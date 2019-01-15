@@ -32,7 +32,7 @@ public:
   /**
    * Enable a pending timeout. If a timeout is already pending, it will be reset to the new timeout.
    */
-  virtual void enableTimer(const std::chrono::milliseconds& d) PURE;
+  virtual void enableTimer(const std::chrono::microseconds& d) PURE;
 };
 
 typedef std::unique_ptr<Timer> TimerPtr;

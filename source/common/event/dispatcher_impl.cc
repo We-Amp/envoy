@@ -25,6 +25,13 @@
 namespace Envoy {
 namespace Event {
 
+event_config* getcfg() {
+  static struct event_config* cfg = event_config_new();
+  int r = event_config_set_flag(cfg, EVENT_BASE_FLAG_PRECISE_TIMER);
+  ASSERT(!r);
+  return cfg;
+}
+
 DispatcherImpl::DispatcherImpl(TimeSystem& time_system, Api::Api& api)
     : DispatcherImpl(time_system, Buffer::WatermarkFactoryPtr{new Buffer::WatermarkBufferFactory},
                      api) {
@@ -35,7 +42,7 @@ DispatcherImpl::DispatcherImpl(TimeSystem& time_system, Api::Api& api)
 DispatcherImpl::DispatcherImpl(TimeSystem& time_system, Buffer::WatermarkFactoryPtr&& factory,
                                Api::Api& api)
     : api_(api), time_system_(time_system), buffer_factory_(std::move(factory)),
-      base_(event_base_new()), scheduler_(time_system_.createScheduler(base_)),
+      base_(event_base_new_with_config(getcfg())), scheduler_(time_system_.createScheduler(base_)),
       deferred_delete_timer_(createTimer([this]() -> void { clearDeferredDeleteList(); })),
       post_timer_(createTimer([this]() -> void { runPostCallbacks(); })),
       current_to_delete_(&to_delete_1_) {

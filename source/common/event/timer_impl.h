@@ -18,7 +18,7 @@ public:
 
   // Timer
   void disableTimer() override;
-  void enableTimer(const std::chrono::milliseconds& d) override;
+  void enableTimer(const std::chrono::microseconds& d) override;
 
 private:
   TimerCb cb_;

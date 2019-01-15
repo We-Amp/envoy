@@ -28,7 +28,7 @@ public:
 
   // Timer
   void disableTimer() override;
-  void enableTimer(const std::chrono::milliseconds& duration) override;
+  void enableTimer(const std::chrono::microseconds& duration) override;
 
   void setTime(MonotonicTime time) { time_ = time; }
 
@@ -105,13 +105,14 @@ void SimulatedTimeSystem::Alarm::disableTimer() {
   }
 }
 
-void SimulatedTimeSystem::Alarm::enableTimer(const std::chrono::milliseconds& duration) {
+void SimulatedTimeSystem::Alarm::enableTimer(const std::chrono::microseconds& duration) {
   disableTimer();
   armed_ = true;
   if (duration.count() == 0) {
     activate();
   } else {
-    time_system_.addAlarm(this, duration);
+    // TODO(oschaaf): we truncate here, revisit and figure out wether that is acceptable.
+    time_system_.addAlarm(this, std::chrono::duration_cast<std::chrono::milliseconds>(duration));
   }
 }
 
