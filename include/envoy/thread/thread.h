@@ -28,6 +28,12 @@ public:
    * Join on thread exit.
    */
   virtual void join() PURE;
+
+  /**
+   * Causes the calling thread to yield execution to another thread that is ready to run on the
+   * current processor. The operating system selects the thread to yield to.
+   */
+  virtual void yield() PURE;
 };
 
 typedef std::unique_ptr<Thread> ThreadPtr;
@@ -49,6 +55,11 @@ public:
    * Return the current system thread ID
    */
   virtual ThreadIdPtr currentThreadId() PURE;
+
+  /**
+   * @return ThreadPtr for the currently executing thread.
+   */
+  virtual ThreadPtr getCurrentThread() PURE;
 };
 
 /**

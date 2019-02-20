@@ -27,10 +27,12 @@ private:
  */
 class ThreadImplPosix : public Thread {
 public:
+  ThreadImplPosix();
   ThreadImplPosix(std::function<void()> thread_routine);
 
   // Thread::Thread
   void join() override;
+  void yield() override;
 
 private:
   std::function<void()> thread_routine_;
@@ -45,6 +47,7 @@ public:
   // Thread::ThreadFactory
   ThreadPtr createThread(std::function<void()> thread_routine) override;
   ThreadIdPtr currentThreadId() override;
+  ThreadPtr getCurrentThread() override;
 };
 
 } // namespace Thread

@@ -30,6 +30,8 @@ std::string ThreadIdImplPosix::debugString() const { return std::to_string(id_);
 
 bool ThreadIdImplPosix::isCurrentThreadId() const { return id_ == getCurrentThreadId(); }
 
+ThreadImplPosix::ThreadImplPosix() : thread_handle_(pthread_self()) {}
+
 ThreadImplPosix::ThreadImplPosix(std::function<void()> thread_routine)
     : thread_routine_(thread_routine) {
   RELEASE_ASSERT(Logger::Registry::initialized(), "");
@@ -47,6 +49,16 @@ void ThreadImplPosix::join() {
   RELEASE_ASSERT(rc == 0, "");
 }
 
+void ThreadImplPosix::yield() {
+#ifdef __linux__
+  pthread_yield();
+#elif defined(__APPLE__)
+  pthread_yield_np();
+#else
+#error "Enable and test pthread_yield code for you arch in pthread/thread_impl.cc"
+#endif
+}
+
 ThreadPtr ThreadFactoryImplPosix::createThread(std::function<void()> thread_routine) {
   return std::make_unique<ThreadImplPosix>(thread_routine);
 }
@@ -54,6 +66,8 @@ ThreadPtr ThreadFactoryImplPosix::createThread(std::function<void()> thread_rout
 ThreadIdPtr ThreadFactoryImplPosix::currentThreadId() {
   return std::make_unique<ThreadIdImplPosix>(getCurrentThreadId());
 }
+
+ThreadPtr ThreadFactoryImplPosix::getCurrentThread() { return std::make_unique<ThreadImplPosix>(); }
 
 } // namespace Thread
 } // namespace Envoy
