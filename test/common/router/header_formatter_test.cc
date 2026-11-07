@@ -433,6 +433,56 @@ request_headers_to_add:
   EXPECT_EQ("%DOWNSTREAM_REMOTE_PORT%", header_map.get_("x-client-port"));
 }
 
+// Pins the staging behavior for config-constant header values: a parser applies constant values
+// from storage owned by its own configuration, and those references stay valid for the parser's
+// lifetime even while sibling configurations (route reloads) come and go.
+TEST(HeaderParserTest, EvaluateHeadersConstantValuesOwnConfigurationStorage) {
+  const std::string long_value = "0123456789012345678901234567890123456789";
+
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+
+  HeaderParserPtr parser;
+  {
+    Protobuf::RepeatedPtrField<envoy::config::core::v3::HeaderValueOption> to_add;
+    auto make_header = [&](const std::string& key, const std::string& value,
+                           HeaderValueOption::HeaderAppendAction action) {
+      auto* header = to_add.Add();
+      header->mutable_header()->set_key(key);
+      header->mutable_header()->set_value(value);
+      header->set_append_action(action);
+    };
+    make_header("x-append", long_value, HeaderValueOption::APPEND_IF_EXISTS_OR_ADD);
+    make_header("x-add-absent", long_value, HeaderValueOption::ADD_IF_ABSENT);
+    make_header("x-overwrite", long_value, HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD);
+    make_header("x-formatted", "%REQ(x-source)%", HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD);
+
+    parser = HeaderParser::configure(to_add).value();
+    // The proto description dies with this scope: the parser owns the values it applies.
+  }
+
+  // A sibling configuration with its own constant storage is created, used, and destroyed while
+  // the parser under test stays alive: its referenced values must not alias sibling storage.
+  {
+    Protobuf::RepeatedPtrField<envoy::config::core::v3::HeaderValueOption> sibling_to_add;
+    auto* header = sibling_to_add.Add();
+    header->mutable_header()->set_key("x-sibling");
+    header->mutable_header()->set_value(std::string(300, 'S'));
+    HeaderParserPtr sibling_parser = HeaderParser::configure(sibling_to_add).value();
+    Http::TestRequestHeaderMapImpl sibling_map{{":method", "POST"}};
+    sibling_parser->evaluateHeaders(sibling_map, stream_info);
+    EXPECT_EQ(std::string(300, 'S'), sibling_map.get_("x-sibling"));
+  }
+
+  Http::TestRequestHeaderMapImpl header_map{
+      {":method", "POST"}, {"x-overwrite", "stale"}, {"x-source", long_value}};
+  parser->evaluateHeaders(header_map, Formatter::Context(&header_map), stream_info);
+
+  EXPECT_EQ(long_value, header_map.get_("x-append"));
+  EXPECT_EQ(long_value, header_map.get_("x-add-absent"));
+  EXPECT_EQ(long_value, header_map.get_("x-overwrite"));
+  EXPECT_EQ(long_value, header_map.get_("x-formatted"));
+}
+
 TEST(HeaderParserTest, EvaluateHeaderValuesWithNullStreamInfo) {
   Http::TestRequestHeaderMapImpl header_map{{":method", "POST"}};
   Protobuf::RepeatedPtrField<envoy::config::core::v3::HeaderValue> headers_values;

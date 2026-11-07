@@ -182,8 +182,26 @@ void HeaderParser::evaluateHeaders(Http::HeaderMap& headers, const Formatter::Co
   // header_formatter_speed_test.cc provides micro-benchmark for evaluating speed of adding and
   // replacing headers and should be used when modifying the code below to access the performance
   // impact of code changes.
-  absl::InlinedVector<std::pair<const Http::LowerCaseString&, const std::string>, 4> headers_to_add,
-      headers_to_overwrite;
+  //
+  // A value staged from an entry's configuration (no formatter built for it) is stored by
+  // reference into storage owned by that entry, which lives as long as the configuration owning
+  // this parser. That outlives every HeaderMap evaluateHeaders() touches: those maps belong to
+  // streams that hold the owning configuration (e.g. the matched route) alive, satisfying
+  // HeaderString's reference contract. Such values are therefore applied through the
+  // reference-taking HeaderMap APIs instead of being copied per request. Formatted values cannot
+  // be referenced (value_buffer below is reused across entries) and are staged into owned
+  // storage to apply with the copy-taking APIs.
+  struct StagedHeader {
+    const Http::LowerCaseString& key_;
+    const HeaderAppendAction action_;
+    // Points into this parser's configuration-owned storage. Only valid when formatted_ is
+    // false.
+    absl::string_view constant_value_;
+    // Owns a formatter-produced value. Only valid when formatted_ is true.
+    std::string formatted_value_;
+    bool formatted_ = false;
+  };
+  absl::InlinedVector<StagedHeader, 4> headers_to_add, headers_to_overwrite;
   // value_buffer is used only when stream_info is a valid pointer and stores header value
   // created by a formatter. It is declared outside of 'for' loop for performance reason to avoid
   // stack allocation and unnecessary std::string's memory adjustments for each iteration. The
@@ -196,24 +214,33 @@ void HeaderParser::evaluateHeaders(Http::HeaderMap& headers, const Formatter::Co
   std::string value_buffer;
   for (const auto& [key, entry] : headers_to_add_) {
     absl::string_view value;
+    bool formatted = false;
     if (stream_info != nullptr && entry->formatter_ != nullptr) {
       value_buffer.clear();
       entry->formatter_->formatTo(value_buffer, context, *stream_info);
       value = value_buffer;
+      formatted = true;
     } else {
       // Either there is no stream to evaluate against, or the configured value is a constant and
       // no formatter was built for it.
       value = entry->original_value_;
     }
     if (!value.empty() || entry->add_if_empty_) {
+      StagedHeader staged{key, entry->append_action_, absl::string_view(), std::string(),
+                          formatted};
+      if (formatted) {
+        staged.formatted_value_ = value;
+      } else {
+        staged.constant_value_ = value;
+      }
       switch (entry->append_action_) {
         PANIC_ON_PROTO_ENUM_SENTINEL_VALUES;
       case HeaderValueOption::APPEND_IF_EXISTS_OR_ADD:
-        headers_to_add.emplace_back(key, value);
+        headers_to_add.emplace_back(std::move(staged));
         break;
       case HeaderValueOption::ADD_IF_ABSENT:
         if (auto header_entry = headers.get(key); header_entry.empty()) {
-          headers_to_add.emplace_back(key, value);
+          headers_to_add.emplace_back(std::move(staged));
         }
         break;
       case HeaderValueOption::OVERWRITE_IF_EXISTS:
@@ -222,7 +249,7 @@ void HeaderParser::evaluateHeaders(Http::HeaderMap& headers, const Formatter::Co
         }
         FALLTHRU;
       case HeaderValueOption::OVERWRITE_IF_EXISTS_OR_ADD:
-        headers_to_overwrite.emplace_back(key, value);
+        headers_to_overwrite.emplace_back(std::move(staged));
         break;
       }
     }
@@ -230,12 +257,20 @@ void HeaderParser::evaluateHeaders(Http::HeaderMap& headers, const Formatter::Co
 
   // First overwrite all headers which need to be overwritten.
   for (const auto& header : headers_to_overwrite) {
-    headers.setReferenceKey(header.first, header.second);
+    if (header.formatted_) {
+      headers.setReferenceKey(header.key_, header.formatted_value_);
+    } else {
+      headers.setReference(header.key_, header.constant_value_);
+    }
   }
 
   // Now add headers which should be added.
   for (const auto& header : headers_to_add) {
-    headers.addReferenceKey(header.first, header.second);
+    if (header.formatted_) {
+      headers.addReferenceKey(header.key_, header.formatted_value_);
+    } else {
+      headers.addReference(header.key_, header.constant_value_);
+    }
   }
 }
 
