@@ -822,6 +822,7 @@ Status ConnectionImpl::onHeaderValueImpl(const char* data, size_t length) {
 
 Status ConnectionImpl::checkFastPathHeaderNameForUnderscores(absl::string_view key, bool& drop) {
   drop = false;
+  (void)key; // Only the server implementation applies an underscore policy.
   return okStatus();
 }
 
