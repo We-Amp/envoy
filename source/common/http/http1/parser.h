@@ -100,6 +100,18 @@ public:
    * Called when accepting a chunk header.
    */
   virtual void onChunkHeader(bool) PURE;
+
+  /**
+   * Called by parsers that support the single-representation header fast path, once per complete
+   * header field, with the (not yet lowercased) key and the (not yet trimmed) value as views into
+   * parser-owned storage. The default implementation preserves the legacy accumulation semantics
+   * by forwarding to onHeaderField()/onHeaderValue().
+   * @return CallbackResult representing success or failure.
+   */
+  virtual CallbackResult onFastHeaderField(absl::string_view key, absl::string_view value) {
+    onHeaderField(key.data(), key.size());
+    return onHeaderValue(value.data(), value.size());
+  }
 };
 
 // ParserStatus represents the internal state of the parser.
@@ -150,6 +162,10 @@ public:
 
   // Returns whether the Transfer-Encoding header is present.
   virtual int hasTransferEncoding() const PURE;
+
+  // Returns the number of messages whose headers were parsed by the single-representation fast
+  // path, if the parser implements one. Parsers without a fast path always return 0.
+  virtual uint32_t fastPathMessageCount() const { return 0; }
 };
 
 using ParserPtr = std::unique_ptr<Parser>;

@@ -820,6 +820,70 @@ Status ConnectionImpl::onHeaderValueImpl(const char* data, size_t length) {
   return checkMaxHeadersSize();
 }
 
+Status ConnectionImpl::checkFastPathHeaderNameForUnderscores(absl::string_view key, bool& drop) {
+  drop = false;
+  return okStatus();
+}
+
+CallbackResult ConnectionImpl::onFastHeaderField(absl::string_view key, absl::string_view value) {
+  return setAndCheckCallbackStatus(onFastHeaderFieldImpl(key, value));
+}
+
+// Single-representation fast-path counterpart of onHeaderFieldImpl + onHeaderValueImpl +
+// completeCurrentHeader: one call per complete header line, inserting the entry directly instead
+// of accumulating staging HeaderStrings. Every check and error below mirrors the semantics (and
+// error text) of the three baseline functions it replaces.
+Status ConnectionImpl::onFastHeaderFieldImpl(absl::string_view key, absl::string_view value) {
+  ASSERT(dispatching_);
+
+  // Account for this line's key and value bytes plus the ":" and "\r\n" bytes between and after
+  // them. The total matches the baseline's per-fragment accounting.
+  getBytesMeter().addHeaderBytesReceived(key.size() + value.size() + CRLF_SIZE + 1);
+
+  auto& headers_or_trailers = headersOrTrailers();
+
+  bool drop = false;
+  RETURN_IF_ERROR(checkFastPathHeaderNameForUnderscores(key, drop));
+
+  if (!Http::HeaderUtility::headerValueIsValid(value)) {
+    ENVOY_CONN_LOG(debug, "invalid header value: {}", connection_, value);
+    error_code_ = Http::Code::BadRequest;
+    RETURN_IF_ERROR(sendProtocolError(Http1ResponseCodeDetails::get().InvalidCharacters));
+    return codecProtocolError("http/1.1 protocol error: header value contains invalid chars");
+  }
+
+  if (!drop) {
+    // Strip leading whitespace (baseline strips it as the first value fragment arrives) and
+    // trailing whitespace (baseline strips it when completing the header).
+    absl::string_view trimmed_value = StringUtil::rtrim(StringUtil::ltrim(value));
+
+    // If there is a stateful formatter installed, remember the original header key before
+    // converting to lower case.
+    auto formatter = headers_or_trailers.formatter();
+    if (formatter.has_value()) {
+      formatter->processKey(key);
+    }
+    HeaderString key_str;
+    key_str.append(key.data(), key.size());
+    key_str.inlineTransform([](char c) { return absl::ascii_tolower(c); });
+
+    HeaderString value_str;
+    value_str.append(trimmed_value.data(), trimmed_value.size());
+
+    headers_or_trailers.addViaMove(std::move(key_str), std::move(value_str));
+  }
+
+  // Check if the number of headers exceeds the limit.
+  if (headers_or_trailers.size() > max_headers_count_) {
+    error_code_ = Http::Code::RequestHeaderFieldsTooLarge;
+    RETURN_IF_ERROR(sendProtocolError(Http1ResponseCodeDetails::get().TooManyHeaders));
+    return codecProtocolError(absl::StrCat("http/1.1 protocol error: ",
+                                           Http1HeaderTypes::get().Headers, " count exceeds limit"));
+  }
+
+  return checkMaxHeadersSize();
+}
+
 StatusOr<CallbackResult> ConnectionImpl::onHeadersCompleteImpl() {
   ASSERT(!processing_trailers_);
   ASSERT(dispatching_);
@@ -1429,6 +1493,35 @@ Status ServerConnectionImpl::checkHeaderNameForUnderscores() {
     } else {
       ENVOY_CONN_LOG(debug, "Rejecting request due to header name with underscores: {}",
                      connection_, current_header_field_.getStringView());
+      error_code_ = Http::Code::BadRequest;
+      RETURN_IF_ERROR(sendProtocolError(Http1ResponseCodeDetails::get().InvalidUnderscore));
+      stats_.incRequestsRejectedWithUnderscoresInHeaders();
+      return codecProtocolError("http/1.1 protocol error: header name contains underscores");
+    }
+  }
+#else
+  // Workaround for gcc not understanding [[maybe_unused]] for class members.
+  (void)headers_with_underscores_action_;
+#endif
+  return okStatus();
+}
+
+Status ServerConnectionImpl::checkFastPathHeaderNameForUnderscores(absl::string_view key,
+                                                                   bool& drop) {
+  drop = false;
+#ifndef ENVOY_ENABLE_UHV
+  // This check has been moved to UHV
+  if (headers_with_underscores_action_ != envoy::config::core::v3::HttpProtocolOptions::ALLOW &&
+      Http::HeaderUtility::headerNameContainsUnderscore(key)) {
+    if (headers_with_underscores_action_ ==
+        envoy::config::core::v3::HttpProtocolOptions::DROP_HEADER) {
+      ENVOY_CONN_LOG(debug, "Dropping header with invalid characters in its name: {}", connection_,
+                     key);
+      stats_.incDroppedHeadersWithUnderscores();
+      drop = true;
+    } else {
+      ENVOY_CONN_LOG(debug, "Rejecting request due to header name with underscores: {}", connection_,
+                     key);
       error_code_ = Http::Code::BadRequest;
       RETURN_IF_ERROR(sendProtocolError(Http1ResponseCodeDetails::get().InvalidUnderscore));
       stats_.incRequestsRejectedWithUnderscoresInHeaders();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "source/common/http/http1/parser.h"
 #include "source/common/runtime/runtime_features.h"
@@ -35,6 +36,7 @@ public:
   absl::string_view methodName() const override;
   absl::string_view errorMessage() const override;
   int hasTransferEncoding() const override;
+  uint32_t fastPathMessageCount() const override { return fast_path_message_count_; }
 
 private:
   // quiche::BalsaVisitorInterface implementation
@@ -63,6 +65,32 @@ private:
   // Shared implementation for ProcessHeaders() and OnTrailers().
   void validateAndProcessHeadersOrTrailersImpl(const quiche::BalsaHeaders& headers, bool trailers);
 
+  // S3 fast path: single-representation header parse. Attempts to parse an entire ordinary
+  // message header block directly from `slice` into the header map, bypassing the BalsaHeaders
+  // materialization and the per-line callback round trip. Returns the number of bytes consumed
+  // (through the block terminator, plus any immediately available Content-Length body) or 0 when
+  // the message must go through Balsa instead (see s3-design.md for the trigger list). The scan
+  // is all-or-nothing: zero parser state is mutated unless the whole block is validated, so the
+  // fallback replays the identical bytes through the unmodified Balsa path.
+  size_t tryFastPath(const char* slice, size_t len);
+  // Consumes Content-Length body bytes for a fast-path message.
+  size_t fastPathBody(const char* slice, size_t len);
+
+  enum class FastBodyState { Inactive, ContentLength };
+  FastBodyState fast_body_state_ = FastBodyState::Inactive;
+  uint64_t fast_body_remaining_ = 0;
+  // Parser-query state for the message parsed by the fast path (Balsa's `headers_` is not
+  // populated for such messages).
+  bool fast_http11_ = false;
+  uint64_t fast_status_code_ = 200;
+  // Owned storage for the method view (SSO-sized in practice; views must outlive the committing
+  // execute() call, and std::string keeps that safe without a per-request allocation).
+  std::string fast_method_storage_;
+  absl::string_view fast_method_;
+  std::optional<uint64_t> fast_content_length_;
+  uint32_t fast_path_message_count_ = 0;
+
+
   // Return ParserStatus::Error if `result` is CallbackResult::Error.
   // Return current value of `status_` otherwise.
   // Typical use would be `status_ = convertResult(result);`
@@ -75,11 +103,15 @@ private:
   ParserCallbacks* connection_ = nullptr;
   const bool enable_trailers_ = false;
   const bool allow_custom_methods_ = false;
+  const size_t max_header_length_;
   // Latched on construction, which happens per connection, so that flipping the runtime guard
   // takes effect on new connections without a per-request runtime lookup.
   const bool allow_query_method_ = false;
   bool first_byte_processed_ = false;
   bool headers_done_ = false;
+  // True while the current message was parsed by the S3 fast path (Balsa's `headers_` is then
+  // not populated for it).
+  bool fast_message_ = false;
   // True until the first byte of the second message arrives.
   bool first_message_ = true;
   ParserStatus status_ = ParserStatus::Ok;

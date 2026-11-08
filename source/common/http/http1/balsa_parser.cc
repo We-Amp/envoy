@@ -13,6 +13,7 @@
 
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 
 namespace Envoy {
 namespace Http {
@@ -27,6 +28,11 @@ constexpr absl::string_view kColonSlashSlash = "://";
 // Response must start with "HTTP".
 constexpr char kResponseFirstByte = 'H';
 constexpr absl::string_view kHttpVersionPrefix = "HTTP/";
+// The end of an ordinary header block: the empty line after the last field.
+constexpr absl::string_view kHeaderBlockTerminator = "\r\n\r\n";
+constexpr absl::string_view kCRLF = "\r\n";
+constexpr absl::string_view kContentLength = "content-length";
+constexpr absl::string_view kTransferEncoding = "transfer-encoding";
 
 // RFC 9110 Sections 5.1 and 9.1 define field names and methods as tokens:
 // https://www.rfc-editor.org/rfc/rfc9110.html
@@ -172,7 +178,7 @@ bool isHeaderNameValid(absl::string_view name) {
 BalsaParser::BalsaParser(MessageType type, ParserCallbacks* connection, size_t max_header_length,
                          bool enable_trailers, bool allow_custom_methods)
     : message_type_(type), connection_(connection), enable_trailers_(enable_trailers),
-      allow_custom_methods_(allow_custom_methods),
+      allow_custom_methods_(allow_custom_methods), max_header_length_(max_header_length),
       allow_query_method_(
           Runtime::runtimeFeatureEnabled("envoy.reloadable_features.http1_allow_query_method")) {
   ASSERT(connection_ != nullptr);
@@ -210,6 +216,21 @@ BalsaParser::BalsaParser(MessageType type, ParserCallbacks* connection, size_t m
 
 size_t BalsaParser::execute(const char* slice, size_t len) {
   ASSERT(status_ != ParserStatus::Error);
+
+  if (fast_body_state_ == FastBodyState::ContentLength) {
+    return fastPathBody(slice, len);
+  }
+
+  if (len > 0 && !first_byte_processed_) {
+    fast_message_ = false;
+    // S3 fast path: try to consume the whole ordinary header block in one representation.
+    // Returns 0 unless the block was fully validated, in which case the parser state has been
+    // advanced accordingly and the remaining bytes (if any) belong to the body.
+    const size_t fast_consumed = tryFastPath(slice, len);
+    if (fast_consumed > 0) {
+      return fast_consumed;
+    }
+  }
 
   if (len > 0 && !first_byte_processed_) {
     if (first_message_) {
@@ -262,10 +283,16 @@ CallbackResult BalsaParser::pause() {
 ParserStatus BalsaParser::getStatus() const { return status_; }
 
 Http::Code BalsaParser::statusCode() const {
+  if (fast_message_) {
+    return static_cast<Http::Code>(fast_status_code_);
+  }
   return static_cast<Http::Code>(headers_.parsed_response_code());
 }
 
 bool BalsaParser::isHttp11() const {
+  if (fast_message_) {
+    return fast_http11_;
+  }
   if (message_type_ == MessageType::Request) {
     return absl::EndsWith(headers_.first_line(), Http::Headers::get().ProtocolStrings.Http11String);
   } else {
@@ -275,19 +302,37 @@ bool BalsaParser::isHttp11() const {
 }
 
 std::optional<uint64_t> BalsaParser::contentLength() const {
+  if (fast_message_) {
+    return fast_content_length_;
+  }
   if (!headers_.content_length_valid()) {
     return std::nullopt;
   }
   return headers_.content_length();
 }
 
-bool BalsaParser::isChunked() const { return headers_.transfer_encoding_is_chunked(); }
+bool BalsaParser::isChunked() const {
+  if (fast_message_) {
+    // The fast path never handles chunked messages; they fall back to Balsa.
+    return false;
+  }
+  return headers_.transfer_encoding_is_chunked();
+}
 
-absl::string_view BalsaParser::methodName() const { return headers_.request_method(); }
+absl::string_view BalsaParser::methodName() const {
+  if (fast_message_) {
+    return fast_method_;
+  }
+  return headers_.request_method();
+}
 
 absl::string_view BalsaParser::errorMessage() const { return error_message_; }
 
 int BalsaParser::hasTransferEncoding() const {
+  if (fast_message_) {
+    // The fast path never handles Transfer-Encoding; such messages fall back to Balsa.
+    return 0;
+  }
   return headers_.HasHeader(Http::Headers::get().TransferEncoding);
 }
 
@@ -423,6 +468,237 @@ void BalsaParser::HandleWarning(BalsaFrameEnums::ErrorCode error_code) {
   if (error_code == BalsaFrameEnums::TRAILER_MISSING_COLON) {
     HandleError(error_code);
   }
+}
+
+size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
+  const absl::string_view input(slice, len);
+
+  if (message_type_ == MessageType::Response && input.front() != kResponseFirstByte) {
+    return 0;
+  }
+
+  // The entire header block must be present in this slice, within the header-size limit.
+  // Anything else (partial blocks, oversized blocks) goes through Balsa unchanged, which
+  // accumulates across slices and reports HEADERS_TOO_LONG identically.
+  const size_t window_len = std::min(len, max_header_length_);
+  const size_t term = input.substr(0, window_len).find(kHeaderBlockTerminator);
+  if (term == absl::string_view::npos) {
+    return 0;
+  }
+  const size_t block_len = term + kHeaderBlockTerminator.size();
+  const absl::string_view block = input.substr(0, block_len);
+
+  // ---- Scan phase: validate the whole block. Zero parser state is mutated here, so any
+  // deviation below simply returns 0 and the Balsa path replays the identical bytes.
+  const size_t first_line_end = block.find(kCRLF);
+  ASSERT(first_line_end != absl::string_view::npos);
+  const absl::string_view first_line = block.substr(0, first_line_end);
+
+  absl::string_view method;
+  absl::string_view url;
+  absl::string_view version;
+  absl::string_view reason;
+  uint64_t status_code = 0;
+  if (message_type_ == MessageType::Request) {
+    const size_t first_sp = first_line.find(' ');
+    if (first_sp == absl::string_view::npos) {
+      return 0;
+    }
+    method = first_line.substr(0, first_sp);
+    const size_t second_sp = first_line.find(' ', first_sp + 1);
+    if (second_sp == absl::string_view::npos) {
+      return 0;
+    }
+    url = first_line.substr(first_sp + 1, second_sp - first_sp - 1);
+    version = first_line.substr(second_sp + 1);
+    if (method.empty() || url.empty() || version.empty() || !isVersionValid(version) ||
+        !isMethodValid(method, allow_custom_methods_, allow_query_method_) ||
+        method == Headers::get().MethodValues.Connect) {
+      return 0;
+    }
+  } else {
+    const size_t first_sp = first_line.find(' ');
+    if (first_sp == absl::string_view::npos || !isVersionValid(first_line.substr(0, first_sp)) ||
+        first_line.size() < first_sp + 4) {
+      return 0;
+    }
+    version = first_line.substr(0, first_sp);
+    const absl::string_view code = first_line.substr(first_sp + 1, 3);
+    if (!absl::ascii_isdigit(code[0]) || !absl::ascii_isdigit(code[1]) ||
+        !absl::ascii_isdigit(code[2])) {
+      return 0;
+    }
+    status_code = (code[0] - '0') * 100 + (code[1] - '0') * 10 + (code[2] - '0');
+    if (first_line.size() == first_sp + 4) {
+      // No reason phrase: leave this shape to Balsa for exact parity.
+      return 0;
+    }
+    if (first_line[first_sp + 4] != ' ') {
+      return 0;
+    }
+    reason = first_line.substr(first_sp + 5);
+  }
+
+  const bool is_http11 = version == Http::Headers::get().ProtocolStrings.Http11String;
+
+  // Field lines: strict CRLF framing only. Line-by-line pass collecting framing.
+  bool te_present = false;
+  bool cl_seen = false;
+  uint64_t content_length = 0;
+  size_t pos = first_line_end + kCRLF.size();
+  while (pos + kCRLF.size() <= block.size()) {
+    size_t eol = block.find(kCRLF, pos);
+    ASSERT(eol != absl::string_view::npos && eol <= block.size() - kCRLF.size());
+    const absl::string_view line = block.substr(pos, eol - pos);
+    pos = eol + kCRLF.size();
+    if (line.empty()) {
+      // End of the header block.
+      break;
+    }
+    const char front = line.front();
+    if (front == ' ' || front == '\t') {
+      // obs-fold continuation: Balsa joins these; leave the message to it.
+      return 0;
+    }
+    if (line.find('\r') != absl::string_view::npos || line.find('\n') != absl::string_view::npos) {
+      // Bare CR or LF inside a line: not strict CRLF framing.
+      return 0;
+    }
+    const size_t colon = line.find(':');
+    if (colon == absl::string_view::npos || colon == 0) {
+      return 0;
+    }
+    const absl::string_view name = line.substr(0, colon);
+    if (name.back() == ' ' || name.back() == '\t' || !isHeaderNameValid(name)) {
+      return 0;
+    }
+    // Framing sniffing on the lowercased name. Cheap compare: names here are short, and any
+    // name longer than the buffer cannot be Content-Length or Transfer-Encoding.
+    char lower_buf[32];
+    if (name.size() <= sizeof(lower_buf)) {
+      for (size_t i = 0; i < name.size(); ++i) {
+        lower_buf[i] = absl::ascii_tolower(name[i]);
+      }
+      const absl::string_view lower_name(lower_buf, name.size());
+      if (lower_name == kTransferEncoding) {
+        te_present = true;
+      } else if (lower_name == kContentLength) {
+        if (cl_seen) {
+          // Multiple Content-Length fields: quiche's disallow_multiple_content_length policy
+          // errors; keep exact parity by falling back.
+          return 0;
+        }
+        cl_seen = true;
+        absl::string_view value = line.substr(colon + 1);
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+          value.remove_prefix(1);
+        }
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) {
+          value.remove_suffix(1);
+        }
+        if (value.empty() || !absl::SimpleAtoi(value, &content_length)) {
+          return 0;
+        }
+      }
+    }
+  }
+  if (te_present) {
+    // Chunked or otherwise transfer-encoded messages keep the Balsa path.
+    return 0;
+  }
+
+  // Framing decision, matching Balsa's semantics for ordinary messages.
+  bool has_body = cl_seen && content_length > 0;
+  if (message_type_ == MessageType::Response) {
+    const bool no_body_status = status_code < 200 || status_code == 204 || status_code == 304;
+    if (no_body_status) {
+      // Balsa ends these messages at the headers regardless of Content-Length.
+      has_body = false;
+    } else if (!cl_seen) {
+      // Body until connection close: Balsa handles the EOF framing.
+      return 0;
+    }
+  }
+
+  // ---- Commit phase: the block is fully validated ordinary input. Emit the exact callback
+  // sequence the Balsa path would have produced.
+  first_message_ = false;
+  status_ = convertResult(connection_->onMessageBegin());
+  if (status_ == ParserStatus::Error) {
+    return 0;
+  }
+  if (message_type_ == MessageType::Request) {
+    status_ = convertResult(connection_->onUrl(url.data(), url.size()));
+  } else {
+    status_ = convertResult(connection_->onStatus(reason.data(), reason.size()));
+  }
+  if (status_ == ParserStatus::Error) {
+    return 0;
+  }
+
+  fast_message_ = true;
+  fast_http11_ = is_http11;
+  fast_status_code_ = status_code;
+  fast_method_storage_ = std::string(method);
+  fast_method_ = fast_method_storage_;
+  fast_content_length_ = cl_seen ? std::optional<uint64_t>(content_length) : std::nullopt;
+  first_byte_processed_ = true;
+  headers_done_ = true;
+  ++fast_path_message_count_;
+
+  // Second pass over the field lines: one direct-insertion call per field, replacing the
+  // per-line onHeaderField/onHeaderValue accumulation round trip.
+  pos = first_line_end + kCRLF.size();
+  while (pos + kCRLF.size() <= block.size()) {
+    const size_t eol = block.find(kCRLF, pos);
+    const absl::string_view line = block.substr(pos, eol - pos);
+    pos = eol + kCRLF.size();
+    if (line.empty()) {
+      break;
+    }
+    const size_t colon = line.find(':');
+    status_ = convertResult(connection_->onFastHeaderField(line.substr(0, colon),
+                                                           line.substr(colon + 1)));
+    if (status_ == ParserStatus::Error) {
+      return 0;
+    }
+  }
+
+  status_ = convertResult(connection_->onHeadersComplete());
+  if (status_ == ParserStatus::Error) {
+    return 0;
+  }
+
+  const size_t header_bytes = block_len;
+  if (!has_body) {
+    // Match Balsa: a message with no body completes right after the headers.
+    MessageDone();
+    return header_bytes;
+  }
+
+  fast_body_state_ = FastBodyState::ContentLength;
+  fast_body_remaining_ = content_length;
+  return header_bytes + fastPathBody(slice + header_bytes, len - header_bytes);
+}
+
+size_t BalsaParser::fastPathBody(const char* slice, size_t len) {
+  ASSERT(fast_body_state_ == FastBodyState::ContentLength);
+  if (len == 0) {
+    // EOF/flush while the body is incomplete.
+    if (fast_body_remaining_ > 0) {
+      status_ = ParserStatus::Error;
+      error_message_ = "HPE_INVALID_EOF_STATE";
+    }
+    return 0;
+  }
+  const size_t n = std::min<size_t>(len, fast_body_remaining_);
+  connection_->bufferBody(slice, n);
+  fast_body_remaining_ -= n;
+  if (fast_body_remaining_ == 0) {
+    fast_body_state_ = FastBodyState::Inactive;
+    MessageDone();
+  }
+  return n;
 }
 
 void BalsaParser::validateAndProcessHeadersOrTrailersImpl(const quiche::BalsaHeaders& headers,

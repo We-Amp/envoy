@@ -5472,5 +5472,278 @@ TEST_F(Http1ClientConnectionImplTest, EncodeHeadersConnectEmptyAuthority) {
   EXPECT_EQ("CONNECT  HTTP/1.1\r\nhost: \r\n\r\n", output);
 }
 
+// --- S3 single-representation header-parse fast path ---
+//
+// The fast path must be wire-behavior-identical to the Balsa path. Each test asserts the decoded
+// output exactly like the pre-existing suites, and additionally pins WHICH path ran via
+// fastPathMessageCount() so the Balsa fallback trigger conditions stay pinned (a regression that
+// silently routes a message through the wrong path must fail here).
+
+uint32_t fastPathCount(const Http::ConnectionCodec& codec) {
+  const auto* http1 = dynamic_cast<const Http::Http1::ConnectionImpl*>(&codec);
+  RELEASE_ASSERT(http1 != nullptr, "codec is not an Http1 ConnectionImpl");
+  return http1->fastPathMessageCount();
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathGetNoBody) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  TestRequestHeaderMapImpl expected_headers{
+      {":authority", "foo.com"}, {":path", "/"}, {":method", "GET"}, {"x-pass", "value"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), true));
+
+  Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nHost: foo.com\r\nX-Pass: value\r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer.length());
+  EXPECT_EQ(1U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathTrimsHeaderValueWhitespace) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  TestRequestHeaderMapImpl expected_headers{
+      {":authority", "foo.com"}, {":path", "/"}, {":method", "GET"}, {"x-pad", "value"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), true));
+
+  Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nHost: foo.com\r\nX-Pad:  value  \r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(1U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathPostWithContentLength) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  TestRequestHeaderMapImpl expected_headers{{":authority", "foo.com"},
+                                            {":path", "/"},
+                                            {":method", "POST"},
+                                            {"content-length", "10"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false));
+  Buffer::OwnedImpl expected_data("0123456789");
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_data), false));
+  EXPECT_CALL(decoder, decodeData(_, true));
+
+  Buffer::OwnedImpl buffer(
+      "POST / HTTP/1.1\r\nHost: foo.com\r\ncontent-length: 10\r\n\r\n0123456789");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer.length());
+  EXPECT_EQ(1U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathPostContentLengthSplitBody) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  TestRequestHeaderMapImpl expected_headers{{":authority", "foo.com"},
+                                            {":path", "/"},
+                                            {":method", "POST"},
+                                            {"content-length", "10"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false));
+  Buffer::OwnedImpl expected_data("01234");
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_data), false));
+
+  Buffer::OwnedImpl buffer("POST / HTTP/1.1\r\nHost: foo.com\r\ncontent-length: 10\r\n\r\n01234");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(1U, fastPathCount(*codec_));
+
+  EXPECT_CALL(decoder, decodeData(_, true));
+  Buffer::OwnedImpl buffer2("56789");
+  status = codec_->dispatch(buffer2);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer2.length());
+  EXPECT_EQ(1U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathFallbackChunked) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  TestRequestHeaderMapImpl expected_headers{{":authority", "foo"},
+                                            {":path", "/"},
+                                            {":method", "POST"},
+                                            {"transfer-encoding", "chunked"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false));
+  Buffer::OwnedImpl expected_data("Hello World");
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_data), false));
+  EXPECT_CALL(decoder, decodeData(_, true));
+
+  Buffer::OwnedImpl buffer("POST / HTTP/1.1\r\nHost: foo\r\ntransfer-encoding: chunked\r\n\r\n"
+                           "6\r\nHello \r\n"
+                           "5\r\nWorld\r\n"
+                           "0\r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathFallbackObsFold) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  // The folded value is joined by the Balsa fallback exactly as baseline does; the fast path
+  // must not own this shape.
+  TestRequestHeaderMapImpl expected_headers{{":authority", "foo.com"},
+                                            {":path", "/"},
+                                            {":method", "GET"},
+                                            {"x-fold", "bar baz"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), true));
+
+  Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nHost: foo.com\r\nX-Fold: bar\r\n baz\r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathFallbackSplitHeaderBlock) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  EXPECT_CALL(decoder, decodeHeaders_(_, true)).Times(0);
+  Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nHost: foo.com\r\nX-Part");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, fastPathCount(*codec_));
+
+  TestRequestHeaderMapImpl expected_headers{
+      {":authority", "foo.com"}, {":path", "/"}, {":method", "GET"}, {"x-part", "yes"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), true));
+  Buffer::OwnedImpl buffer2(": yes\r\n\r\n");
+  status = codec_->dispatch(buffer2);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathFallbackConnect) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  TestRequestHeaderMapImpl expected_headers{{":authority", "host:443"}, {":method", "CONNECT"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false));
+
+  Buffer::OwnedImpl buffer("CONNECT host:443 HTTP/1.1\r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathFallbackDuplicateContentLength) {
+  Buffer::OwnedImpl buffer(
+      "POST / HTTP/1.1\r\nHost: foo\r\ncontent-length: 5\r\ncontent-length: 5\r\n\r\nhello");
+  expect400(buffer, Http1ResponseCodeDetails::get().HttpCodecError,
+            "http/1.1 protocol error: HPE_UNEXPECTED_CONTENT_LENGTH");
+  EXPECT_EQ(0U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathFallbackInvalidMethod) {
+  Buffer::OwnedImpl buffer("BAD_METHOD / HTTP/1.1\r\nHost: foo\r\n\r\n");
+  expect400(buffer, Http1ResponseCodeDetails::get().HttpCodecError,
+            "http/1.1 protocol error: HPE_INVALID_METHOD");
+  EXPECT_EQ(0U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ServerConnectionImplTest, FastPathHeaderCountLimit) {
+  max_request_headers_count_ = 2;
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  Http::ResponseEncoder* response_encoder = nullptr;
+  EXPECT_CALL(callbacks_, newStream(_, _))
+      .WillOnce([&](Http::ResponseEncoder& encoder, bool) -> Http::RequestDecoder& {
+        response_encoder = &encoder;
+        return decoder;
+      });
+  EXPECT_CALL(decoder,
+              sendLocalReply(Http::Code::RequestHeaderFieldsTooLarge, _, _, _, _));
+
+  Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nHost: foo.com\r\nA: 1\r\nB: 2\r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_TRUE(isCodecProtocolError(status));
+  EXPECT_EQ("http/1.1 protocol error: headers count exceeds limit", status.message());
+}
+
+TEST_F(Http1ClientConnectionImplTest, FastPathResponseWithContentLength) {
+  initialize();
+
+  NiceMock<MockResponseDecoder> response_decoder;
+  Http::RequestEncoder& request_encoder = codec_->newStream(response_decoder);
+  TestRequestHeaderMapImpl headers{{":method", "GET"}, {":path", "/"}};
+  EXPECT_OK(request_encoder.encodeHeaders(headers, true));
+
+  TestResponseHeaderMapImpl expected_headers{{":status", "200"}, {"content-length", "5"}};
+  EXPECT_CALL(response_decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false));
+  Buffer::OwnedImpl expected_data("hello");
+  EXPECT_CALL(response_decoder, decodeData(BufferEqual(&expected_data), false));
+  EXPECT_CALL(response_decoder, decodeData(_, true));
+
+  Buffer::OwnedImpl buffer("HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer.length());
+  EXPECT_EQ(1U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ClientConnectionImplTest, FastPathContinueHeaders) {
+  initialize();
+
+  NiceMock<MockResponseDecoder> response_decoder;
+  Http::RequestEncoder& request_encoder = codec_->newStream(response_decoder);
+  TestRequestHeaderMapImpl headers{{":method", "GET"}, {":path", "/"}};
+  EXPECT_OK(request_encoder.encodeHeaders(headers, true));
+
+  EXPECT_CALL(response_decoder, decode1xxHeaders_(_));
+  EXPECT_CALL(response_decoder, decodeData(_, _)).Times(0);
+  Buffer::OwnedImpl initial_response("HTTP/1.1 100 Continue\r\n\r\n");
+  auto status = codec_->dispatch(initial_response);
+  EXPECT_OK(status);
+  EXPECT_EQ(1U, fastPathCount(*codec_));
+}
+
+TEST_F(Http1ClientConnectionImplTest, FastPathFallbackResponseNoContentLength) {
+  initialize();
+
+  NiceMock<MockResponseDecoder> response_decoder;
+  Http::RequestEncoder& request_encoder = codec_->newStream(response_decoder);
+  TestRequestHeaderMapImpl headers{{":method", "GET"}, {":path", "/"}};
+  EXPECT_OK(request_encoder.encodeHeaders(headers, true));
+
+  EXPECT_CALL(response_decoder, decodeHeaders_(_, false));
+  EXPECT_CALL(response_decoder, decodeData(_, _)).Times(0);
+  Buffer::OwnedImpl buffer("HTTP/1.1 200 OK\r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, fastPathCount(*codec_));
+}
+
 } // namespace Http
 } // namespace Envoy

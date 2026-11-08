@@ -265,6 +265,9 @@ public:
   Http::Status dispatch(Buffer::Instance& data) override;
   void goAway() override {} // Called during connection manager drain flow
   Protocol protocol() override { return protocol_; }
+  // Number of messages whose headers were parsed by the single-representation fast path.
+  // Exposed for tests and stats; parsers without a fast path report 0.
+  uint32_t fastPathMessageCount() const { return parser_->fastPathMessageCount(); }
   void shutdownNotice() override {} // Called during connection manager drain flow
   bool wantsToWrite() override { return false; }
   void onUnderlyingConnectionAboveWriteBufferHighWatermark() override { onAboveHighWatermark(); }
@@ -364,6 +367,7 @@ private:
   CallbackResult onStatus(const char* data, size_t length) override;
   CallbackResult onHeaderField(const char* data, size_t length) override;
   CallbackResult onHeaderValue(const char* data, size_t length) override;
+  CallbackResult onFastHeaderField(absl::string_view key, absl::string_view value) override;
   CallbackResult onHeadersComplete() override;
   void bufferBody(const char* data, size_t length) override;
   CallbackResult onMessageComplete() override;
@@ -376,6 +380,14 @@ private:
   virtual Status onStatusBase(const char* data, size_t length) PURE;
   Status onHeaderFieldImpl(const char* data, size_t length);
   Status onHeaderValueImpl(const char* data, size_t length);
+  Status onFastHeaderFieldImpl(absl::string_view key, absl::string_view value);
+
+  /**
+   * Header-name underscore policy for the fast path, where the staging HeaderStrings are
+   * bypassed. A returned error is REJECT semantics; `drop` set is DROP semantics (the header
+   * must not be inserted).
+   */
+  virtual Status checkFastPathHeaderNameForUnderscores(absl::string_view key, bool& drop);
   StatusOr<CallbackResult> onHeadersCompleteImpl();
   virtual StatusOr<CallbackResult> onHeadersCompleteBase() PURE;
   StatusOr<CallbackResult> onMessageCompleteImpl();
@@ -551,6 +563,7 @@ private:
 
   Status doFloodProtectionChecks() const;
   Status checkHeaderNameForUnderscores() override;
+  Status checkFastPathHeaderNameForUnderscores(absl::string_view key, bool& drop) override;
   Status checkProtocolVersion(RequestHeaderMap& headers);
 
   ServerConnectionCallbacks& callbacks_;
