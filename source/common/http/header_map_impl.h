@@ -2,7 +2,6 @@
 
 #include <array>
 #include <cstdint>
-#include <list>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -128,9 +127,11 @@ protected:
 
     HeaderString key_;
     HeaderString value_;
-    std::list<HeaderEntryImpl>::iterator entry_;
+    // Intrusive list links; a null next_/prev_ marks the respective list end.
+    HeaderEntryImpl* next_ = nullptr;
+    HeaderEntryImpl* prev_ = nullptr;
   };
-  using HeaderNode = std::list<HeaderEntryImpl>::iterator;
+  using HeaderNode = HeaderEntryImpl*;
 
   /**
    * This is the static lookup table that is used to determine whether a header is one of the O(1)
@@ -197,10 +198,17 @@ protected:
    * access given a header key. Once the map is initialized, it will be used even
    * if the number of headers decreases below the threshold.
    *
-   * Note: the internal iterators held in fields make this unsafe to copy and move, since the
-   * reference to end() is not preserved across a move (see Notes in
-   * https://en.cppreference.com/w/cpp/container/list/list). The NonCopyable will suppress both copy
-   * and move constructors/assignment.
+   * Entries are arena-allocated: they are bump-allocated from chunk storage owned by the list and
+   * threaded onto an intrusive doubly linked list, instead of being individually malloc'ed and
+   * free'ed by std::list. This removes a malloc/free pair per header and makes traversal
+   * cache-linear. Chunks are released wholesale when the list is destroyed or cleared; erased
+   * entries destroy their HeaderStrings immediately but their storage slots stay dead until that
+   * wholesale release. Header maps in the proxy data plane live for exactly one request, so the
+   * arena lifetime is trivially scoped. Entries must remain stable in memory regardless: the lazy
+   * map's keys are string views into entry storage.
+   *
+   * Note: the internal entry pointers held in fields make this unsafe to copy and move. The
+   * NonCopyable will suppress both copy and move constructors/assignment.
    * TODO(htuch): Maybe we want this to movable one day; for now, our header map moves happen on
    * HeaderMapPtr, so the performance impact should not be evident.
    */
@@ -209,7 +217,29 @@ protected:
     using HeaderNodeVector = absl::InlinedVector<HeaderNode, 1>;
     using HeaderLazyMap = absl::flat_hash_map<absl::string_view, HeaderNodeVector>;
 
-    HeaderList() : pseudo_headers_end_(headers_.end()) {}
+    // Forward iterator over the entry list; the null node is the end sentinel.
+    class Iterator {
+    public:
+      explicit Iterator(HeaderNode node) : node_(node) {}
+
+      HeaderEntryImpl& operator*() const { return *node_; }
+      HeaderEntryImpl* operator->() const { return node_; }
+      Iterator& operator++() {
+        node_ = node_->next_;
+        return *this;
+      }
+      bool operator==(const Iterator& rhs) const { return node_ == rhs.node_; }
+      bool operator!=(const Iterator& rhs) const { return node_ != rhs.node_; }
+
+    private:
+      HeaderNode node_;
+    };
+
+    Iterator begin() const { return Iterator(head_); }
+    Iterator end() const { return Iterator(nullptr); }
+    // The last entry in the list, nullptr if empty; reverse iteration walks the prev_ links
+    // starting from here.
+    HeaderNode back() const { return tail_; }
 
     template <class Key> bool isPseudoHeader(const Key& key) {
       return !key.getStringView().empty() && key.getStringView()[0] == ':';
@@ -217,25 +247,43 @@ protected:
 
     template <class Key, class... Value> HeaderNode insert(Key&& key, Value&&... value) {
       const bool is_pseudo_header = isPseudoHeader(key);
-      HeaderNode i = headers_.emplace(is_pseudo_header ? pseudo_headers_end_ : headers_.end(),
-                                      std::forward<Key>(key), std::forward<Value>(value)...);
+      HeaderNode node = allocateEntry(std::forward<Key>(key), std::forward<Value>(value)...);
+      // Insert before the first non-pseudo header, or at the back for pseudo headers; this
+      // preserves the ordering semantics of the std::list::emplace(pos, ...) this list replaced.
+      linkBefore(is_pseudo_header ? pseudo_headers_end_ : nullptr, node);
+      ++size_;
       if (!lazy_map_.empty()) {
-        lazy_map_[i->key().getStringView()].push_back(i);
+        lazy_map_[node->key().getStringView()].push_back(node);
       }
-      if (!is_pseudo_header && pseudo_headers_end_ == headers_.end()) {
-        pseudo_headers_end_ = i;
+      if (!is_pseudo_header && pseudo_headers_end_ == nullptr) {
+        pseudo_headers_end_ = node;
       }
-      return i;
+      return node;
     }
 
+    // Unlinks and destroys the entry. Its arena storage slot stays dead until the chunks are
+    // released wholesale; the entry following i (nullptr at the list end) is returned.
     HeaderNode erase(HeaderNode i, bool remove_from_map) {
       if (pseudo_headers_end_ == i) {
-        pseudo_headers_end_++;
+        pseudo_headers_end_ = i->next_;
       }
       if (remove_from_map) {
         lazy_map_.erase(i->key().getStringView());
       }
-      return headers_.erase(i);
+      HeaderNode next = i->next_;
+      if (i->prev_ != nullptr) {
+        i->prev_->next_ = next;
+      } else {
+        head_ = next;
+      }
+      if (next != nullptr) {
+        next->prev_ = i->prev_;
+      } else {
+        tail_ = i->prev_;
+      }
+      --size_;
+      i->~HeaderEntryImpl();
+      return next;
     }
 
     template <class UnaryPredicate> void removeIf(UnaryPredicate p) {
@@ -248,12 +296,12 @@ protected:
           // The following call to absl::erase_if removes the elements that satisfy the
           // UnaryPredicate and resizes the vector.
           absl::erase_if(values_vec, [&](HeaderNode it) {
-            if (p(*(it->entry_))) {
+            if (p(*it)) {
               // Remove the element from the list.
-              if (pseudo_headers_end_ == it->entry_) {
-                pseudo_headers_end_++;
+              if (pseudo_headers_end_ == it) {
+                pseudo_headers_end_ = it->next_;
               }
-              headers_.erase(it);
+              erase(it, false /* remove_from_map */);
               return true;
             }
             return false;
@@ -269,15 +317,13 @@ protected:
       } else {
         // The lazy map isn't used, iterate over the list elements and remove elements that satisfy
         // the predicate.
-        headers_.remove_if([&](const HeaderEntryImpl& entry) {
-          const bool to_remove = p(entry);
-          if (to_remove) {
-            if (pseudo_headers_end_ == entry.entry_) {
-              pseudo_headers_end_++;
-            }
+        for (HeaderNode i = head_; i != nullptr;) {
+          HeaderNode next = i->next_;
+          if (p(*i)) {
+            erase(i, false /* remove_from_map */);
           }
-          return to_remove;
-        });
+          i = next;
+        }
       }
     }
 
@@ -295,25 +341,74 @@ protected:
      */
     size_t remove(absl::string_view key);
 
-    std::list<HeaderEntryImpl>::iterator begin() { return headers_.begin(); }
-    std::list<HeaderEntryImpl>::iterator end() { return headers_.end(); }
-    std::list<HeaderEntryImpl>::const_iterator begin() const { return headers_.begin(); }
-    std::list<HeaderEntryImpl>::const_iterator end() const { return headers_.end(); }
-    std::list<HeaderEntryImpl>::const_reverse_iterator rbegin() const { return headers_.rbegin(); }
-    std::list<HeaderEntryImpl>::const_reverse_iterator rend() const { return headers_.rend(); }
     HeaderLazyMap::iterator mapFind(absl::string_view key) { return lazy_map_.find(key); }
     HeaderLazyMap::iterator mapEnd() { return lazy_map_.end(); }
-    size_t size() const { return headers_.size(); }
-    bool empty() const { return headers_.empty(); }
+    size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+
+    // Destroys all live entries and releases the arena chunks wholesale.
     void clear() {
-      headers_.clear();
-      pseudo_headers_end_ = headers_.end();
+      for (HeaderNode i = head_; i != nullptr;) {
+        HeaderNode next = i->next_;
+        i->~HeaderEntryImpl();
+        i = next;
+      }
+      head_ = tail_ = pseudo_headers_end_ = nullptr;
+      size_ = 0;
       lazy_map_.clear();
+      while (chunk_head_ != nullptr) {
+        HeaderEntryChunk* chunk = chunk_head_;
+        chunk_head_ = chunk->next_chunk_;
+        delete chunk;
+      }
+      current_chunk_ = nullptr;
     }
 
   private:
-    std::list<HeaderEntryImpl> headers_;
-    HeaderNode pseudo_headers_end_;
+    // Bump-allocated storage for kNodesPerChunk entry nodes. A chunk is a single allocation;
+    // entries are carved out of it front to back and never individually freed.
+    static constexpr uint32_t kNodesPerChunk = 64;
+    struct HeaderEntryChunk {
+      HeaderEntryChunk* next_chunk_ = nullptr;
+      uint32_t used_ = 0;
+      alignas(alignof(HeaderEntryImpl)) uint8_t
+          node_storage_[kNodesPerChunk * sizeof(HeaderEntryImpl)];
+    };
+
+    template <class... Args> HeaderNode allocateEntry(Args&&... args) {
+      if (current_chunk_ == nullptr || current_chunk_->used_ == kNodesPerChunk) {
+        HeaderEntryChunk* chunk = new HeaderEntryChunk();
+        chunk->next_chunk_ = chunk_head_;
+        chunk_head_ = current_chunk_ = chunk;
+      }
+      uint8_t* storage =
+          current_chunk_->node_storage_ + current_chunk_->used_ * sizeof(HeaderEntryImpl);
+      ++current_chunk_->used_;
+      return new (storage) HeaderEntryImpl(std::forward<Args>(args)...);
+    }
+
+    // Links node into the list before pos; a null pos appends at the back.
+    void linkBefore(HeaderNode pos, HeaderNode node) {
+      node->prev_ = pos != nullptr ? pos->prev_ : tail_;
+      node->next_ = pos;
+      if (node->prev_ != nullptr) {
+        node->prev_->next_ = node;
+      } else {
+        head_ = node;
+      }
+      if (pos != nullptr) {
+        pos->prev_ = node;
+      } else {
+        tail_ = node;
+      }
+    }
+
+    HeaderNode head_ = nullptr;
+    HeaderNode tail_ = nullptr;
+    HeaderNode pseudo_headers_end_ = nullptr;
+    HeaderEntryChunk* chunk_head_ = nullptr;
+    HeaderEntryChunk* current_chunk_ = nullptr;
+    uint32_t size_ = 0;
     HeaderLazyMap lazy_map_;
   };
 
