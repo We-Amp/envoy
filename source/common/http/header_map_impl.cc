@@ -55,12 +55,12 @@ template <> bool HeaderMapImpl::HeaderList::isPseudoHeader(const LowerCaseString
 
 bool HeaderMapImpl::HeaderList::maybeMakeMap() {
   if (lazy_map_.empty()) {
-    if (headers_.size() < kMinHeadersForLazyMap) {
+    if (size_ < kMinHeadersForLazyMap) {
       return false;
     }
     // Add all entries from the list into the map.
-    lazy_map_.reserve(headers_.size());
-    for (auto node = headers_.begin(); node != headers_.end(); ++node) {
+    lazy_map_.reserve(size_);
+    for (HeaderNode node = head_; node != nullptr; node = node->next_) {
       HeaderNodeVector& v = lazy_map_[node->key().getStringView()];
       v.push_back(node);
     }
@@ -84,12 +84,12 @@ size_t HeaderMapImpl::HeaderList::remove(absl::string_view key) {
     }
   } else {
     // Erase all same key entries from the list.
-    for (auto i = headers_.begin(); i != headers_.end();) {
+    for (HeaderNode i = head_; i != nullptr;) {
       if (i->key() == key) {
         removed_bytes += i->key().size() + i->value().size();
         i = erase(i, false /* remove_from_map */);
       } else {
-        ++i;
+        i = i->next_;
       }
     }
   }
@@ -247,8 +247,7 @@ void HeaderMapImpl::insertByKey(HeaderString&& key, HeaderString&& value) {
     }
   } else {
     addSize(key.size() + value.size());
-    HeaderNode i = headers_.insert(std::move(key), std::move(value));
-    i->entry_ = i;
+    headers_.insert(std::move(key), std::move(value));
   }
 }
 
@@ -396,7 +395,7 @@ void HeaderMapImpl::iterate(HeaderMap::ConstIterateCb cb) const {
 
 void HeaderMapImpl::iterateReverse(HeaderMap::ConstIterateCb cb) const {
   // NOLINTNEXTLINE(modernize-loop-convert)
-  for (auto it = headers_.rbegin(); it != headers_.rend(); it++) {
+  for (HeaderNode it = headers_.back(); it != nullptr; it = it->prev_) {
     if (cb(*it) == HeaderMap::Iterate::Break) {
       break;
     }
@@ -458,8 +457,7 @@ HeaderMapImpl::HeaderEntryImpl& HeaderMapImpl::maybeCreateInline(HeaderEntryImpl
 
   addSize(key.get().size());
   HeaderNode i = headers_.insert(key);
-  i->entry_ = i;
-  *entry = &(*i);
+  *entry = i;
   return **entry;
 }
 
@@ -473,8 +471,7 @@ HeaderMapImpl::HeaderEntryImpl& HeaderMapImpl::maybeCreateInline(HeaderEntryImpl
 
   addSize(key.get().size() + value.size());
   HeaderNode i = headers_.insert(key, std::move(value));
-  i->entry_ = i;
-  *entry = &(*i);
+  *entry = i;
   return **entry;
 }
 
@@ -495,10 +492,10 @@ size_t HeaderMapImpl::removeInline(HeaderEntryImpl** ptr_to_entry) {
   }
 
   HeaderEntryImpl* entry = *ptr_to_entry;
-  const uint64_t size_to_subtract = entry->entry_->key().size() + entry->entry_->value().size();
+  const uint64_t size_to_subtract = entry->key().size() + entry->value().size();
   subtractSize(size_to_subtract);
   *ptr_to_entry = nullptr;
-  headers_.erase(entry->entry_, true);
+  headers_.erase(entry, true);
   return 1;
 }
 
