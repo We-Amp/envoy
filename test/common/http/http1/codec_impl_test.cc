@@ -5745,5 +5745,197 @@ TEST_F(Http1ClientConnectionImplTest, FastPathFallbackResponseNoContentLength) {
   EXPECT_EQ(0U, fastPathCount(*codec_));
 }
 
+// --- S3 differential parse-equivalence harness ---
+//
+// The fast path REPLACES parse work, so it must be observationally identical to the Balsa
+// fallback path. Every corpus message below is driven through the same codec twice: once in one
+// dispatch holding the full message (the fast path commits whenever the message is eligible), and
+// once byte-at-a-time (no dispatch slice ever holds a full header block, so the Balsa fallback
+// path is forced by construction). The resulting decoded HeaderMaps must be identical: names,
+// values, iteration order, casing behavior, empty/absent semantics — as must body bytes,
+// end-stream counts, and codec error text.
+
+namespace {
+std::string serializeHeaderMapForEquivalence(const HeaderMap& map) {
+  std::string out;
+  for (const auto& header : map) {
+    absl::StrAppend(&out, header.key().getStringView(), "=", header.value().getStringView(), "\n");
+  }
+  return out;
+}
+
+struct EquivalenceDriveResult {
+  std::string headers;
+  std::string body;
+  int end_streams = 0;
+  bool codec_error = false;
+  std::string error_message;
+};
+} // namespace
+
+TEST_F(Http1ServerConnectionImplTest, DifferentialParseEquivalenceRequests) {
+  const std::vector<std::string> corpus = {
+      // Ordinary no-body request: fast-path eligible.
+      "GET / HTTP/1.1\r\nHost: foo\r\nUser-Agent: x\r\n\r\n",
+      // CL body: fast-path eligible.
+      "POST /upload HTTP/1.1\r\nHost: foo\r\ncontent-length: 5\r\n\r\nhello",
+      // Chunked: always falls back.
+      "POST / HTTP/1.1\r\nHost: foo\r\ntransfer-encoding: chunked\r\n\r\n6\r\nHello \r\n5\r\nWorld\r\n0\r\n\r\n",
+      // obs-fold: always falls back.
+      "GET / HTTP/1.1\r\nHost: foo\r\nX-Fold: bar\r\n baz\r\n\r\n",
+      // Duplicate non-CL header.
+      "GET / HTTP/1.1\r\nHost: foo\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n",
+      // Duplicate inline header.
+      "GET / HTTP/1.1\r\nHost: foo\r\nHost: bar\r\n\r\n",
+      // Empty value.
+      "GET / HTTP/1.1\r\nHost: foo\r\nX-Empty:\r\n\r\n",
+      // Whitespace-only value, internal tabs, trailing spaces.
+      "GET / HTTP/1.1\r\nHost: foo\r\nX-A: a\tb  c \r\n\r\n",
+      // Quoted value with colons.
+      "GET / HTTP/1.1\r\nHost: foo\r\nX-Q: \"a:b\"\r\n\r\n",
+      // Mixed-case names: lowercasing parity.
+      "GET / HTTP/1.1\r\nHoSt: foo\r\nX-CaSe: VaLuE\r\n\r\n",
+      // Absolute URL.
+      "GET http://foo.com/path?q=1 HTTP/1.1\r\nHost: foo.com\r\n\r\n",
+      // HTTP/1.0.
+      "GET / HTTP/1.0\r\nHost: foo\r\n\r\n",
+      // Many headers.
+      "GET / HTTP/1.1\r\nHost: foo\r\nX-1: 1\r\nX-2: 2\r\nX-3: 3\r\nX-4: 4\r\nX-5: 5\r\nX-6: 6\r\nX-7: 7\r\nX-8: 8\r\nX-9: 9\r\nX-10: 10\r\n\r\n",
+      // Long value (exceeds the inline-string cutoff).
+      absl::StrCat("GET / HTTP/1.1\r\nHost: foo\r\nX-Long: ", std::string(300, 'x'), "\r\n\r\n"),
+      // Header name with underscores (ALLOW policy).
+      "GET / HTTP/1.1\r\nHost: foo\r\nX_Underscore: v\r\n\r\n",
+      // Whitespace between name and colon: always falls back.
+      "GET / HTTP/1.1\r\nHost: foo\r\nX-A : b\r\n\r\n",
+      // CONNECT: always falls back.
+      "CONNECT host:443 HTTP/1.1\r\n\r\n",
+      // Error parity: duplicate Content-Length.
+      "GET / HTTP/1.1\r\nHost: foo\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc",
+      // Error parity: invalid method.
+      "BAD_METHOD / HTTP/1.1\r\nHost: foo\r\n\r\n",
+      // Error parity: invalid version.
+      "GET / HTTP/1.2\r\nHost: foo\r\n\r\n",
+      // Error parity: invalid value character.
+      std::string("GET / HTTP/1.1\r\nHost: foo\r\nX-Bad: v\x7f\r\n\r\n"),
+  };
+
+  auto drive = [this](const std::string& wire,
+                      size_t chunk_size) -> EquivalenceDriveResult {
+    codec_settings_.allow_absolute_url_ = true;
+    codec_ = std::make_unique<Http1::ServerConnectionImpl>(
+        connection_, http1CodecStats(), callbacks_, codec_settings_, max_request_headers_kb_,
+        max_request_headers_count_, envoy::config::core::v3::HttpProtocolOptions::ALLOW,
+        overload_manager_);
+    NiceMock<MockRequestDecoder> decoder;
+    setupRequestDecoderMock(decoder);
+    ON_CALL(callbacks_, newStream(_, _)).WillByDefault(ReturnRef(decoder));
+    EquivalenceDriveResult r;
+    ON_CALL(decoder, decodeHeaders_(_, _))
+        .WillByDefault([&](RequestHeaderMapSharedPtr& headers, bool end_stream) {
+          r.headers = serializeHeaderMapForEquivalence(*headers);
+          if (end_stream) {
+            r.end_streams++;
+          }
+        });
+    ON_CALL(decoder, decodeData(_, _))
+        .WillByDefault([&](Buffer::Instance& data, bool end_stream) {
+          r.body += data.toString();
+          if (end_stream) {
+            r.end_streams++;
+          }
+        });
+    for (size_t offset = 0; offset < wire.size(); offset += chunk_size) {
+      Buffer::OwnedImpl chunk(wire.substr(offset, chunk_size));
+      auto status = codec_->dispatch(chunk);
+      if (!status.ok()) {
+        r.codec_error = true;
+        r.error_message = std::string(status.message());
+        break;
+      }
+    }
+    return r;
+  };
+
+  for (const auto& wire : corpus) {
+    EquivalenceDriveResult fast = drive(wire, wire.size());
+    EquivalenceDriveResult slow = drive(wire, 1);
+    EXPECT_EQ(fast.headers, slow.headers) << "wire: " << wire;
+    EXPECT_EQ(fast.body, slow.body) << "wire: " << wire;
+    EXPECT_EQ(fast.end_streams, slow.end_streams) << "wire: " << wire;
+    EXPECT_EQ(fast.codec_error, slow.codec_error) << "wire: " << wire;
+    EXPECT_EQ(fast.error_message, slow.error_message) << "wire: " << wire;
+  }
+}
+
+TEST_F(Http1ClientConnectionImplTest, DifferentialParseEquivalenceResponses) {
+  const std::vector<std::string> corpus = {
+      // CL body: fast-path eligible.
+      "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nX-Extra: 1\r\n\r\nhello",
+      // No CL: EOF framing, falls back.
+      "HTTP/1.1 200 OK\r\n\r\n",
+      // 204: no-body status.
+      "HTTP/1.1 204 No Content\r\nX-Meta: yes\r\n\r\n",
+      // 304 with a Content-Length (baseline ignores it): parity of the fast path's framing rule.
+      "HTTP/1.1 304 Not Modified\r\ncontent-length: 0\r\n\r\n",
+      // No reason phrase: always falls back.
+      "HTTP/1.1 200\r\n\r\n",
+      // Multi-token reason.
+      "HTTP/1.1 418 I'm a teapot\r\ncontent-length: 0\r\n\r\n",
+      // HTTP/1.0 response.
+      "HTTP/1.0 200 OK\r\ncontent-length: 2\r\n\r\nok",
+      // Error parity: garbage first byte.
+      "NOT-HTTP\r\n\r\n",
+  };
+
+  auto drive = [this](const std::string& wire,
+                      size_t chunk_size) -> EquivalenceDriveResult {
+    initialize();
+    NiceMock<MockResponseDecoder> response_decoder;
+    Http::RequestEncoder& request_encoder = codec_->newStream(response_decoder);
+    TestRequestHeaderMapImpl headers{{":method", "GET"}, {":path", "/"}};
+    EXPECT_OK(request_encoder.encodeHeaders(headers, true));
+    EquivalenceDriveResult r;
+    ON_CALL(response_decoder, decode1xxHeaders_(_))
+        .WillByDefault([&](ResponseHeaderMapPtr& h) {
+          r.headers += "1xx\n" + serializeHeaderMapForEquivalence(*h);
+        });
+    ON_CALL(response_decoder, decodeHeaders_(_, _))
+        .WillByDefault([&](ResponseHeaderMapPtr& h, bool end_stream) {
+          r.headers += serializeHeaderMapForEquivalence(*h);
+          if (end_stream) {
+            r.headers += "es";
+            r.end_streams++;
+          }
+        });
+    ON_CALL(response_decoder, decodeData(_, _))
+        .WillByDefault([&](Buffer::Instance& data, bool end_stream) {
+          r.body += data.toString();
+          if (end_stream) {
+            r.end_streams++;
+          }
+        });
+    for (size_t offset = 0; offset < wire.size(); offset += chunk_size) {
+      Buffer::OwnedImpl chunk(wire.substr(offset, chunk_size));
+      auto status = codec_->dispatch(chunk);
+      if (!status.ok()) {
+        r.codec_error = true;
+        r.error_message = std::string(status.message());
+        break;
+      }
+    }
+    return r;
+  };
+
+  for (const auto& wire : corpus) {
+    EquivalenceDriveResult fast = drive(wire, wire.size());
+    EquivalenceDriveResult slow = drive(wire, 1);
+    EXPECT_EQ(fast.headers, slow.headers) << "wire: " << wire;
+    EXPECT_EQ(fast.body, slow.body) << "wire: " << wire;
+    EXPECT_EQ(fast.end_streams, slow.end_streams) << "wire: " << wire;
+    EXPECT_EQ(fast.codec_error, slow.codec_error) << "wire: " << wire;
+    EXPECT_EQ(fast.error_message, slow.error_message) << "wire: " << wire;
+  }
+}
+
 } // namespace Http
 } // namespace Envoy
