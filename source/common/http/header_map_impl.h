@@ -241,6 +241,8 @@ protected:
     // starting from here.
     HeaderNode back() const { return tail_; }
 
+    ~HeaderList() { clear(); }
+
     template <class Key> bool isPseudoHeader(const Key& key) {
       return !key.getStringView().empty() && key.getStringView()[0] == ':';
     }
