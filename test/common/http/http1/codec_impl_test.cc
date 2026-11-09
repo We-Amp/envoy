@@ -6084,7 +6084,7 @@ TEST_F(Http1ServerConnectionImplTest, DifferentialParseEquivalenceRandomizedRequ
         break;
       }
     }
-    r.fast_commits = codec_->fastPathMessageCount();
+    r.fast_commits = fastPathCount(*codec_);
     return r;
   };
 
@@ -6207,7 +6207,7 @@ TEST_F(Http1ClientConnectionImplTest, DifferentialParseEquivalenceRandomizedResp
       }
     }
     (void)close_during_headers;
-    r.fast_commits = codec_->fastPathMessageCount();
+    r.fast_commits = fastPathCount(*codec_);
     return r;
   };
 
