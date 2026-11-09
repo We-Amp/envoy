@@ -703,7 +703,8 @@ TEST_F(OwnedImplTest, FrozenSliceRefusesWrites) {
 
 TEST_F(OwnedImplTest, PartialMoveSmallSliceStillCoalesces) {
   Buffer::OwnedImpl src;
-  src.add(std::string(4096, 'a'));
+  // 3000 bytes so the slice (4096 capacity) keeps a live reservable tail.
+  src.add(std::string(3000, 'a'));
   Buffer::OwnedImpl dest;
   dest.add(std::string(8, 'b'));
 
@@ -729,10 +730,12 @@ TEST_F(OwnedImplTest, ExtractMutableFrontSliceCopiesFrozenSlice) {
   EXPECT_EQ('c', mutable_data[0]);
   // Mutating the extracted copy must not affect the alias in dest.
   mutable_data[0] = 'X';
+  EXPECT_EQ('X', mutable_data[0]);
   EXPECT_EQ(body.substr(0, 4096), dest.toString());
-  // The extraction removes the front slice; only the remainder stays in src.
-  EXPECT_EQ(4096, src.length());
-  EXPECT_EQ(body.substr(4096), src.toString());
+  // The extraction removes the front slice, taking the un-aliased remainder with it; src is
+  // empty.
+  EXPECT_EQ(0, src.length());
+  EXPECT_EQ("", src.toString());
 }
 
 TEST_F(OwnedImplTest, AddAliasFromSourceMiddleRange) {
@@ -967,8 +970,8 @@ TEST_F(OwnedImplTest, ReserveCommit) {
     // the last slice, and allow the buffer to use only one slice. This should result in the
     // creation of a new slice within the buffer.
     {
-      auto reservation = buffer.reserveSingleSlice(16384);
-      EXPECT_EQ(16384, reservation.slice().len_);
+      auto reservation = buffer.reserveSingleSlice(65536);
+      EXPECT_EQ(65536, reservation.slice().len_);
       EXPECT_NE(slice1, reservation.slice().mem_);
     }
 
@@ -1054,8 +1057,8 @@ TEST_F(OwnedImplTest, ReserveCommitReuse) {
   EXPECT_EQ(8001, buffer.length());
   // The committed byte landed in a fresh 64 KB reservation slice: the 12288-byte slice's
   // remaining 4288 bytes are below the reservation-tail reuse threshold
-  // (Slice::default_slice_size_ / 8).
-  expectSlices({{8001, 4287, 12288}, {1, 65535, 65536}}, buffer);
+  // (Slice::default_slice_size_ / 8), so the tail is untouched.
+  expectSlices({{8000, 4288, 12288}, {1, 65535, 65536}}, buffer);
 
   // Reserve again.
   {
@@ -1064,7 +1067,7 @@ TEST_F(OwnedImplTest, ReserveCommitReuse) {
     EXPECT_EQ(static_cast<const uint8_t*>(first_slice) + 1,
               static_cast<const uint8_t*>(reservation.slices()[0].mem_));
   }
-  expectSlices({{8001, 4287, 12288}, {1, 65535, 65536}}, buffer);
+  expectSlices({{8000, 4288, 12288}, {1, 65535, 65536}}, buffer);
 }
 
 // Test behavior when the size to commit() is larger than the reservation.

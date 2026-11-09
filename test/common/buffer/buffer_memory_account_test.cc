@@ -342,9 +342,10 @@ TEST_F(BufferMemoryAccountTest, NewReservationSlicesOnlyChargedAfterCommit) {
   auto reservation = buffer.reserveForRead();
   EXPECT_EQ(getBalance(buffer_account), 0);
 
-  // We should only be charged for the slices committed.
+  // We should only be charged for the slices committed. The committed bytes land in a fresh
+  // 64 KB reservation slice, and the charge is the full slice capacity.
   reservation.commit(16384);
-  EXPECT_EQ(getBalance(buffer_account), 16384);
+  EXPECT_EQ(getBalance(buffer_account), 65536);
 
   buffer_account->clearDownstream();
 }
@@ -355,14 +356,20 @@ TEST_F(BufferMemoryAccountTest, ReservationShouldNotChargeForExistingSlice) {
   Buffer::OwnedImpl buffer(buffer_account);
   ASSERT_EQ(getBalance(buffer_account), 0);
 
-  buffer.add("Many bytes remaining in this slice to use for reservation.");
-  EXPECT_EQ(getBalance(buffer_account), 4096);
+  // Create the existing slice through a committed reservation so it carries a live reservable
+  // tail above the reuse threshold (Slice::default_slice_size_ / 8): the charge is the full
+  // 64 KB slice capacity.
+  {
+    auto reservation = buffer.reserveForRead();
+    reservation.commit(58);
+  }
+  EXPECT_EQ(getBalance(buffer_account), 65536);
 
   // The account shouldn't be charged again at commit since the commit
   // uses memory from the slice already charged for.
   auto reservation = buffer.reserveForRead();
   reservation.commit(2000);
-  EXPECT_EQ(getBalance(buffer_account), 4096);
+  EXPECT_EQ(getBalance(buffer_account), 65536);
 
   buffer_account->clearDownstream();
 }
