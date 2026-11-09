@@ -225,6 +225,13 @@ public:
   const Network::Connection& connection() const { return connection_; }
 
   /**
+   * @return the number of body ranges that were appended to the buffered body as immutable
+   * aliases of the dispatch buffer's slice storage instead of being copied. Exposed so tests can
+   * pin which of bufferBody's paths ran.
+   */
+  uint32_t bodySliceAliasCount() const { return body_slice_alias_count_; }
+
+  /**
    * Called when the active encoder has completed encoding the outbound half of the stream.
    */
   virtual void onEncodeComplete() PURE;
@@ -320,6 +327,7 @@ protected:
   bool deferred_end_stream_headers_ : 1 = false;
   bool dispatching_ : 1 = false;
   bool dispatching_slice_already_drained_ : 1;
+  uint32_t body_slice_alias_count_ = 0;
   StreamInfo::BytesMeterSharedPtr bytes_meter_before_stream_;
   const uint32_t max_headers_kb_;
   const uint32_t max_headers_count_;

@@ -747,6 +747,11 @@ void ConnectionImpl::bufferBody(const char* data, size_t length) {
   if (data == slice.mem_ && length == slice.len_) {
     buffered_body_.move(*current_dispatching_buffer_, length);
     dispatching_slice_already_drained_ = true;
+  } else if (buffered_body_.addAliasFromSource(
+                 static_cast<Buffer::OwnedImpl&>(*current_dispatching_buffer_), data, length)) {
+    // The body range shares a read slice with data that stays behind (parsed headers): alias the
+    // slice storage instead of copying the body bytes. The source slice is frozen by the alias.
+    ++body_slice_alias_count_;
   } else {
     buffered_body_.add(data, length);
   }

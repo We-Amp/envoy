@@ -11,13 +11,11 @@
 
 namespace Envoy {
 namespace Buffer {
-namespace {
-// This size has been determined to be optimal from running the
-// //test/integration:http_benchmark benchmark tests.
+
+// CopyThreshold is defined in buffer_impl.h. This size has been determined to be optimal from
+// running the //test/integration:http_benchmark benchmark tests.
 // TODO(yanavlasov): This may not be optimal for all hardware configurations or traffic patterns and
 // may need to be configurable in the future.
-constexpr uint64_t CopyThreshold = 512;
-} // namespace
 
 thread_local absl::InlinedVector<Slice::StoragePtr,
                                  OwnedImpl::OwnedImplReservationSlicesOwnerMultiple::free_list_max_>
@@ -371,9 +369,16 @@ void OwnedImpl::move(Instance& rhs, uint64_t length, bool reset_drain_trackers_a
     if (copy_size == 0) {
       other.slices_.pop_front();
     } else if (copy_size < slice_size) {
-      // TODO(brian-pane) add reference-counting to allow slices to share their storage
-      // and eliminate the copy for this partial-slice case?
-      add(other.slices_.front().data(), copy_size);
+      if (copy_size >= CopyThreshold) {
+        // Reference-counting the partial slice (the TODO below): share the front slice's storage
+        // for the moved range instead of copying it. The source slice is frozen by
+        // makeSharedView, so it can neither write into nor reuse the shared range.
+        coalesceOrAddSlice(other.slices_.front().makeSharedView(0, copy_size));
+      } else {
+        // TODO(brian-pane) add reference-counting to allow slices to share their storage
+        // and eliminate the copy for this partial-slice case?
+        add(other.slices_.front().data(), copy_size);
+      }
       other.slices_.front().drain(copy_size);
       other.length_ -= copy_size;
     } else {
@@ -390,6 +395,31 @@ void OwnedImpl::move(Instance& rhs, uint64_t length, bool reset_drain_trackers_a
     length -= copy_size;
   }
   other.postProcess();
+}
+
+bool OwnedImpl::addAliasFromSource(OwnedImpl& src, const void* data, uint64_t length) {
+  ASSERT(&src != this);
+  if (data == nullptr || length < CopyThreshold) {
+    // Too small to be worth an extra slice plus iovec; the caller should copy.
+    return false;
+  }
+  const uint8_t* range_start = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < src.slices_.size(); i++) {
+    Slice& slice = src.slices_[i];
+    if (slice.dataSize() == 0) {
+      continue;
+    }
+    // This is the front-most slice with data, i.e. the slice frontSlice() returns. The range
+    // must lie entirely within it, otherwise aliasing cannot represent it.
+    const uint8_t* slice_start = slice.data();
+    if (range_start < slice_start || range_start > slice_start + slice.dataSize() ||
+        length > static_cast<uint64_t>(slice_start + slice.dataSize() - range_start)) {
+      return false;
+    }
+    coalesceOrAddSlice(slice.makeSharedView(range_start - slice_start, length));
+    return true;
+  }
+  return false;
 }
 
 Reservation OwnedImpl::reserveForRead() {

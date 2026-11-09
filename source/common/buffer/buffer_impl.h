@@ -19,6 +19,11 @@
 namespace Envoy {
 namespace Buffer {
 
+// Content of this size or smaller is copied rather than moved between buffers when there is
+// room in the destination's last slice. Determined to be optimal from the
+// //test/integration:http_benchmark benchmark tests.
+inline constexpr uint64_t CopyThreshold = 512;
+
 /**
  * A Slice manages a contiguous block of bytes.
  * The block is arranged like this:
@@ -37,7 +42,7 @@ namespace Buffer {
 class Slice {
 public:
   using Reservation = RawSlice;
-  using StoragePtr = std::unique_ptr<uint8_t[]>;
+  using StoragePtr = std::shared_ptr<uint8_t[]>;
 
   struct SizedStorage {
     StoragePtr mem_;
@@ -57,7 +62,7 @@ public:
    * @param account the account to charge.
    */
   Slice(uint64_t min_capacity, const BufferMemoryAccountSharedPtr& account)
-      : capacity_(sliceSize(min_capacity)), storage_(new uint8_t[capacity_]),
+      : capacity_(sliceSize(min_capacity)), storage_(std::make_shared<uint8_t[]>(capacity_)),
         base_(storage_.get()) {
     if (account) {
       account->charge(capacity_);
@@ -101,6 +106,7 @@ public:
     base_ = rhs.base_;
     data_ = rhs.data_;
     reservable_ = rhs.reservable_;
+    frozen_ = rhs.frozen_;
     drain_trackers_ = std::move(rhs.drain_trackers_);
     account_ = std::move(rhs.account_);
     releasor_.swap(rhs.releasor_);
@@ -109,6 +115,7 @@ public:
     rhs.base_ = nullptr;
     rhs.data_ = 0;
     rhs.reservable_ = 0;
+    rhs.frozen_ = false;
   }
 
   Slice& operator=(Slice&& rhs) noexcept {
@@ -120,6 +127,7 @@ public:
       base_ = rhs.base_;
       data_ = rhs.data_;
       reservable_ = rhs.reservable_;
+      frozen_ = rhs.frozen_;
       drain_trackers_ = std::move(rhs.drain_trackers_);
       account_ = std::move(rhs.account_);
       if (releasor_) {
@@ -132,6 +140,7 @@ public:
       rhs.base_ = nullptr;
       rhs.data_ = 0;
       rhs.reservable_ = 0;
+      rhs.frozen_ = false;
     }
 
     return *this;
@@ -147,12 +156,12 @@ public:
   /**
    * @return true if the data in the slice is mutable
    */
-  bool isMutable() const { return storage_ != nullptr; }
+  bool isMutable() const { return storage_ != nullptr && !frozen_; }
 
   /**
    * @return true if content in this Slice can be coalesced into another Slice.
    */
-  bool canCoalesce() const { return storage_ != nullptr; }
+  bool canCoalesce() const { return storage_ != nullptr && !frozen_; }
 
   /**
    * @return a pointer to the start of the usable content.
@@ -189,9 +198,46 @@ public:
    * @note Read-only implementations of Slice should return zero from this method.
    */
   uint64_t reservableSize() const {
+    if (frozen_) {
+      // A frozen slice shares its storage with immutable views; no further writes may land
+      // anywhere in its storage, so none of the reservable tail may be handed out.
+      return 0;
+    }
     ASSERT(capacity_ >= reservable_);
     return capacity_ - reservable_;
   }
+
+  /**
+   * Create an immutable slice that shares this slice's backing storage, referring to the
+   * [offset, offset + length) range of this slice's current data, without copying any bytes.
+   * The storage is reference-counted: the bytes live until every sharing slice is destroyed.
+   * This slice is frozen as a side effect: it can never again reserve, append, prepend, or
+   * otherwise be written to, because any such write could mutate bytes that the shared view
+   * (taken here) or a previously taken view refers to. The caller is responsible for draining
+   * the shared range out of this slice.
+   * @param offset the offset of the shared range within this slice's current data.
+   * @param length the length of the shared range.
+   * @return the immutable sharing slice.
+   */
+  Slice makeSharedView(uint64_t offset, uint64_t length) {
+    ASSERT(storage_ != nullptr);
+    ASSERT(offset + length <= dataSize());
+    ASSERT(length > 0);
+    Slice view;
+    view.storage_ = storage_;
+    view.capacity_ = length;
+    view.base_ = base_ + offset;
+    view.data_ = 0;
+    view.reservable_ = length;
+    view.frozen_ = true;
+    frozen_ = true;
+    return view;
+  }
+
+  /**
+   * @return whether this slice has been frozen by sharing its storage with an immutable view.
+   */
+  bool isFrozen() const { return frozen_; }
 
   /**
    * Reserve `size` bytes that the caller can populate with content. The caller SHOULD then
@@ -342,7 +388,7 @@ public:
     account_ = account;
   }
 
-  static constexpr uint32_t default_slice_size_ = 16384;
+  static constexpr uint32_t default_slice_size_ = 65536;
 
 public:
   /**
@@ -386,6 +432,10 @@ protected:
   /** Offset in bytes from the start of the slice to the start of the Reservable section which is
    * also the end of the Data section. */
   uint64_t reservable_ = 0;
+
+  /** Whether this slice's storage is shared with immutable views (see makeSharedView()). A frozen
+   * slice refuses all writes into its storage, including reuse of its reservable tail. */
+  bool frozen_ = false;
 
   /** Hooks to execute when the slice is destroyed. */
   std::list<std::function<void()>> drain_trackers_;
@@ -674,6 +724,21 @@ public:
   void move(Instance& rhs) override;
   void move(Instance& rhs, uint64_t length) override;
   void move(Instance& rhs, uint64_t length, bool reset_drain_trackers_and_accounting) override;
+
+  /**
+   * Append the [data, data + length) byte range to this buffer as an immutable alias of the
+   * front slice of `src`, without copying bytes: the range's storage is shared by reference
+   * counting, and `src`'s front slice is frozen against all further writes (see
+   * Slice::makeSharedView). This is the codec-seam counterpart of the partial-slice aliasing in
+   * move(); it is meant for ranges that share a slice with data that stays behind (e.g. body
+   * bytes that follow parsed headers in the same read slice).
+   * @param src the buffer whose front slice holds the range.
+   * @param data the start of the range; must lie entirely within src's front slice data.
+   * @param length the range length; must be at least CopyThreshold, or no alias is taken.
+   * @return whether the alias was created; false means the caller should copy (add()) instead.
+   */
+  bool addAliasFromSource(OwnedImpl& src, const void* data, uint64_t length);
+
   Reservation reserveForRead() override;
   ReservationSingleSlice reserveSingleSlice(uint64_t length, bool separate_slice = false) override;
   ssize_t search(const void* data, uint64_t size, size_t start, size_t length) const override;
