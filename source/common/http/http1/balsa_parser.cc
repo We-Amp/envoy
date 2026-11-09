@@ -513,6 +513,7 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
     version = first_line.substr(second_sp + 1);
     if (method.empty() || url.empty() || version.empty() || !isVersionValid(version) ||
         !isMethodValid(method, allow_custom_methods_, allow_query_method_) ||
+        !isUrlValid(url, /* is_connect = */ false) ||
         method == Headers::get().MethodValues.Connect) {
       return 0;
     }

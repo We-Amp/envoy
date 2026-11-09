@@ -5745,6 +5745,68 @@ TEST_F(Http1ClientConnectionImplTest, FastPathFallbackResponseNoContentLength) {
   EXPECT_EQ(0U, fastPathCount(*codec_));
 }
 
+// Regression: pins the fast path's pause-boundary parity. When the connection begins closing
+// during the decodeHeaders callback, onHeadersCompleteBase pauses the parser, and the baseline
+// parser stops at the headers: the body stays in the dispatch buffer and decodeData never fires
+// (the ContentLengthAllBitsSet regression test above pins the same boundary for the baseline).
+// The fast path must do exactly that, not enter its body state.
+TEST_F(Http1ServerConnectionImplTest, FastPathStopsAtHeadersOnPause) {
+  initialize();
+
+  MockRequestDecoder decoder;
+  setupRequestDecoderMock(decoder);
+  InSequence sequence;
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  TestRequestHeaderMapImpl expected_headers{
+      {"content-length", "3"}, {":path", "/"}, {":method", "POST"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false))
+      .WillOnce([&](Http::RequestHeaderMapSharedPtr&, bool) -> void {
+        connection_.state_ = Network::Connection::State::Closing;
+      });
+  EXPECT_CALL(decoder, decodeData(_, _)).Times(0);
+
+  Buffer::OwnedImpl buffer("POST / HTTP/1.1\r\ncontent-length: 3\r\n\r\n123");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_NE(0U, buffer.length());
+  // The fast path committed the headers, but stopped at the pause boundary: no body bytes.
+  EXPECT_EQ(1U, fastPathCount(*codec_));
+}
+
+// Regression: pins the fast path's per-message lifecycle. ServerConnectionImpl::onMessageBeginBase
+// ASSERTs active_request_ == nullptr when a new message begins, so a completed fast-path message
+// must leave exactly the same reset state (headers_or_trailers_ cleared, ActiveRequest torn down)
+// as a baseline-completed one, or the second keep-alive request trips the assert. Drive two full
+// fast-path request/response cycles over one connection.
+TEST_F(Http1ServerConnectionImplTest, FastPathClearsActiveRequestOnCompletion) {
+  initialize();
+
+  TestRequestHeaderMapImpl expected_headers{
+      {":authority", "foo.com"}, {":path", "/"}, {":method", "GET"}};
+
+  for (int cycle = 0; cycle < 2; ++cycle) {
+    NiceMock<MockRequestDecoder> decoder;
+    setupRequestDecoderMock(decoder);
+    Http::ResponseEncoder* response_encoder = nullptr;
+    EXPECT_CALL(callbacks_, newStream(_, _))
+        .WillOnce([&](Http::ResponseEncoder& encoder, bool) -> Http::RequestDecoder& {
+          response_encoder = &encoder;
+          return decoder;
+        });
+    EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), true));
+    Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nHost: foo.com\r\n\r\n");
+    auto status = codec_->dispatch(buffer);
+    EXPECT_OK(status);
+    EXPECT_EQ(0U, buffer.length());
+    EXPECT_EQ(cycle + 1U, fastPathCount(*codec_));
+
+    // Complete the response so the ActiveRequest is torn down before the next keep-alive
+    // request: onMessageBeginBase's lifecycle assert must hold for the fast path too.
+    response_encoder->encodeHeaders(TestResponseHeaderMapImpl{{":status", "200"}}, true);
+  }
+}
+
 // --- S3 differential parse-equivalence harness ---
 //
 // The fast path REPLACES parse work, so it must be observationally identical to the Balsa
@@ -5814,6 +5876,9 @@ TEST_F(Http1ServerConnectionImplTest, DifferentialParseEquivalenceRequests) {
       "GET / HTTP/1.1\r\nHost: foo\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc",
       // Error parity: invalid method.
       "BAD_METHOD / HTTP/1.1\r\nHost: foo\r\n\r\n",
+      // Error parity: invalid URL (neither absolute path nor absolute URL) — the exact shape the
+      // Http11InvalidRequest regression pins; the fast path must fall back so Balsa reports it.
+      "GET www.somewhere.com HTTP/1.1\r\nHost: bah\r\n\r\n",
       // Error parity: invalid version.
       "GET / HTTP/1.2\r\nHost: foo\r\n\r\n",
       // Error parity: invalid value character.
