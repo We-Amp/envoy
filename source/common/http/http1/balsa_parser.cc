@@ -33,6 +33,7 @@ constexpr absl::string_view kHeaderBlockTerminator = "\r\n\r\n";
 constexpr absl::string_view kCRLF = "\r\n";
 constexpr absl::string_view kContentLength = "content-length";
 constexpr absl::string_view kTransferEncoding = "transfer-encoding";
+constexpr absl::string_view kConnectionUpgrade = "connection";
 
 // RFC 9110 Sections 5.1 and 9.1 define field names and methods as tokens:
 // https://www.rfc-editor.org/rfc/rfc9110.html
@@ -540,11 +541,17 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
     reason = first_line.substr(first_sp + 5);
   }
 
+  if (message_type_ == MessageType::Response && status_code == 101) {
+    // Switching Protocols tunnels everything after the headers; leave it to Balsa.
+    return 0;
+  }
+
   const bool is_http11 = version == Http::Headers::get().ProtocolStrings.Http11String;
 
   // Field lines: strict CRLF framing only. Line-by-line pass collecting framing.
   bool te_present = false;
   bool cl_seen = false;
+  bool upgrade_seen = false;
   uint64_t content_length = 0;
   size_t pos = first_line_end + kCRLF.size();
   while (pos + kCRLF.size() <= block.size()) {
@@ -583,6 +590,10 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
       const absl::string_view lower_name(lower_buf, name.size());
       if (lower_name == kTransferEncoding) {
         te_present = true;
+      } else if (lower_name == kConnectionUpgrade &&
+                 absl::StrContains(line.substr(colon + 1), "upgrade", absl::ascii_tolower)) {
+        // Upgrade-shaped messages are tunneled by the baseline parser; leave them to it.
+        upgrade_seen = true;
       } else if (lower_name == kContentLength) {
         if (cl_seen) {
           // Multiple Content-Length fields: quiche's disallow_multiple_content_length policy
@@ -603,8 +614,8 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
       }
     }
   }
-  if (te_present) {
-    // Chunked or otherwise transfer-encoded messages keep the Balsa path.
+  if (te_present || upgrade_seen) {
+    // Chunked/transfer-encoded and upgrade-shaped messages keep the Balsa path.
     return 0;
   }
 
@@ -670,10 +681,16 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
     }
   }
 
-  status_ = convertResult(connection_->onHeadersComplete());
+  const CallbackResult headers_result = connection_->onHeadersComplete();
+  status_ = convertResult(headers_result);
   if (status_ == ParserStatus::Error) {
     // As above: the commit already mutated connection state, so consume the block.
     return block_len;
+  }
+  if (headers_result == CallbackResult::NoBody || headers_result == CallbackResult::NoBodyData) {
+    // HeaderDone parity: the connection declared the message bodyless regardless of the framing
+    // the scan derived (e.g. responses to HEAD requests).
+    has_body = false;
   }
 
   const size_t header_bytes = block_len;

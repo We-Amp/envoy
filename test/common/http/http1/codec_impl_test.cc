@@ -5564,6 +5564,10 @@ TEST_F(Http1ServerConnectionImplTest, FastPathPostContentLengthSplitBody) {
   EXPECT_OK(status);
   EXPECT_EQ(1U, fastPathCount(*codec_));
 
+  // The second dispatch's chunk is flushed from the buffered body when the message completes,
+  // then the end-stream decodeData follows.
+  Buffer::OwnedImpl expected_data2("56789");
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_data2), false));
   EXPECT_CALL(decoder, decodeData(_, true));
   Buffer::OwnedImpl buffer2("56789");
   status = codec_->dispatch(buffer2);
