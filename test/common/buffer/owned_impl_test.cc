@@ -1642,9 +1642,9 @@ TYPED_TEST(OwnedImplTypedTest, ReadReserveAndCommit) {
   ASSERT_EQ(result.return_value_, static_cast<uint64_t>(rc));
   ASSERT_EQ(os_sys_calls.close(fds[1]).return_value_, 0);
   EXPECT_EQ("bbbbbe", buf.toString());
-  // The 4090-byte reservable tail of the first slice is below the reservation-tail reuse
+  // The 4091-byte reservable tail of the first slice is below the reservation-tail reuse
   // threshold (Slice::default_slice_size_ / 8), so the read byte lands in a fresh 64 KB slice.
-  OwnedImplTest::expectSlices({{5, 4090, 4096}, {1, 65535, 65536}}, buf);
+  OwnedImplTest::expectSlices({{5, 4091, 4096}, {1, 65535, 65536}}, buf);
 }
 
 } // namespace

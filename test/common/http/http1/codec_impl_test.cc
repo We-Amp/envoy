@@ -611,12 +611,13 @@ TEST_F(Http1ServerConnectionImplTest, LargeBodyOptimization) {
   EXPECT_EQ(0U, buffer.length());
 }
 
-// --- S4 refcounted slice storage: bufferBody aliases the header-shared first body slice ---
+// --- S4 refcounted slice storage: bufferBody aliases mid-slice body ranges ---
 //
-// A body range that shares a read slice with parsed headers cannot take bufferBody's whole-slice
-// move branch; with refcounted slice storage it is aliased into the buffered body instead of
-// being copied. These tests pin which of bufferBody's paths ran via bodySliceAliasCount(), so a
-// silent regression to the copy path (or an unintended alias) fails here.
+// Body ranges that start mid-slice (chunked data after a chunk-size line, fragments after
+// partial header consumption) cannot take bufferBody's whole-slice move branch; with refcounted
+// slice storage they are aliased into the buffered body instead of copied. These tests pin which
+// of bufferBody's paths ran via bodySliceAliasCount(), so a silent regression to the copy path
+// (or an unintended alias) fails here.
 
 uint32_t bodyAliasCount(const Http::Connection& codec) {
   const auto* http1 = dynamic_cast<const Http::Http1::ConnectionImpl*>(&codec);
@@ -624,7 +625,11 @@ uint32_t bodyAliasCount(const Http::Connection& codec) {
   return http1->bodySliceAliasCount();
 }
 
-TEST_F(Http1ServerConnectionImplTest, BufferBodyAliasesHeaderSharedFirstSlice) {
+// A Content-Length body sharing a read slice with headers does NOT need the alias: Balsa
+// consumes only the headers per ProcessInput call, the dispatch loop drains, and bufferBody sees
+// the body starting exactly at the drained front slice (the zero-copy move branch). This pins
+// that baseline alignment: no copy AND no alias for the ordinary CL shape.
+TEST_F(Http1ServerConnectionImplTest, BufferBodyContentLengthSingleSliceMovesWithoutAlias) {
   initialize();
 
   MockRequestDecoder decoder;
@@ -636,12 +641,41 @@ TEST_F(Http1ServerConnectionImplTest, BufferBodyAliasesHeaderSharedFirstSlice) {
   const std::string body(4096, 'A');
   std::string post =
       "POST / HTTP/1.1\r\ncontent-length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
-  // One slice holds headers and the whole body: bufferBody cannot take the whole-slice move
-  // branch, so the body range must be aliased rather than copied.
   Buffer::OwnedImpl buffer(post);
 
   TestRequestHeaderMapImpl expected_headers{
       {"content-length", std::to_string(body.size())}, {":path", "/"}, {":method", "POST"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false));
+  Buffer::OwnedImpl expected_data(body);
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_data), false));
+  Buffer::OwnedImpl expected_end;
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_end), true));
+
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer.length());
+  EXPECT_EQ(0u, bodyAliasCount(*codec_));
+}
+
+// Chunked bodies DO hand bufferBody ranges that start mid-slice (after a chunk-size line Balsa
+// consumed inside the same ProcessInput call): those ranges must be aliased, not copied, once
+// they exceed the copy threshold.
+TEST_F(Http1ServerConnectionImplTest, BufferBodyAliasesLargeChunkedBodyInFirstSlice) {
+  initialize();
+
+  MockRequestDecoder decoder;
+  setupRequestDecoderMock(decoder);
+
+  InSequence sequence;
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  const std::string body(4096, 'A');
+  std::string post = "POST / HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n1000\r\n" + body +
+                     "\r\n0\r\n\r\n";
+  Buffer::OwnedImpl buffer(post);
+
+  TestRequestHeaderMapImpl expected_headers{
+      {"transfer-encoding", "chunked"}, {":path", "/"}, {":method", "POST"}};
   EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false));
   Buffer::OwnedImpl expected_data(body);
   EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_data), false));
@@ -4649,7 +4683,7 @@ TEST_F(Http1ClientConnectionImplTest, NoContentLengthResponse) {
   }
 }
 
-TEST_F(Http1ClientConnectionImplTest, BufferBodyAliasesHeaderSharedFirstSlice) {
+TEST_F(Http1ClientConnectionImplTest, BufferBodyAliasesLargeChunkedBodyInFirstSlice) {
   initialize();
 
   StrictMock<MockResponseDecoder> decoder;
@@ -4658,9 +4692,10 @@ TEST_F(Http1ClientConnectionImplTest, BufferBodyAliasesHeaderSharedFirstSlice) {
   EXPECT_OK(request_encoder.encodeHeaders(headers, true));
 
   const std::string body(4096, 'B');
-  std::string response = "HTTP/1.1 200 OK\r\ncontent-length: " + std::to_string(body.size()) +
-                         "\r\n\r\n" + body;
-  // Headers and body share the dispatch slice; the body must be aliased, not copied.
+  std::string response = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1000\r\n" +
+                         body + "\r\n0\r\n\r\n";
+  // The chunk data starts mid-slice (after the chunk-size line Balsa consumed in the same
+  // ProcessInput call); it must be aliased, not copied.
   Buffer::OwnedImpl buffer(response);
 
   InSequence sequence;
