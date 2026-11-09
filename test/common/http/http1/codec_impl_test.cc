@@ -1,6 +1,7 @@
 #include <array>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <string>
 
 #include "envoy/buffer/buffer.h"
@@ -6005,6 +6006,234 @@ TEST_F(Http1ClientConnectionImplTest, DifferentialParseEquivalenceResponses) {
     EXPECT_EQ(fast.codec_error, slow.codec_error) << "wire: " << wire;
     EXPECT_EQ(fast.error_message, slow.error_message) << "wire: " << wire;
   }
+}
+
+// --- S3 randomized differential fuzz pass (seeded, deterministic) ---
+//
+// The lead's gate upgrade: beyond the fixed differential corpus, drive RANDOMIZED wire inputs
+// through the same codec three ways (full-message = fast path when eligible; byte-at-a-time =
+// Balsa fallback forced; random-chunk = either, depending on the splits) and assert identical
+// decoded output per input. Fixed seed so any failure is reproducible; the seed and wire are
+// printed on divergence.
+
+namespace {
+std::mt19937& randomFuzzRng() {
+  static std::mt19937 rng(20261109);
+  return rng;
+}
+std::string pickRandom(const std::vector<std::string>& v) {
+  auto& rng = randomFuzzRng();
+  return v[rng() % v.size()];
+}
+
+EquivalenceDriveResult driveServerWire(Http1ServerConnectionImplTest& fixture,
+                                       const std::string& wire, size_t chunk_size,
+                                       bool close_during_headers) {
+  fixture.codec_settings_.allow_absolute_url_ = true;
+  fixture.codec_ = std::make_unique<Http1::ServerConnectionImpl>(
+      fixture.connection_, fixture.http1CodecStats(), fixture.callbacks_, fixture.codec_settings_,
+      fixture.max_request_headers_kb_, fixture.max_request_headers_count_,
+      envoy::config::core::v3::HttpProtocolOptions::ALLOW, fixture.overload_manager_);
+  NiceMock<MockRequestDecoder> decoder;
+  setupRequestDecoderMock(decoder);
+  ON_CALL(fixture.callbacks_, newStream(_, _)).WillByDefault(ReturnRef(decoder));
+  EquivalenceDriveResult r;
+  ON_CALL(decoder, decodeHeaders_(_, _))
+      .WillByDefault([&](RequestHeaderMapSharedPtr& headers, bool end_stream) {
+        r.headers = serializeHeaderMapForEquivalence(*headers);
+        if (end_stream) {
+          r.end_streams++;
+        }
+        if (close_during_headers) {
+          fixture.connection_.state_ = Network::Connection::State::Closing;
+        }
+      });
+  ON_CALL(decoder, decodeData(_, _))
+      .WillByDefault([&](Buffer::Instance& data, bool end_stream) {
+        r.body += data.toString();
+        if (end_stream) {
+          r.end_streams++;
+        }
+      });
+  for (size_t offset = 0; offset < wire.size(); offset += chunk_size) {
+    Buffer::OwnedImpl chunk(wire.substr(offset, chunk_size));
+    auto status = fixture.codec_->dispatch(chunk);
+    if (!status.ok()) {
+      r.codec_error = true;
+      r.error_message = std::string(status.message());
+      break;
+    }
+  }
+  return r;
+}
+} // namespace
+
+TEST_F(Http1ServerConnectionImplTest, DifferentialParseEquivalenceRandomizedRequests) {
+  const std::vector<std::string> methods = {"GET",       "POST",         "PUT",
+                                            "DELETE",    "OPTIONS",      "PATCH",
+                                            "QUERY",     "BAD_METHOD",   "a-b-c",
+                                            "LONGMETHOD"};
+  const std::vector<std::string> urls = {"/",         "/a/b?q=1",     "http://host/p",
+                                         "*",         "www.example.com", "/x%20y",
+                                         "/deep/path/with/segments"};
+  const std::vector<std::string> versions = {"HTTP/1.1", "HTTP/1.0"};
+  const std::vector<std::string> names = {"host",       "x-a",           "x_uscore",
+                                          "X-MiXeD",    "content-length", "transfer-encoding",
+                                          "connection", "cookie",        "x-pad",
+                                          "x-long-name-0123456789abcdef"};
+  const std::vector<std::string> values = {"",           "v",           "  spaced  ",
+                                           "a\tb",       "\"q:1\"",   "v1, v2",
+                                           "localhost",   "upgrade",     "websocket",
+                                           "chunked",     "5",           "20",
+                                           "close",       "0",           "99999999999",
+                                           "v*v*v*v(v)[v]{v}"};
+  auto& rng = randomFuzzRng();
+  const int kIterations = 300;
+  int divergences = 0;
+  for (int i = 0; i < kIterations; ++i) {
+    std::string wire = pickRandom(methods) + " " + pickRandom(urls) + " " + pickRandom(versions) +
+                       "\r\n";
+    const int header_count = static_cast<int>(rng() % 9);
+    for (int h = 0; h < header_count; ++h) {
+      wire += pickRandom(names) + ":" + (rng() % 2 ? " " : "") + pickRandom(values) + "\r\n";
+      if (rng() % 12 == 0) {
+        // obs-fold continuation (both paths must agree on the joined value)
+        wire += "  folded\r\n";
+      }
+    }
+    wire += "\r\n";
+    if (rng() % 3 == 0) {
+      // a body tail: raw bytes after the header block (CL-shaped or upgrade-payload shaped;
+      // both paths must agree on however the baseline frames it)
+      const int body_len = static_cast<int>(rng() % 12);
+      for (int b = 0; b < body_len; ++b) {
+        wire += static_cast<char>(33 + (rng() % 90));
+      }
+    }
+    if (rng() % 20 == 0) {
+      // truncated message: both paths must agree on the partial-parse result
+      wire = wire.substr(0, wire.size() / 2);
+    }
+    const bool close_during_headers = rng() % 10 == 0;
+
+    EquivalenceDriveResult full = driveServerWire(*this, wire, wire.size(), close_during_headers);
+    EquivalenceDriveResult bytes = driveServerWire(*this, wire, 1, close_during_headers);
+    const size_t chunk_a = 1 + rng() % std::max<size_t>(1, wire.size() / 2);
+    EquivalenceDriveResult chunks = driveServerWire(*this, wire, chunk_a, close_during_headers);
+
+    if (full.headers != bytes.headers || full.headers != chunks.headers ||
+        full.body != bytes.body || full.body != chunks.body ||
+        full.end_streams != bytes.end_streams || full.end_streams != chunks.end_streams ||
+        full.codec_error != bytes.codec_error || full.codec_error != chunks.codec_error ||
+        full.error_message != bytes.error_message || full.error_message != chunks.error_message) {
+      ++divergences;
+      ADD_FAILURE() << "seed=20261109 iter=" << i << " close=" << close_during_headers
+                    << " wire=[" << wire << "] full={h=" << full.headers << ",b=" << full.body
+                    << ",e=" << full.end_streams << ",err=" << full.error_message
+                    << "} bytes={h=" << bytes.headers << ",b=" << bytes.body << ",e="
+                    << bytes.end_streams << ",err=" << bytes.error_message << "} chunks={h="
+                    << chunks.headers << ",b=" << chunks.body << ",e=" << chunks.end_streams
+                    << ",err=" << chunks.error_message << "}";
+      if (divergences >= 5) {
+        break;
+      }
+    }
+  }
+  EXPECT_EQ(0, divergences);
+}
+
+TEST_F(Http1ClientConnectionImplTest, DifferentialParseEquivalenceRandomizedResponses) {
+  const std::vector<std::string> codes = {"100", "101", "200", "204", "206",
+                                          "304", "418", "500", "503"};
+  const std::vector<std::string> names = {"x-a",        "content-length", "transfer-encoding",
+                                          "connection", "upgrade",        "x-pad",
+                                          "x-mixed"};
+  const std::vector<std::string> values = {"",         "5",     "20",      "chunked",
+                                           "upgrade",   "close", "v1, v2",  "  padded  "};
+  auto& rng = randomFuzzRng();
+  const int kIterations = 250;
+  int divergences = 0;
+  auto drive = [this](const std::string& wire, size_t chunk_size,
+                      bool close_during_headers) -> EquivalenceDriveResult {
+    initialize();
+    NiceMock<MockResponseDecoder> response_decoder;
+    Http::RequestEncoder& request_encoder = codec_->newStream(response_decoder);
+    TestRequestHeaderMapImpl headers{{":method", "GET"}, {":path", "/"}};
+    EXPECT_OK(request_encoder.encodeHeaders(headers, true));
+    EquivalenceDriveResult r;
+    ON_CALL(response_decoder, decode1xxHeaders_(_))
+        .WillByDefault([&](ResponseHeaderMapPtr& h) {
+          r.headers += "1xx\n" + serializeHeaderMapForEquivalence(*h);
+        });
+    ON_CALL(response_decoder, decodeHeaders_(_, _))
+        .WillByDefault([&](ResponseHeaderMapPtr& h, bool end_stream) {
+          r.headers += serializeHeaderMapForEquivalence(*h);
+          if (end_stream) {
+            r.headers += "es";
+            r.end_streams++;
+          }
+        });
+    ON_CALL(response_decoder, decodeData(_, _))
+        .WillByDefault([&](Buffer::Instance& data, bool end_stream) {
+          r.body += data.toString();
+          if (end_stream) {
+            r.end_streams++;
+          }
+        });
+    for (size_t offset = 0; offset < wire.size(); offset += chunk_size) {
+      Buffer::OwnedImpl chunk(wire.substr(offset, chunk_size));
+      auto status = codec_->dispatch(chunk);
+      if (!status.ok()) {
+        r.codec_error = true;
+        r.error_message = std::string(status.message());
+        break;
+      }
+    }
+    (void)close_during_headers;
+    return r;
+  };
+
+  for (int i = 0; i < kIterations; ++i) {
+    std::string wire = "HTTP/1.1 " + pickRandom(codes) + " Reason Phrase\r\n";
+    const int header_count = static_cast<int>(rng() % 7);
+    for (int h = 0; h < header_count; ++h) {
+      wire += pickRandom(names) + ":" + (rng() % 2 ? " " : "") + pickRandom(values) + "\r\n";
+    }
+    wire += "\r\n";
+    if (rng() % 3 == 0) {
+      const int body_len = static_cast<int>(rng() % 12);
+      for (int b = 0; b < body_len; ++b) {
+        wire += static_cast<char>(33 + (rng() % 90));
+      }
+    }
+    if (rng() % 20 == 0) {
+      wire = wire.substr(0, wire.size() / 2);
+    }
+
+    EquivalenceDriveResult full = drive(wire, wire.size(), false);
+    EquivalenceDriveResult bytes = drive(wire, 1, false);
+    const size_t chunk_a = 1 + rng() % std::max<size_t>(1, wire.size() / 2);
+    EquivalenceDriveResult chunks = drive(wire, chunk_a, false);
+
+    if (full.headers != bytes.headers || full.headers != chunks.headers ||
+        full.body != bytes.body || full.body != chunks.body ||
+        full.end_streams != bytes.end_streams || full.end_streams != chunks.end_streams ||
+        full.codec_error != bytes.codec_error || full.codec_error != chunks.codec_error ||
+        full.error_message != bytes.error_message || full.error_message != chunks.error_message) {
+      ++divergences;
+      ADD_FAILURE() << "seed=20261109 iter=" << i << " wire=[" << wire << "] full={h="
+                    << full.headers << ",b=" << full.body << ",e=" << full.end_streams
+                    << ",err=" << full.error_message << "} bytes={h=" << bytes.headers
+                    << ",b=" << bytes.body << ",e=" << bytes.end_streams << ",err="
+                    << bytes.error_message << "} chunks={h=" << chunks.headers << ",b="
+                    << chunks.body << ",e=" << chunks.end_streams << ",err="
+                    << chunks.error_message << "}";
+      if (divergences >= 5) {
+        break;
+      }
+    }
+  }
+  EXPECT_EQ(0, divergences);
 }
 
 } // namespace Http
