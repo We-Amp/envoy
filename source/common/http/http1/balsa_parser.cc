@@ -626,7 +626,10 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
   first_message_ = false;
   status_ = convertResult(connection_->onMessageBegin());
   if (status_ == ParserStatus::Error) {
-    return 0;
+    // The message has already begun from the connection's perspective (state mutated): the
+    // caller must not fall through to the baseline preamble, which would run onMessageBegin a
+    // second time. Return the block as consumed; dispatch observes the codec error instead.
+    return block_len;
   }
   if (message_type_ == MessageType::Request) {
     status_ = convertResult(connection_->onUrl(url.data(), url.size()));
@@ -634,7 +637,8 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
     status_ = convertResult(connection_->onStatus(reason.data(), reason.size()));
   }
   if (status_ == ParserStatus::Error) {
-    return 0;
+    // As above: the commit already mutated connection state, so consume the block.
+    return block_len;
   }
 
   fast_message_ = true;
@@ -661,13 +665,15 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
     status_ = convertResult(connection_->onFastHeaderField(line.substr(0, colon),
                                                            line.substr(colon + 1)));
     if (status_ == ParserStatus::Error) {
-      return 0;
+      // As above: the commit already mutated connection state, so consume the block.
+      return block_len;
     }
   }
 
   status_ = convertResult(connection_->onHeadersComplete());
   if (status_ == ParserStatus::Error) {
-    return 0;
+    // As above: the commit already mutated connection state, so consume the block.
+    return block_len;
   }
 
   const size_t header_bytes = block_len;
