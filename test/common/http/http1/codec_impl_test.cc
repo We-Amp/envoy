@@ -6025,47 +6025,6 @@ std::string pickRandom(const std::vector<std::string>& v) {
   auto& rng = randomFuzzRng();
   return v[rng() % v.size()];
 }
-
-EquivalenceDriveResult driveServerWire(Http1ServerConnectionImplTest& fixture,
-                                       const std::string& wire, size_t chunk_size,
-                                       bool close_during_headers) {
-  fixture.codec_settings_.allow_absolute_url_ = true;
-  fixture.codec_ = std::make_unique<Http1::ServerConnectionImpl>(
-      fixture.connection_, fixture.http1CodecStats(), fixture.callbacks_, fixture.codec_settings_,
-      fixture.max_request_headers_kb_, fixture.max_request_headers_count_,
-      envoy::config::core::v3::HttpProtocolOptions::ALLOW, fixture.overload_manager_);
-  NiceMock<MockRequestDecoder> decoder;
-  setupRequestDecoderMock(decoder);
-  ON_CALL(fixture.callbacks_, newStream(_, _)).WillByDefault(ReturnRef(decoder));
-  EquivalenceDriveResult r;
-  ON_CALL(decoder, decodeHeaders_(_, _))
-      .WillByDefault([&](RequestHeaderMapSharedPtr& headers, bool end_stream) {
-        r.headers = serializeHeaderMapForEquivalence(*headers);
-        if (end_stream) {
-          r.end_streams++;
-        }
-        if (close_during_headers) {
-          fixture.connection_.state_ = Network::Connection::State::Closing;
-        }
-      });
-  ON_CALL(decoder, decodeData(_, _))
-      .WillByDefault([&](Buffer::Instance& data, bool end_stream) {
-        r.body += data.toString();
-        if (end_stream) {
-          r.end_streams++;
-        }
-      });
-  for (size_t offset = 0; offset < wire.size(); offset += chunk_size) {
-    Buffer::OwnedImpl chunk(wire.substr(offset, chunk_size));
-    auto status = fixture.codec_->dispatch(chunk);
-    if (!status.ok()) {
-      r.codec_error = true;
-      r.error_message = std::string(status.message());
-      break;
-    }
-  }
-  return r;
-}
 } // namespace
 
 TEST_F(Http1ServerConnectionImplTest, DifferentialParseEquivalenceRandomizedRequests) {
@@ -6087,6 +6046,46 @@ TEST_F(Http1ServerConnectionImplTest, DifferentialParseEquivalenceRandomizedRequ
                                            "chunked",     "5",           "20",
                                            "close",       "0",           "99999999999",
                                            "v*v*v*v(v)[v]{v}"};
+  auto drive = [this](const std::string& wire, size_t chunk_size,
+                      bool close_during_headers) -> EquivalenceDriveResult {
+    codec_settings_.allow_absolute_url_ = true;
+    codec_ = std::make_unique<Http1::ServerConnectionImpl>(
+        connection_, http1CodecStats(), callbacks_, codec_settings_, max_request_headers_kb_,
+        max_request_headers_count_, envoy::config::core::v3::HttpProtocolOptions::ALLOW,
+        overload_manager_);
+    NiceMock<MockRequestDecoder> decoder;
+    setupRequestDecoderMock(decoder);
+    ON_CALL(callbacks_, newStream(_, _)).WillByDefault(ReturnRef(decoder));
+    EquivalenceDriveResult r;
+    ON_CALL(decoder, decodeHeaders_(_, _))
+        .WillByDefault([&](RequestHeaderMapSharedPtr& headers, bool end_stream) {
+          r.headers = serializeHeaderMapForEquivalence(*headers);
+          if (end_stream) {
+            r.end_streams++;
+          }
+          if (close_during_headers) {
+            connection_.state_ = Network::Connection::State::Closing;
+          }
+        });
+    ON_CALL(decoder, decodeData(_, _))
+        .WillByDefault([&](Buffer::Instance& data, bool end_stream) {
+          r.body += data.toString();
+          if (end_stream) {
+            r.end_streams++;
+          }
+        });
+    for (size_t offset = 0; offset < wire.size(); offset += chunk_size) {
+      Buffer::OwnedImpl chunk(wire.substr(offset, chunk_size));
+      auto status = codec_->dispatch(chunk);
+      if (!status.ok()) {
+        r.codec_error = true;
+        r.error_message = std::string(status.message());
+        break;
+      }
+    }
+    return r;
+  };
+
   auto& rng = randomFuzzRng();
   const int kIterations = 300;
   int divergences = 0;
@@ -6116,10 +6115,10 @@ TEST_F(Http1ServerConnectionImplTest, DifferentialParseEquivalenceRandomizedRequ
     }
     const bool close_during_headers = rng() % 10 == 0;
 
-    EquivalenceDriveResult full = driveServerWire(*this, wire, wire.size(), close_during_headers);
-    EquivalenceDriveResult bytes = driveServerWire(*this, wire, 1, close_during_headers);
+    EquivalenceDriveResult full = drive(wire, wire.size(), close_during_headers);
+    EquivalenceDriveResult bytes = drive(wire, 1, close_during_headers);
     const size_t chunk_a = 1 + rng() % std::max<size_t>(1, wire.size() / 2);
-    EquivalenceDriveResult chunks = driveServerWire(*this, wire, chunk_a, close_during_headers);
+    EquivalenceDriveResult chunks = drive(wire, chunk_a, close_during_headers);
 
     if (full.headers != bytes.headers || full.headers != chunks.headers ||
         full.body != bytes.body || full.body != chunks.body ||
