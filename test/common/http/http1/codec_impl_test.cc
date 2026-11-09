@@ -6262,5 +6262,41 @@ TEST_F(Http1ClientConnectionImplTest, DifferentialParseEquivalenceRandomizedResp
             << " divergences=" << divergences << std::endl;
 }
 
+// TEMP DIAGNOSTIC (remove before final): deterministic repro of fuzz iter-48.
+TEST_F(Http1ClientConnectionImplTest, TmpDiag304TrailingGarbage) {
+  initialize();
+  NiceMock<MockResponseDecoder> response_decoder;
+  Http::RequestEncoder& request_encoder = codec_->newStream(response_decoder);
+  TestRequestHeaderMapImpl headers{{":method", "GET"}, {":path", "/"}};
+  EXPECT_OK(request_encoder.encodeHeaders(headers, true));
+  std::string wire = "HTTP/1.1 304 Reason Phrase\r\nx-mixed:\r\nupgrade:   padded  \r\nx-mixed:upgrade\r\nx-a: chunked\r\n\r\n4i";
+  auto drive = [&](const char* tag, size_t chunk_size) {
+    codec_ = std::make_unique<Http1::ClientConnectionImpl>(
+        connection_, http1CodecStats(), callbacks_, codec_settings_, max_response_headers_kb_,
+        max_response_headers_count_, /* passing_through_proxy=*/false);
+    NiceMock<MockResponseDecoder> rd;
+    codec_->newStream(rd);
+    std::cerr << "DIAG " << tag << " begin\n";
+    EquivalenceDriveResult r;
+    for (size_t offset = 0; offset < wire.size(); offset += chunk_size) {
+      Buffer::OwnedImpl chunk(wire.substr(offset, chunk_size));
+      std::cerr << "DIAG " << tag << " dispatch offset=" << offset << " bytes="
+                << (chunk_size < wire.size() - offset ? chunk_size : wire.size() - offset) << "\n";
+      auto status = codec_->dispatch(chunk);
+      std::cerr << "DIAG " << tag << " -> ok=" << status.ok() << " remaining=" << chunk.length()
+                << " fast=" << fastPathCount(*codec_) << "\n";
+      if (!status.ok()) {
+        r.error_message = std::string(status.message());
+        std::cerr << "DIAG " << tag << " err=" << r.error_message << "\n";
+        break;
+      }
+    }
+    return r;
+  };
+  auto a = drive("full", wire.size());
+  auto b = drive("bytes", 1);
+  std::cerr << "DIAG full.err=" << a.error_message << " bytes.err=" << b.error_message << "\n";
+}
+
 } // namespace Http
 } // namespace Envoy
