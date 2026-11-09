@@ -664,6 +664,21 @@ TEST_F(OwnedImplTest, PartialMoveLargeSliceAliasesStorage) {
   EXPECT_EQ(body.substr(0, 10000) + "tail", dest.toString());
 }
 
+TEST_F(OwnedImplTest, PartialMoveAliasesAfterPartialDrain) {
+  Buffer::OwnedImpl src;
+  const std::string body(8192, 'y');
+  src.add(body);
+  // Advance the source slice's data start: the alias offset is relative to the DATA start, and
+  // must anchor there, not at the raw storage start.
+  src.drain(100);
+  Buffer::OwnedImpl dest;
+  dest.move(src, 4000);
+  EXPECT_EQ(4000, dest.length());
+  EXPECT_EQ(std::string(4000, 'y'), dest.toString());
+  EXPECT_EQ(4092, src.length());
+  EXPECT_EQ(std::string(4092, 'y'), src.toString());
+}
+
 TEST_F(OwnedImplTest, AliasOutlivesSourceSlice) {
   Buffer::OwnedImpl src;
   const std::string body(8192, 'y');

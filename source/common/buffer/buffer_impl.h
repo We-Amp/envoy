@@ -226,7 +226,7 @@ public:
     Slice view;
     view.storage_ = storage_;
     view.capacity_ = length;
-    view.base_ = base_ + offset;
+    view.base_ = base_ + data_ + offset;
     view.data_ = 0;
     view.reservable_ = length;
     view.frozen_ = true;
