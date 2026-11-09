@@ -691,6 +691,12 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
 
   fast_body_state_ = FastBodyState::ContentLength;
   fast_body_remaining_ = content_length;
+  if (len == header_bytes) {
+    // The body arrives in later dispatches; an exhausted slice is not an EOF. Feeding zero
+    // bytes here must not raise the parser's end-of-file error (that is reserved for genuine
+    // zero-length flush dispatches while the body is incomplete).
+    return header_bytes;
+  }
   return header_bytes + fastPathBody(slice + header_bytes, len - header_bytes);
 }
 
