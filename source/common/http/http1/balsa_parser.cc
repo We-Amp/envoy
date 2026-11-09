@@ -675,6 +675,12 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
     MessageDone();
     return header_bytes;
   }
+  if (status_ == ParserStatus::Paused) {
+    // The codec paused during the header callbacks (e.g. the connection began closing while
+    // decodeHeaders ran): stop at the headers and leave the body unconsumed, exactly like the
+    // baseline parser, which feeds no body bytes after a pause in onHeadersCompleteBase.
+    return header_bytes;
+  }
 
   fast_body_state_ = FastBodyState::ContentLength;
   fast_body_remaining_ = content_length;
