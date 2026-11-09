@@ -5479,7 +5479,7 @@ TEST_F(Http1ClientConnectionImplTest, EncodeHeadersConnectEmptyAuthority) {
 // fastPathMessageCount() so the Balsa fallback trigger conditions stay pinned (a regression that
 // silently routes a message through the wrong path must fail here).
 
-uint32_t fastPathCount(const Http::ConnectionCodec& codec) {
+uint32_t fastPathCount(const Http::Connection& codec) {
   const auto* http1 = dynamic_cast<const Http::Http1::ConnectionImpl*>(&codec);
   RELEASE_ASSERT(http1 != nullptr, "codec is not an Http1 ConnectionImpl");
   return http1->fastPathMessageCount();
@@ -5659,14 +5659,14 @@ TEST_F(Http1ServerConnectionImplTest, FastPathFallbackConnect) {
 TEST_F(Http1ServerConnectionImplTest, FastPathFallbackDuplicateContentLength) {
   Buffer::OwnedImpl buffer(
       "POST / HTTP/1.1\r\nHost: foo\r\ncontent-length: 5\r\ncontent-length: 5\r\n\r\nhello");
-  expect400(buffer, Http1ResponseCodeDetails::get().HttpCodecError,
+  expect400(buffer, "http1.codec_error",
             "http/1.1 protocol error: HPE_UNEXPECTED_CONTENT_LENGTH");
   EXPECT_EQ(0U, fastPathCount(*codec_));
 }
 
 TEST_F(Http1ServerConnectionImplTest, FastPathFallbackInvalidMethod) {
   Buffer::OwnedImpl buffer("BAD_METHOD / HTTP/1.1\r\nHost: foo\r\n\r\n");
-  expect400(buffer, Http1ResponseCodeDetails::get().HttpCodecError,
+  expect400(buffer, "http1.codec_error",
             "http/1.1 protocol error: HPE_INVALID_METHOD");
   EXPECT_EQ(0U, fastPathCount(*codec_));
 }
@@ -5758,9 +5758,10 @@ TEST_F(Http1ClientConnectionImplTest, FastPathFallbackResponseNoContentLength) {
 namespace {
 std::string serializeHeaderMapForEquivalence(const HeaderMap& map) {
   std::string out;
-  for (const auto& header : map) {
+  map.iterate([&out](const HeaderEntry& header) {
     absl::StrAppend(&out, header.key().getStringView(), "=", header.value().getStringView(), "\n");
-  }
+    return HeaderMap::Iterate::Continue;
+  });
   return out;
 }
 
