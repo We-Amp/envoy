@@ -174,6 +174,25 @@ bool isHeaderNameValid(absl::string_view name) {
                      [](absl::string_view::value_type c) { return isValidTokenCharacter(c); });
 }
 
+// Case-insensitive substring search (the absl predicate overload is not used to keep the
+// dependency surface minimal).
+bool containsCaseInsensitive(absl::string_view haystack, absl::string_view needle) {
+  const size_t n = needle.size();
+  if (haystack.size() < n) {
+    return false;
+  }
+  for (size_t i = 0; i + n <= haystack.size(); ++i) {
+    size_t j = 0;
+    while (j < n && absl::ascii_tolower(haystack[i + j]) == absl::ascii_tolower(needle[j])) {
+      ++j;
+    }
+    if (j == n) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // anonymous namespace
 
 BalsaParser::BalsaParser(MessageType type, ParserCallbacks* connection, size_t max_header_length,
@@ -591,7 +610,7 @@ size_t BalsaParser::tryFastPath(const char* slice, size_t len) {
       if (lower_name == kTransferEncoding) {
         te_present = true;
       } else if (lower_name == kConnectionUpgrade &&
-                 absl::StrContains(line.substr(colon + 1), "upgrade", absl::ascii_tolower)) {
+                 containsCaseInsensitive(line.substr(colon + 1), "upgrade")) {
         // Upgrade-shaped messages are tunneled by the baseline parser; leave them to it.
         upgrade_seen = true;
       } else if (lower_name == kContentLength) {
