@@ -638,6 +638,149 @@ TEST_F(OwnedImplTest, PartialMoveDrainTrackers) {
   buffer2.drain(buffer2.length());
 }
 
+// --- S4 refcounted slice storage: alias views over shared storage ---
+
+TEST_F(OwnedImplTest, PartialMoveLargeSliceAliasesStorage) {
+  Buffer::OwnedImpl src;
+  const std::string body(16384, 'x');
+  src.add(body);
+  Buffer::OwnedImpl dest;
+
+  // A partial move above CopyThreshold must alias the shared storage, not copy.
+  dest.move(src, 10000);
+  EXPECT_EQ(10000, dest.length());
+  EXPECT_EQ(6384, src.length());
+  EXPECT_EQ(body.substr(0, 10000), dest.toString());
+  EXPECT_EQ(body.substr(10000), src.toString());
+
+  // The source slice was frozen by the alias: its storage must not be handed out again.
+  const auto src_slices = src.describeSlicesForTest();
+  ASSERT_EQ(1, src_slices.size());
+  EXPECT_EQ(0, src_slices[0].reservable);
+
+  // The aliased slice is not coalescable: appending to dest creates a separate slice.
+  dest.add("tail");
+  ASSERT_EQ(2, dest.getRawSlices().size());
+  EXPECT_EQ(body.substr(0, 10000) + "tail", dest.toString());
+}
+
+TEST_F(OwnedImplTest, AliasOutlivesSourceSlice) {
+  Buffer::OwnedImpl src;
+  const std::string body(8192, 'y');
+  src.add(body);
+  Buffer::OwnedImpl dest;
+  dest.move(src, 4096);
+  EXPECT_EQ(4096, dest.length());
+
+  // Drain the source remainder and pop the frozen slice entirely.
+  src.drain(src.length());
+  EXPECT_EQ(0, src.length());
+  EXPECT_EQ(0, src.getRawSlices().size());
+
+  // The alias still reads the shared bytes.
+  EXPECT_EQ(body.substr(0, 4096), dest.toString());
+}
+
+TEST_F(OwnedImplTest, FrozenSliceRefusesWrites) {
+  Buffer::OwnedImpl src;
+  const std::string body(8192, 'z');
+  src.add(body);
+  Buffer::OwnedImpl dest;
+  dest.move(src, 4096);
+  ASSERT_EQ(0, src.describeSlicesForTest()[0].reservable);
+
+  // Appends must land in a new slice; the frozen front slice stays byte-identical.
+  src.add("more");
+  EXPECT_EQ(4100, src.length());
+  EXPECT_EQ(body.substr(4096) + "more", src.toString());
+  EXPECT_EQ(body.substr(0, 4096), dest.toString());
+
+  // Read reservations must not reuse the frozen tail's storage.
+  const void* frozen_storage = src.getRawSlices()[0].mem_;
+  auto reservation = src.reserveForRead();
+  EXPECT_NE(frozen_storage, reservation.slices()[0].mem_);
+}
+
+TEST_F(OwnedImplTest, PartialMoveSmallSliceStillCoalesces) {
+  Buffer::OwnedImpl src;
+  src.add(std::string(4096, 'a'));
+  Buffer::OwnedImpl dest;
+  dest.add(std::string(8, 'b'));
+
+  // A partial move below CopyThreshold keeps the copy-and-coalesce behavior.
+  dest.move(src, 100);
+  EXPECT_EQ(108, dest.length());
+  EXPECT_EQ(1, dest.getRawSlices().size());
+  EXPECT_EQ(std::string(8, 'b') + std::string(100, 'a'), dest.toString());
+  // The source was not frozen: its tail is still reservable.
+  EXPECT_GT(src.describeSlicesForTest()[0].reservable, 0);
+}
+
+TEST_F(OwnedImplTest, ExtractMutableFrontSliceCopiesFrozenSlice) {
+  Buffer::OwnedImpl src;
+  const std::string body(8192, 'c');
+  src.add(body);
+  Buffer::OwnedImpl dest;
+  dest.move(src, 4096);
+
+  auto slice_data = src.extractMutableFrontSlice();
+  absl::Span<uint8_t> mutable_data = slice_data->getMutableData();
+  ASSERT_EQ(4096, mutable_data.size());
+  EXPECT_EQ('c', mutable_data[0]);
+  // Mutating the extracted copy must not affect the alias in dest.
+  mutable_data[0] = 'X';
+  EXPECT_EQ(body.substr(0, 4096), dest.toString());
+  // The extraction removes the front slice; only the remainder stays in src.
+  EXPECT_EQ(4096, src.length());
+  EXPECT_EQ(body.substr(4096), src.toString());
+}
+
+TEST_F(OwnedImplTest, AddAliasFromSourceMiddleRange) {
+  Buffer::OwnedImpl src;
+  const std::string payload(512, 'H');
+  const std::string body(2048, 'B');
+  src.add(payload + body);
+  Buffer::OwnedImpl dest;
+
+  // Alias the body range that shares the front slice with the payload bytes.
+  RawSlice front = src.frontSlice();
+  const char* body_start = static_cast<const char*>(front.mem_) + payload.size();
+  EXPECT_TRUE(dest.addAliasFromSource(src, body_start, body.size()));
+  EXPECT_EQ(body, dest.toString());
+
+  // The source is readable and intact, but its storage is no longer writable.
+  EXPECT_EQ(payload + body, src.toString());
+  EXPECT_EQ(0, src.describeSlicesForTest()[0].reservable);
+
+  // Below-threshold ranges are refused and nothing is added.
+  Buffer::OwnedImpl small;
+  EXPECT_FALSE(small.addAliasFromSource(src, front.mem_, 100));
+  EXPECT_EQ(0, small.length());
+
+  // Re-aliasing a frozen slice is fine: sharing is reference counted.
+  Buffer::OwnedImpl dest2;
+  EXPECT_TRUE(dest2.addAliasFromSource(src, front.mem_, payload.size()));
+  EXPECT_EQ(payload, dest2.toString());
+  EXPECT_EQ(body, dest.toString());
+}
+
+TEST_F(OwnedImplTest, LinearizeWithFrozenAliasSlice) {
+  Buffer::OwnedImpl src;
+  const std::string body(8192, 'd');
+  src.add(body);
+  Buffer::OwnedImpl dest;
+  dest.move(src, 4096);
+  dest.add("tail");
+  ASSERT_EQ(2, dest.getRawSlices().size());
+
+  const std::string expected = body.substr(0, 4096) + "tail";
+  EXPECT_EQ(expected, dest.toString());
+  dest.linearize(expected.size());
+  EXPECT_EQ(expected, dest.toString());
+  // The source's aliased bytes are unaffected by dest's linearization copy.
+  EXPECT_EQ(body.substr(4096), src.toString());
+}
+
 TEST_F(OwnedImplTest, DrainTrackingOnDestruction) {
   testing::InSequence s;
 
@@ -833,26 +976,27 @@ TEST_F(OwnedImplTest, ReserveCommit) {
     // should result in the buffer creating a second slice and splitting the reservation between the
     // last two slices.
     {
-      expectSlices({{1, 16383, 16384}}, buffer);
+      // Reservation slices use the 64 KB default read-slice size.
+      expectSlices({{1, 65535, 65536}}, buffer);
       auto reservation = buffer.reserveForRead();
       EXPECT_GE(reservation.numSlices(), 2);
       EXPECT_GE(reservation.length(), 32767);
       EXPECT_EQ(slice1, reservation.slices()[0].mem_);
-      EXPECT_EQ(16383, reservation.slices()[0].len_);
-      EXPECT_EQ(16384, reservation.slices()[1].len_);
+      EXPECT_EQ(65535, reservation.slices()[0].len_);
+      EXPECT_EQ(65536, reservation.slices()[1].len_);
     }
 
     // Append a fragment to the buffer, and then request a small reservation. The buffer
     // should make a new slice to satisfy the reservation; it cannot safely use any of
     // the previously seen slices, because they are no longer at the end of the buffer.
     {
-      expectSlices({{1, 16383, 16384}}, buffer);
+      expectSlices({{1, 65535, 65536}}, buffer);
       buffer.addBufferFragment(fragment);
       EXPECT_EQ(13, buffer.length());
       auto reservation = buffer.reserveForRead();
       EXPECT_NE(slice1, reservation.slices()[0].mem_);
       reservation.commit(1);
-      expectSlices({{1, 16383, 16384}, {12, 0, 12}, {1, 16383, 16384}}, buffer);
+      expectSlices({{1, 65535, 65536}, {12, 0, 12}, {1, 65535, 65536}}, buffer);
     }
     EXPECT_EQ(14, buffer.length());
   }
@@ -908,8 +1052,10 @@ TEST_F(OwnedImplTest, ReserveCommitReuse) {
     reservation.commit(1);
   }
   EXPECT_EQ(8001, buffer.length());
-  // The second slice is now released because there's nothing in the second slice.
-  expectSlices({{8001, 4287, 12288}}, buffer);
+  // The committed byte landed in a fresh 64 KB reservation slice: the 12288-byte slice's
+  // remaining 4288 bytes are below the reservation-tail reuse threshold
+  // (Slice::default_slice_size_ / 8).
+  expectSlices({{8001, 4287, 12288}, {1, 65535, 65536}}, buffer);
 
   // Reserve again.
   {
@@ -918,7 +1064,7 @@ TEST_F(OwnedImplTest, ReserveCommitReuse) {
     EXPECT_EQ(static_cast<const uint8_t*>(first_slice) + 1,
               static_cast<const uint8_t*>(reservation.slices()[0].mem_));
   }
-  expectSlices({{8001, 4287, 12288}}, buffer);
+  expectSlices({{8001, 4287, 12288}, {1, 65535, 65536}}, buffer);
 }
 
 // Test behavior when the size to commit() is larger than the reservation.
@@ -1231,14 +1377,14 @@ TEST_F(OwnedImplTest, CopyOutToSlicesTests) {
     EXPECT_EQ(32 * 1024, src_buf.frontSlice().len_);
 
     Buffer::OwnedImpl dest_buf;
-    // The destination buffer are expected to have 8 Slices, each slice has 16KB buffer.
+    // The destination buffer are expected to have 8 Slices, each slice has 64KB buffer.
     auto reservation = dest_buf.reserveForRead();
     EXPECT_EQ(8, reservation.numSlices());
     for (uint64_t i = 0; i < reservation.numSlices(); i++) {
-      EXPECT_EQ(16 * 1024, reservation.slices()[i].len_);
+      EXPECT_EQ(64 * 1024, reservation.slices()[i].len_);
     }
 
-    // Copy single 32 KB slice's data to 8 * 16KB slices.
+    // Copy single 32 KB slice's data to 8 * 64KB slices.
     EXPECT_EQ(data.size(),
               src_buf.copyOutToSlices(32 * 1024, reservation.slices(), reservation.numSlices()));
     reservation.commit(data.size());
@@ -1256,14 +1402,14 @@ TEST_F(OwnedImplTest, CopyOutToSlicesTests) {
     src_buf.appendSliceForTest("ld", 2);
     src_buf.appendSliceForTest("!", 1);
     Buffer::OwnedImpl dest_buf;
-    // The destination buffer are expected to have 8 Slices, each slice has 16KB buffer.
+    // The destination buffer are expected to have 8 Slices, each slice has 64KB buffer.
     auto reservation = dest_buf.reserveForRead();
     EXPECT_EQ(8, reservation.numSlices());
     for (uint64_t i = 0; i < reservation.numSlices(); i++) {
-      EXPECT_EQ(16 * 1024, reservation.slices()[i].len_);
+      EXPECT_EQ(64 * 1024, reservation.slices()[i].len_);
     }
 
-    // Copy data from src 7 slices into the first 16K slice of dest.
+    // Copy data from src 7 slices into the first 64K slice of dest.
     EXPECT_EQ(data.size(),
               src_buf.copyOutToSlices(100, reservation.slices(), reservation.numSlices()));
     reservation.commit(data.size());
@@ -1465,7 +1611,7 @@ TYPED_TEST(OwnedImplTypedTest, ReserveZeroCommit) {
   ASSERT_EQ(os_sys_calls.close(fds[1]).return_value_, 0);
   ASSERT_EQ(previous_length, buf.search(data.data(), rc, previous_length, 0));
   EXPECT_EQ("bbbbb", buf.toString().substr(0, 5));
-  OwnedImplTest::expectSlices({{5, 0, 4096}, {1953, 14431, 16384}}, buf);
+  OwnedImplTest::expectSlices({{5, 0, 4096}, {1953, 63583, 65536}}, buf);
 }
 
 TYPED_TEST(OwnedImplTypedTest, ReadReserveAndCommit) {
@@ -1493,7 +1639,9 @@ TYPED_TEST(OwnedImplTypedTest, ReadReserveAndCommit) {
   ASSERT_EQ(result.return_value_, static_cast<uint64_t>(rc));
   ASSERT_EQ(os_sys_calls.close(fds[1]).return_value_, 0);
   EXPECT_EQ("bbbbbe", buf.toString());
-  OwnedImplTest::expectSlices({{6, 4090, 4096}}, buf);
+  // The 4090-byte reservable tail of the first slice is below the reservation-tail reuse
+  // threshold (Slice::default_slice_size_ / 8), so the read byte lands in a fresh 64 KB slice.
+  OwnedImplTest::expectSlices({{5, 4090, 4096}, {1, 65535, 65536}}, buf);
 }
 
 } // namespace

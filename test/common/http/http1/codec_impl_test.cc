@@ -611,6 +611,104 @@ TEST_F(Http1ServerConnectionImplTest, LargeBodyOptimization) {
   EXPECT_EQ(0U, buffer.length());
 }
 
+// --- S4 refcounted slice storage: bufferBody aliases the header-shared first body slice ---
+//
+// A body range that shares a read slice with parsed headers cannot take bufferBody's whole-slice
+// move branch; with refcounted slice storage it is aliased into the buffered body instead of
+// being copied. These tests pin which of bufferBody's paths ran via bodySliceAliasCount(), so a
+// silent regression to the copy path (or an unintended alias) fails here.
+
+uint32_t bodyAliasCount(const Http::Connection& codec) {
+  const auto* http1 = dynamic_cast<const Http::Http1::ConnectionImpl*>(&codec);
+  RELEASE_ASSERT(http1 != nullptr, "codec is not an Http1 ConnectionImpl");
+  return http1->bodySliceAliasCount();
+}
+
+TEST_F(Http1ServerConnectionImplTest, BufferBodyAliasesHeaderSharedFirstSlice) {
+  initialize();
+
+  MockRequestDecoder decoder;
+  setupRequestDecoderMock(decoder);
+
+  InSequence sequence;
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  const std::string body(4096, 'A');
+  std::string post =
+      "POST / HTTP/1.1\r\ncontent-length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
+  // One slice holds headers and the whole body: bufferBody cannot take the whole-slice move
+  // branch, so the body range must be aliased rather than copied.
+  Buffer::OwnedImpl buffer(post);
+
+  TestRequestHeaderMapImpl expected_headers{
+      {"content-length", std::to_string(body.size())}, {":path", "/"}, {":method", "POST"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false));
+  Buffer::OwnedImpl expected_data(body);
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_data), false));
+  Buffer::OwnedImpl expected_end;
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_end), true));
+
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer.length());
+  EXPECT_GE(bodyAliasCount(*codec_), 1u);
+}
+
+// The copy path stays pinned for body fragments below the alias threshold, and the buffered body
+// keeps merging fragmented bodies into a single decodeData call.
+TEST_F(Http1ServerConnectionImplTest, BufferBodySmallFragmentsStillCopyAndMerge) {
+  initialize();
+
+  MockRequestDecoder decoder;
+  setupRequestDecoderMock(decoder);
+
+  InSequence sequence;
+  EXPECT_CALL(callbacks_, newStream(_, _)).WillOnce(ReturnRef(decoder));
+
+  const std::string body = "12345";
+  std::string post =
+      "POST / HTTP/1.1\r\ncontent-length: 5\r\n\r\n" + body;
+  Buffer::OwnedImpl buffer = createBufferWithNByteSlices(post, 1);
+
+  TestRequestHeaderMapImpl expected_headers{
+      {"content-length", "5"}, {":path", "/"}, {":method", "POST"}};
+  EXPECT_CALL(decoder, decodeHeaders_(HeaderMapEqual(&expected_headers), false));
+  Buffer::OwnedImpl expected_data(body);
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_data), false));
+  Buffer::OwnedImpl expected_end;
+  EXPECT_CALL(decoder, decodeData(BufferEqual(&expected_end), true));
+
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer.length());
+  EXPECT_EQ(0u, bodyAliasCount(*codec_));
+}
+
+TEST_F(Http1ClientConnectionImplTest, BufferBodyAliasesHeaderSharedFirstSlice) {
+  initialize();
+
+  StrictMock<MockResponseDecoder> decoder;
+  Http::RequestEncoder& request_encoder = codec_->newStream(decoder);
+  TestRequestHeaderMapImpl headers{{":method", "GET"}, {":path", "/"}, {":authority", "host"}};
+  EXPECT_OK(request_encoder.encodeHeaders(headers, true));
+
+  const std::string body(4096, 'B');
+  std::string response = "HTTP/1.1 200 OK\r\ncontent-length: " + std::to_string(body.size()) +
+                         "\r\n\r\n" + body;
+  // Headers and body share the dispatch slice; the body must be aliased, not copied.
+  Buffer::OwnedImpl buffer(response);
+
+  InSequence sequence;
+  EXPECT_CALL(decoder, decodeHeaders_(_, false));
+  EXPECT_CALL(decoder, decodeData(BufferString(body), false));
+  EXPECT_CALL(decoder, decodeData(BufferString(""), true));
+
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0, buffer.length());
+  EXPECT_GE(bodyAliasCount(*codec_), 1u);
+}
+
 // Regression test for checking if content length exists when all bits are set (e.g. 3).
 TEST_F(Http1ServerConnectionImplTest, ContentLengthAllBitsSet) {
   initialize();
