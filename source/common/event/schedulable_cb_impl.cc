@@ -1,7 +1,5 @@
 #include "source/common/event/schedulable_cb_impl.h"
 
-#include <cstdio>
-
 #include "source/common/common/assert.h"
 
 #include "event2/event.h"
@@ -17,14 +15,12 @@ SchedulableCallbackImpl::SchedulableCallbackImpl(Libevent::BasePtr& libevent,
       &raw_event_, libevent.get(),
       [](evutil_socket_t, short, void* arg) -> void {
         SchedulableCallbackImpl* cb = static_cast<SchedulableCallbackImpl*>(arg);
-        fprintf(stderr, "DBG activation-callback RUN\n");
         cb->cb_();
       },
       this);
 }
 
 void SchedulableCallbackImpl::scheduleCallbackCurrentIteration() {
-  fprintf(stderr, "DBG schedCur enabled=%d\n", enabled() ? 1 : 0);
   if (enabled()) {
     return;
   }
@@ -34,7 +30,6 @@ void SchedulableCallbackImpl::scheduleCallbackCurrentIteration() {
 }
 
 void SchedulableCallbackImpl::scheduleCallbackNextIteration() {
-  fprintf(stderr, "DBG schedNext enabled=%d\n", enabled() ? 1 : 0);
   if (enabled()) {
     return;
   }
