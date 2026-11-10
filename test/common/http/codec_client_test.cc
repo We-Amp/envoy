@@ -167,8 +167,9 @@ TEST_F(CodecClientTest, ActiveRequestReuseOnCleanCompletion) {
     Http::MockResponseDecoder outer_decoder2;
     Http::RequestEncoder& request_encoder2 = client_->newStream(outer_decoder2);
     EXPECT_EQ(wrapper1, client_->activeRequestAddressForTest());
-    // The reused wrapper is what the codec sees as the response decoder for stream 2.
-    EXPECT_EQ(wrapper1, inner_decoder2);
+    // The reused wrapper is what the codec sees as the response decoder for stream 2
+    // (same wrapper object, captured through the same ResponseDecoder base).
+    EXPECT_EQ(inner_decoder1, inner_decoder2);
 
     EXPECT_OK(request_encoder2.encodeHeaders(request_headers, true));
     ResponseHeaderMapPtr response_headers2{new TestResponseHeaderMapImpl{{":status", "200"}}};
