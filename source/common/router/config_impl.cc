@@ -1987,6 +1987,41 @@ void VirtualHostImpl::buildRouteCandidateIndex() {
       node->route_indices.push_back(i);
       break;
     }
+    case PathMatchType::Regex: {
+      // Conservative literal-prefix extraction from the regex text: only an anchored ('^') run
+      // of plain literal characters becomes a prefix-trie entry (regexes are case-sensitive, so
+      // the raw prefix is used). Anything else -- unanchored patterns, metacharacters, escapes --
+      // stays in the ordered side list. A conservative miss only costs a side-list scan for that
+      // route; it can never produce a wrong candidate set, because every candidate is still
+      // re-validated by the route's full regex match.
+      static constexpr absl::string_view kMetachars = "()[]{}|?*+$.^\\";
+      const std::string& pattern = route->matcher();
+      if (pattern.empty() || pattern[0] != '^') {
+        route_index_.side_list.push_back(i);
+        break;
+      }
+      size_t literal_end = 1;
+      while (literal_end < pattern.size() &&
+             kMetachars.find(pattern[literal_end]) == absl::string_view::npos) {
+        ++literal_end;
+      }
+      if (literal_end == 1) {
+        // Anchored but no literal prefix (e.g. "^$" or "^(a|b)/rest").
+        route_index_.side_list.push_back(i);
+        break;
+      }
+      const absl::string_view prefix = absl::string_view(pattern).substr(1, literal_end - 1);
+      RouteCandidateIndex::PrefixTrieNode* node = &route_index_.prefix_root;
+      for (const char c : prefix) {
+        auto& child = node->children[c];
+        if (child == nullptr) {
+          child = std::make_unique<RouteCandidateIndex::PrefixTrieNode>();
+        }
+        node = child.get();
+      }
+      node->route_indices.push_back(i);
+      break;
+    }
     default:
       // Regex, URI-template, connect and any other match kind stay in the ordered side list,
       // which is scanned for every request so the candidate set remains a superset.
