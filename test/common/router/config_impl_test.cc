@@ -12668,6 +12668,97 @@ virtual_hosts:
   EXPECT_EQ(accepted_route->routeEntry()->clusterName(), "foo");
 }
 
+// Regression coverage for route evaluation ordering: the per-route path condition is part of the
+// same first-match conjunction as every other criterion, and the lowest configured index still
+// wins for mixed matcher types. Routes below exercise a headers-only-match candidate (must fall
+// through to the broader route), a path-only-match candidate blocked by a zero runtime fraction,
+// case-insensitive prefix, path_separated_prefix segment boundaries, and an anchored regex.
+TEST_F(RouteMatcherTest, PathConditionFirstMatchSemanticsMixedMatchers) {
+  const std::string yaml = R"EOF(
+virtual_hosts:
+- name: vhost
+  domains: ["example.com"]
+  routes:
+  - match:
+      path: "/only/this/exact/path"
+      case_sensitive: true
+      headers:
+      - name: "x-route"
+        string_match:
+          exact: "one"
+    route:
+      cluster: narrow_exact
+  - match:
+      prefix: "/fraction"
+      runtime_fraction:
+        default_value:
+          numerator: 0
+          denominator: HUNDRED
+    route:
+      cluster: fraction_route
+  - match:
+      prefix: "/fraction"
+    route:
+      cluster: fraction_fallback
+  - match:
+      prefix: "/case"
+      case_sensitive: false
+    route:
+      cluster: case_insensitive
+  - match:
+      path_separated_prefix: "/separated"
+    route:
+      cluster: separated
+  - match:
+      safe_regex:
+        regex: "^/re[gx]+/sub"
+    route:
+      cluster: regex_route
+  # Catch-all with a header criterion: only reachable when the more specific routes above
+  # reject.
+  - match:
+      prefix: "/"
+      headers:
+      - name: "x-route"
+        string_match:
+          exact: "one"
+    route:
+      cluster: fallback_prefix
+)EOF";
+
+  factory_context_.cluster_manager_.initializeClusters(
+      {"narrow_exact", "fallback_prefix", "fraction_route", "fraction_fallback", "case_insensitive",
+       "separated", "regex_route"},
+      {});
+  TestConfigImpl config(parseRouteConfigurationFromYaml(yaml), factory_context_, true,
+                        creation_status_);
+  ASSERT_TRUE(creation_status_.ok());
+
+  const auto routeFor = [&config](const std::string& path) -> RouteConstSharedPtr {
+    Http::TestRequestHeaderMapImpl headers{
+        {":authority", "example.com"}, {":path", path},   {":method", "GET"}, {":scheme", "http"},
+        {"x-forwarded-proto", "http"}, {"x-route", "one"}};
+    return config.route(headers, 0);
+  };
+
+  // The narrow exact-path route cannot match, although all header criteria would: the broader
+  // route configured after it wins.
+  EXPECT_EQ("fallback_prefix", routeFor("/other")->routeEntry()->clusterName());
+  // When path and headers both match, the lowest configured index wins.
+  EXPECT_EQ("narrow_exact", routeFor("/only/this/exact/path")->routeEntry()->clusterName());
+  // A zero-fraction runtime criterion rejects the earlier route; the later route wins.
+  EXPECT_EQ("fraction_fallback", routeFor("/fraction/x")->routeEntry()->clusterName());
+  // Case-insensitive prefix.
+  EXPECT_EQ("case_insensitive", routeFor("/CASE/x")->routeEntry()->clusterName());
+  // path_separated_prefix only matches at a segment boundary; the non-boundary request falls
+  // through every more specific route to the catch-all.
+  EXPECT_EQ("separated", routeFor("/separated/child")->routeEntry()->clusterName());
+  EXPECT_EQ("fallback_prefix", routeFor("/separatedchild")->routeEntry()->clusterName());
+  // Anchored regex; a non-matching path likewise reaches the catch-all.
+  EXPECT_EQ("regex_route", routeFor("/regx/sub")->routeEntry()->clusterName());
+  EXPECT_EQ("fallback_prefix", routeFor("/rx/sub")->routeEntry()->clusterName());
+}
+
 TEST_F(RouteMatchOverrideTest, MatchTreeVerifyRouteOverrideStops) {
   const std::string yaml = R"EOF(
 virtual_hosts:
