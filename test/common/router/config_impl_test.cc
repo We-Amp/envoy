@@ -15,6 +15,7 @@
 #include "envoy/server/filter_config.h"
 #include "envoy/type/v3/percent.pb.h"
 
+#include "source/common/common/regex.h"
 #include "source/common/config/metadata.h"
 #include "source/common/config/well_known_names.h"
 #include "source/common/http/header_map_impl.h"
@@ -12793,6 +12794,133 @@ TEST_F(RouteMatcherTest, RouteIndexLatin1BytePattern) {
   const DirectResponseEntry* entry = actual->directResponseEntry();
   ASSERT_NE(entry, nullptr);
   EXPECT_EQ(regex_status, static_cast<int>(entry->responseCode()));
+}
+
+// Pins the index's empty-candidate short circuit: with the index enabled and no candidate for
+// the request path, no route is evaluated at all -- the route callback is never invoked and no
+// route is returned.
+TEST_F(RouteMatcherTest, RouteIndexEmptyCandidatesNeverEvaluateRoutes) {
+  const std::string yaml = R"EOF(
+virtual_hosts:
+- name: vhost
+  domains: ["example.com"]
+  routes:
+  - match:
+      path: "/only/exact"
+    route:
+      cluster: exact
+  - match:
+      path: "/second/exact"
+    route:
+      cluster: second
+)EOF";
+
+  factory_context_.cluster_manager_.initializeClusters({"exact", "second"}, {});
+  TestConfigImpl config(parseRouteConfigurationFromYaml(yaml), factory_context_, true,
+                        creation_status_);
+  ASSERT_TRUE(creation_status_.ok());
+
+  Http::TestRequestHeaderMapImpl headers{{":authority", "example.com"},
+                                         {":path", "/nomatch"},
+                                         {":method", "GET"},
+                                         {":scheme", "http"},
+                                         {"x-forwarded-proto", "http"}};
+  bool callback_invoked = false;
+  const RouteConstSharedPtr route = config.route(
+      [&callback_invoked](RouteConstSharedPtr, RouteEvalStatus) {
+        callback_invoked = true;
+        return RouteMatchStatus::Continue;
+      },
+      headers);
+  EXPECT_EQ(nullptr, route);
+  EXPECT_FALSE(callback_invoked);
+}
+
+// A regex route WITHOUT the explicit google_re2 marker is indexed when the server's default
+// regex engine is google_re2 (the default): it must match.
+TEST_F(RouteMatcherTest, RouteIndexRegexWithoutExplicitEngineIndexed) {
+  const std::string yaml = R"EOF(
+virtual_hosts:
+- name: vhost
+  domains: ["example.com"]
+  routes:
+  - match:
+      safe_regex:
+        regex: "^/api/v[0-9]+/users$"
+    route:
+      cluster: regex_route
+  - match:
+      prefix: "/"
+    route:
+      cluster: catch_all
+)EOF";
+
+  factory_context_.cluster_manager_.initializeClusters({"regex_route", "catch_all"}, {});
+  TestConfigImpl config(parseRouteConfigurationFromYaml(yaml), factory_context_, true,
+                        creation_status_);
+  ASSERT_TRUE(creation_status_.ok());
+
+  Http::TestRequestHeaderMapImpl headers{{":authority", "example.com"},
+                                         {":path", "/api/v3/users"},
+                                         {":method", "GET"},
+                                         {":scheme", "http"},
+                                         {"x-forwarded-proto", "http"}};
+  const RouteConstSharedPtr route = config.route(headers, 0);
+  ASSERT_NE(route, nullptr);
+  EXPECT_EQ("regex_route", route->routeEntry()->clusterName());
+}
+
+// With a non-google_re2 default regex engine, regex routes are not trie-indexed (by design);
+// they keep their ordered scan position and must still match correctly.
+class FakeNonRe2Engine : public Regex::Engine {
+public:
+  absl::StatusOr<Regex::CompiledMatcherPtr> matcher(const std::string& regex) const override {
+    return std::make_unique<Regex::CompiledGoogleReMatcherNoSafetyChecks>(regex);
+  }
+};
+
+// A factory-context subclass whose default regex engine is a stand-in for a non-RE2 engine
+// (e.g. hyperscan): MockServerFactoryContext hardwires google_re2.
+class NonRe2FactoryContext
+    : public testing::NiceMock<Server::Configuration::MockServerFactoryContext> {
+public:
+  Regex::Engine& regexEngine() override { return fake_engine_; }
+
+private:
+  FakeNonRe2Engine fake_engine_;
+};
+
+TEST_F(RouteMatcherTest, RouteIndexNonRe2DefaultEngineStillMatches) {
+  NonRe2FactoryContext non_re2_context;
+  const std::string yaml = R"EOF(
+virtual_hosts:
+- name: vhost
+  domains: ["example.com"]
+  routes:
+  - match:
+      safe_regex:
+        regex: "^/api/v[0-9]+/users$"
+    route:
+      cluster: regex_route
+  - match:
+      prefix: "/"
+    route:
+      cluster: catch_all
+)EOF";
+
+  non_re2_context.cluster_manager_.initializeClusters({"regex_route", "catch_all"}, {});
+  TestConfigImpl config(parseRouteConfigurationFromYaml(yaml), non_re2_context, true,
+                        creation_status_);
+  ASSERT_TRUE(creation_status_.ok());
+
+  Http::TestRequestHeaderMapImpl headers{{":authority", "example.com"},
+                                         {":path", "/api/v3/users"},
+                                         {":method", "GET"},
+                                         {":scheme", "http"},
+                                         {"x-forwarded-proto", "http"}};
+  const RouteConstSharedPtr route = config.route(headers, 0);
+  ASSERT_NE(route, nullptr);
+  EXPECT_EQ("regex_route", route->routeEntry()->clusterName());
 }
 
 TEST_F(RouteMatchOverrideTest, MatchTreeVerifyRouteOverrideStops) {

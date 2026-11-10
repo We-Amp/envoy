@@ -540,15 +540,16 @@ private:
   enum class SslRequirements : uint8_t { None, ExternalOnly, All };
 
   // Config-time route index over the positions of routes_: an exact-path hash map plus a prefix
-  // trie for exact / prefix / path-separated-prefix routes and for anchored safe_regex routes
-  // whose required literal prefix RE2's PossibleMatchRange analysis establishes; an ordered side
-  // list of positions carries the route kinds the index cannot represent (unanchored or
-  // prefixless regex, URI template, connect, and anything else). The index only ever produces
-  // candidate positions: every candidate is re-validated by the route's matches(), and
-  // candidates are evaluated in ascending route-position order, so first-match semantics are
-  // exactly those of the linear scan. Case-insensitive routes are normalized with ASCII
-  // lower-casing at both index build and lookup time, mirroring the ignore-case string matcher
-  // semantics.
+  // trie for exact / prefix / path-separated-prefix routes and for google_re2 safe_regex routes
+  // whose required literal prefix RE2's PossibleMatchRange analysis establishes -- valid for
+  // unanchored patterns too, because Envoy evaluates FullMatch (a subset of anchored matches).
+  // An ordered side list of positions carries everything else: regex patterns with no derivable
+  // prefix or a non-google_re2 engine, URI template, connect, and any unrepresentable kind. The
+  // index only ever produces candidate positions: every candidate is re-validated by the
+  // route's matches(), and candidates are evaluated in ascending route-position order, so
+  // first-match semantics are exactly those of the linear scan. Case-insensitive routes are
+  // normalized with ASCII lower-casing at both index build and lookup time, mirroring the
+  // ignore-case string matcher semantics.
   struct RouteCandidateIndex {
     struct PrefixTrieNode {
       std::vector<uint32_t> route_indices;
@@ -569,16 +570,17 @@ private:
     std::vector<uint32_t> side_list;
   };
 
-  // Builds route_index_ from routes_. No-op for a single route, where the linear scan is already
-  // minimal.
-  void buildRouteCandidateIndex();
+  // Builds route_index_ from routes_ and the virtual host configuration (the safe_regex engine
+  // is taken from each route's config: only routes configured with the google_re2 engine are
+  // trie-indexed). No-op for a single route, where the linear scan is already minimal.
+  void buildRouteCandidateIndex(const envoy::config::route::v3::VirtualHost& virtual_host,
+                                Server::Configuration::ServerFactoryContext& factory_context);
 
-  VirtualHostMatchResult
-  getRouteFromRoutesWithCandidates(const RouteCallback& cb,
-                                   const RouteMatchContext& route_match_context,
-                                   const StreamInfo::StreamInfo& stream_info, uint64_t random_value,
-                                   absl::Span<const RouteEntryImplBaseConstSharedPtr> routes,
-                                   absl::Span<const uint32_t> candidates) const;
+  VirtualHostMatchResult getRouteFromRoutesWithCandidates(
+      const RouteCallback& cb, const RouteMatchContext& route_match_context,
+      const StreamInfo::StreamInfo& stream_info, uint64_t random_value,
+      absl::Span<const RouteEntryImplBaseConstSharedPtr> routes,
+      const std::optional<absl::Span<const uint32_t>>& candidates) const;
 
   CommonVirtualHostSharedPtr shared_virtual_host_;
   // Created after the shared virtual host so that the specifiers can build routes in it.

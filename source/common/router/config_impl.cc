@@ -1926,7 +1926,7 @@ VirtualHostImpl::VirtualHostImpl(const envoy::config::route::v3::VirtualHost& vi
   SET_AND_RETURN_IF_NOT_OK(route_specifiers_or_error.status(), creation_status);
   route_specifiers_ = std::move(route_specifiers_or_error.value());
 
-  buildRouteCandidateIndex();
+  buildRouteCandidateIndex(virtual_host, factory_context);
 }
 
 void VirtualHostImpl::RouteCandidateIndex::collectCandidates(
@@ -1970,7 +1970,9 @@ void VirtualHostImpl::RouteCandidateIndex::collectCandidates(
   candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
 }
 
-void VirtualHostImpl::buildRouteCandidateIndex() {
+void VirtualHostImpl::buildRouteCandidateIndex(
+    const envoy::config::route::v3::VirtualHost& virtual_host,
+    Server::Configuration::ServerFactoryContext& factory_context) {
   if (routes_.size() < 2) {
     // With a single route (or none) the linear scan is already minimal; nothing to index.
     return;
@@ -2009,22 +2011,32 @@ void VirtualHostImpl::buildRouteCandidateIndex() {
       break;
     }
     case PathMatchType::Regex: {
-      // All Regex-kind routes reach this branch; a route is indexed only when its engine is
-      // google_re2 AND RE2's own prefix analysis establishes a required case-sensitive literal
-      // prefix for the pattern. The analysis RE2 is compiled with the same options as the
-      // route's own matcher (Quiet, Latin-1 encoding under
+      // All Regex-kind routes reach this branch; a route is indexed only when its effective
+      // engine is google_re2 -- either the RouteMatch config names it explicitly, or no engine
+      // is named and the server's default regex engine IS the google_re2 engine (any other
+      // default engine's pattern syntax and match semantics differ, so indexing it here would
+      // be unsound -- such routes land in the side list BY DESIGN) -- AND RE2's own prefix
+      // analysis establishes a required
+      // case-sensitive literal prefix for the pattern. The analysis RE2 is compiled with the
+      // same options as the route's own matcher (Quiet, Latin-1 encoding under
       // envoy.reloadable_features.re2_use_latin1_mode) so a raw high-byte in the pattern yields
-      // a raw-byte prefix that matches the raw-byte path; a non-RE2 engine's pattern would
-      // recompile differently or as empty pattern() and lands in the side list -- by design.
-      // RE2 computes the range against an anchored-at-start match while Envoy evaluates
-      // FullMatch -- a subset of anchored matches -- so the required-prefix bound holds a
-      // fortiori, and it holds for unanchored patterns too (a full match is also an
-      // anchored-at-start match). The longest common prefix of the reported range endpoints is
-      // required of every match, so the trie entry can never over-reject (a truncated max
-      // remains a valid upper bound). Fold-case prefixes and patterns RE2 cannot compile stay
-      // in the ordered side list, which is scanned for every request. The extraction can only
-      // MISS (a route evaluated more often than strictly necessary), never over-reject, because
-      // every candidate is still fully re-validated by the route's own regex match.
+      // a raw-byte prefix that matches the raw-byte path. RE2 computes the range against an
+      // anchored-at-start match while Envoy evaluates FullMatch -- a subset of anchored matches
+      // -- so the required-prefix bound holds a fortiori, and it holds for unanchored patterns
+      // too (a full match is also an anchored-at-start match). The longest common prefix of the
+      // reported range endpoints is required of every match, so the trie entry can never
+      // over-reject (a truncated max remains a valid upper bound). Fold-case prefixes and
+      // patterns RE2 cannot compile stay in the ordered side list, which is scanned for every
+      // request. The extraction can only MISS (a route evaluated more often than strictly
+      // necessary), never over-reject, because every candidate is still fully re-validated by
+      // the route's own regex match.
+      const bool explicit_re2 = virtual_host.routes(i).match().safe_regex().has_google_re2();
+      const bool default_engine_is_re2 =
+          dynamic_cast<const Regex::GoogleReEngine*>(&factory_context.regexEngine()) != nullptr;
+      if (!explicit_re2 && !default_engine_is_re2) {
+        route_index_.side_list.push_back(i);
+        break;
+      }
       re2::RE2::Options options(re2::RE2::CannedOptions::Quiet);
       if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.re2_use_latin1_mode")) {
         options.set_encoding(re2::RE2::Options::EncodingLatin1);
@@ -2077,27 +2089,32 @@ VirtualHostMatchResult VirtualHostImpl::getRouteFromRoutes(
     const RouteCallback& cb, const RouteMatchContext& route_match_context,
     const StreamInfo::StreamInfo& stream_info, uint64_t random_value,
     absl::Span<const RouteEntryImplBaseConstSharedPtr> routes) const {
+  // Linear path: no candidate selection, every configured route is visited in order.
   return getRouteFromRoutesWithCandidates(cb, route_match_context, stream_info, random_value,
-                                          routes, {});
+                                          routes, absl::nullopt);
 }
 
 VirtualHostMatchResult VirtualHostImpl::getRouteFromRoutesWithCandidates(
     const RouteCallback& cb, const RouteMatchContext& route_match_context,
     const StreamInfo::StreamInfo& stream_info, uint64_t random_value,
     absl::Span<const RouteEntryImplBaseConstSharedPtr> routes,
-    absl::Span<const uint32_t> candidates) const {
+    const std::optional<absl::Span<const uint32_t>>& candidates) const {
   const Http::RequestHeaderMap& headers = route_match_context.headers();
   const RouteSpecifierSpan config_specifiers =
       shared_virtual_host_->globalRouteConfig().routeSpecifiers();
 
-  // Candidates hold route positions in ascending order; an empty candidate set visits every
-  // route in order. A candidate's "no more routes" status is a property of its position in the
+  // nullopt visits every route in order (linear path). A present candidate set holds route
+  // positions in ascending order -- INCLUDING the empty set, which means the index established
+  // that no configured route can match, so the scan is skipped entirely (every configured route
+  // is either index-represented or carried by the side list, and the side list is part of the
+  // candidate set). A candidate's "no more routes" status is a property of its position in the
   // configured route list, exactly as in the linear scan.
   const size_t route_count = routes.size();
-  const size_t visit_count = candidates.empty() ? route_count : candidates.size();
+  const bool use_candidates = candidates.has_value();
+  const size_t visit_count = use_candidates ? candidates->size() : route_count;
   for (size_t position = 0; position < visit_count; ++position) {
     const uint32_t route_index =
-        candidates.empty() ? static_cast<uint32_t>(position) : candidates[position];
+        use_candidates ? (*candidates)[position] : static_cast<uint32_t>(position);
     const bool is_last_route = (route_index == route_count - 1);
     const RouteEntryImplBaseConstSharedPtr& route = routes[route_index];
 
@@ -2215,13 +2232,17 @@ VirtualHostImpl::getRouteFromEntries(const RouteCallback& cb, const Http::Reques
 
   // Check for a route that matches the request. With the config-time route index enabled, only
   // the candidate routes it selects are visited, still in configured route order, and an empty
-  // candidate set is a genuine no-match: every configured route is either represented in the
-  // index or carried by the side list, so no route matches and no route is evaluated. (When the
-  // index is disabled the candidate span is passed empty, which getRouteFromRoutesWithCandidates
-  // treats as visit-every-route.)
+  // candidate set is a genuine no-match returned without evaluating any route: every configured
+  // route is either represented in the index or carried by the side list (which contributes its
+  // positions to the candidate set), so nothing can match. Without the index every route is
+  // visited in order.
   if (route_index_.enabled) {
     absl::InlinedVector<uint32_t, 8> candidates;
     route_index_.collectCandidates(route_match_context.sanitizedPathWithoutQuery(), candidates);
+    if (candidates.empty()) {
+      ENVOY_LOG(debug, "route index produced no candidates; no route matches");
+      return {};
+    }
     return getRouteFromRoutesWithCandidates(cb, route_match_context, stream_info, random_value,
                                             routes_, absl::MakeSpan(candidates));
   }
