@@ -4,6 +4,7 @@
 
 #include "source/common/common/assert.h"
 #include "source/common/event/dispatcher_impl.h"
+#include "source/common/runtime/runtime_features.h"
 
 #include "event2/event.h"
 
@@ -41,10 +42,20 @@ void FileEventImpl::activate(uint32_t events) {
   ASSERT((events & (FileReadyType::Read | FileReadyType::Write | FileReadyType::Closed)) == events);
 
   // Schedule the activation callback so it runs as part of the next loop iteration if it is not
-  // already scheduled.
+  // already scheduled. A Write-only activation is typically produced by
+  // Network::ConnectionImpl::write() while handling work in the current iteration; scheduling it
+  // in the current iteration removes an extra loop turn and a zero-timeout poll per write. Read
+  // activations stay on next-iteration scheduling for fairness, and a per-dispatcher budget
+  // bounds how many Write activations a single turn may run in the current iteration.
   if (injected_activation_events_ == 0) {
     ASSERT(!activation_cb_->enabled());
-    activation_cb_->scheduleCallbackNextIteration();
+    if (events == FileReadyType::Write &&
+        Runtime::runtimeFeatureEnabled("envoy.reloadable_features.write_activation_current_iteration") &&
+        static_cast<DispatcherImpl&>(dispatcher_).tryConsumeCurrentIterationWriteActivationBudget()) {
+      activation_cb_->scheduleCallbackCurrentIteration();
+    } else {
+      activation_cb_->scheduleCallbackNextIteration();
+    }
   }
   ASSERT(activation_cb_->enabled());
 

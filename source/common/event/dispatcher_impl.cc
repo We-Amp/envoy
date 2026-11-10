@@ -86,6 +86,9 @@ DispatcherImpl::DispatcherImpl(const std::string& name, Thread::ThreadFactory& t
   updateApproximateMonotonicTimeInternal();
   base_scheduler_.registerOnCheckCallback(
       std::bind(&DispatcherImpl::updateApproximateMonotonicTime, this));
+  // Reset the per-turn Write-activation budget at the start of every event-loop iteration.
+  base_scheduler_.registerOnPrepareCallback(
+      [this]() -> void { write_activation_budget_ = kWriteActivationBudgetPerLoopIteration; });
 }
 
 DispatcherImpl::~DispatcherImpl() {
@@ -93,6 +96,14 @@ DispatcherImpl::~DispatcherImpl() {
   FatalErrorHandler::removeFatalErrorHandler(*this);
   // TODO(lambdai): Resolve https://github.com/envoyproxy/envoy/issues/15072 and enable
   // ASSERT(deletable_in_dispatcher_thread_.empty())
+}
+
+bool DispatcherImpl::tryConsumeCurrentIterationWriteActivationBudget() {
+  if (write_activation_budget_ == 0) {
+    return false;
+  }
+  --write_activation_budget_;
+  return true;
 }
 
 void DispatcherImpl::registerWatchdog(const Server::WatchDogSharedPtr& watchdog,

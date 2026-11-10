@@ -103,6 +103,13 @@ public:
   void
   runFatalActionsOnTrackedObject(const FatalAction::FatalActionPtrList& actions) const override;
 
+  // Budget of Write-only FileEvent activations that may be scheduled to run in the current
+  // event-loop iteration within one loop turn. The budget is reset when each loop iteration
+  // begins (via the scheduler's prepare callback) and consumed by
+  // tryConsumeCurrentIterationWriteActivationBudget(); once exhausted, activations fall back to
+  // next-iteration scheduling so a turn with many ready writes cannot grow unboundedly.
+  bool tryConsumeCurrentIterationWriteActivationBudget();
+
 private:
   // Holds a reference to the watchdog registered with this dispatcher and the timer used to ensure
   // that the dog is touched periodically.
@@ -167,6 +174,11 @@ private:
   SchedulableCallbackPtr post_cb_;
   Thread::MutexBasicLockable post_lock_;
   std::list<PostCb> post_callbacks_ ABSL_GUARDED_BY(post_lock_);
+  // Remaining current-iteration Write-activation budget for the ongoing loop turn. Reset at the
+  // start of every loop iteration by the scheduler prepare callback.
+  uint32_t write_activation_budget_{kWriteActivationBudgetPerLoopIteration};
+
+  static constexpr uint32_t kWriteActivationBudgetPerLoopIteration = 64;
 
   std::vector<DeferredDeletablePtr> to_delete_1_;
   std::vector<DeferredDeletablePtr> to_delete_2_;

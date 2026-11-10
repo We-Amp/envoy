@@ -137,18 +137,22 @@ TEST_P(FileEventImplActivateTest, ActivateChaining) {
       trigger, FileReadyType::Read | FileReadyType::Write);
 
   testing::InSequence s;
-  // First loop iteration: handle scheduled read event and the real write event produced by poll.
-  // Note that the real and injected events are combined and delivered in a single call to the fd
-  // callback.
+  // First loop iteration: handle the scheduled read event and the real write event produced by
+  // poll. Note that the real and injected events are combined and delivered in a single call to
+  // the fd callback. The Write-only event scheduled while handling the read is delivered in this
+  // same iteration (the write activation runs in the current iteration), so the fd callback and
+  // write callback run a second time here.
   EXPECT_CALL(prepare_callback, Call);
   EXPECT_CALL(fd_callback, Call);
   EXPECT_CALL(read_callback, Call);
   EXPECT_CALL(write_callback, Call);
-  // Second loop iteration: handle write and close events scheduled while handling read.
-  EXPECT_CALL(prepare_callback, Call);
   EXPECT_CALL(fd_callback, Call);
   EXPECT_CALL(write_callback, Call);
   if constexpr (Event::PlatformDefaultTriggerType != Event::FileTriggerType::EmulatedEdge) {
+    // Second loop iteration: the poll returned the still-writable socket's real write event.
+    EXPECT_CALL(prepare_callback, Call);
+    EXPECT_CALL(fd_callback, Call);
+    EXPECT_CALL(write_callback, Call);
     // Third loop iteration: poll returned no new real events.
     EXPECT_CALL(prepare_callback, Call);
   }
