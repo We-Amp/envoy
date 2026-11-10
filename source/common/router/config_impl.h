@@ -540,13 +540,15 @@ private:
   enum class SslRequirements : uint8_t { None, ExternalOnly, All };
 
   // Config-time route index over the positions of routes_: an exact-path hash map plus a prefix
-  // trie for exact / prefix / path-separated-prefix routes, and an ordered side list of positions
-  // for the route kinds the index cannot represent (regex, URI template, connect, and anything
-  // else). The index only ever produces candidate positions: every candidate is re-validated by
-  // the route's matches(), and candidates are evaluated in ascending route-position order, so
-  // first-match semantics are exactly those of the linear scan. Case-insensitive routes are
-  // normalized with ASCII lower-casing at both index build and lookup time, mirroring the
-  // ignore-case string matcher semantics.
+  // trie for exact / prefix / path-separated-prefix routes and for anchored safe_regex routes
+  // whose required literal prefix RE2's PossibleMatchRange analysis establishes; an ordered side
+  // list of positions carries the route kinds the index cannot represent (unanchored or
+  // prefixless regex, URI template, connect, and anything else). The index only ever produces
+  // candidate positions: every candidate is re-validated by the route's matches(), and
+  // candidates are evaluated in ascending route-position order, so first-match semantics are
+  // exactly those of the linear scan. Case-insensitive routes are normalized with ASCII
+  // lower-casing at both index build and lookup time, mirroring the ignore-case string matcher
+  // semantics.
   struct RouteCandidateIndex {
     struct PrefixTrieNode {
       std::vector<uint32_t> route_indices;
@@ -574,8 +576,7 @@ private:
   VirtualHostMatchResult
   getRouteFromRoutesWithCandidates(const RouteCallback& cb,
                                    const RouteMatchContext& route_match_context,
-                                   const StreamInfo::StreamInfo& stream_info,
-                                   uint64_t random_value,
+                                   const StreamInfo::StreamInfo& stream_info, uint64_t random_value,
                                    absl::Span<const RouteEntryImplBaseConstSharedPtr> routes,
                                    absl::Span<const uint32_t> candidates) const;
 
@@ -990,7 +991,6 @@ public:
   bool pathMatchCaseSensitive() const { return case_sensitive_; }
 
 protected:
-
   // Common logic for rewritePathHeader() of DirectResponseEntry.
   void finalizePathHeaderForRedirect(Http::RequestHeaderMap& headers,
                                      absl::string_view matched_path, bool keep_old_path) const;

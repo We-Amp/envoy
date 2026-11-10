@@ -12710,6 +12710,91 @@ TEST_F(RouteMatcherTest, RouteIndexRandomizedDifferential) {
   }
 }
 
+// Pins the case-insensitive EXACT path match through the config-time route index: a
+// mixed-case request must hit the exact route (never the later catch-all), and a
+// non-matching path must fall through to the catch-all.
+TEST_F(RouteMatcherTest, RouteIndexCaseInsensitiveExact) {
+  const std::string yaml = R"EOF(
+virtual_hosts:
+- name: vhost
+  domains: ["example.com"]
+  routes:
+  - match:
+      path: "/Exact"
+      case_sensitive: false
+    route:
+      cluster: ci_exact
+  - match:
+      prefix: "/other"
+      case_sensitive: false
+    route:
+      cluster: other
+  - match:
+      prefix: "/"
+    route:
+      cluster: catch_all
+)EOF";
+
+  factory_context_.cluster_manager_.initializeClusters({"ci_exact", "other", "catch_all"}, {});
+  TestConfigImpl config(parseRouteConfigurationFromYaml(yaml), factory_context_, true,
+                        creation_status_);
+  ASSERT_TRUE(creation_status_.ok());
+
+  const auto routeFor = [&config](const std::string& path) -> RouteConstSharedPtr {
+    Http::TestRequestHeaderMapImpl headers{{":authority", "example.com"},
+                                           {":path", path},
+                                           {":method", "GET"},
+                                           {":scheme", "http"},
+                                           {"x-forwarded-proto", "http"}};
+    return config.route(headers, 0);
+  };
+
+  EXPECT_EQ("ci_exact", routeFor("/Exact")->routeEntry()->clusterName());
+  EXPECT_EQ("ci_exact", routeFor("/EXACT")->routeEntry()->clusterName());
+  EXPECT_EQ("ci_exact", routeFor("/eXaCt")->routeEntry()->clusterName());
+  EXPECT_EQ("ci_exact", routeFor("/exact")->routeEntry()->clusterName());
+  EXPECT_EQ("other", routeFor("/OTHER/x")->routeEntry()->clusterName());
+  EXPECT_EQ("catch_all", routeFor("/nothing")->routeEntry()->clusterName());
+}
+
+// Pins Latin-1 parity between the route index's regex analysis and the route's own matcher: a
+// raw high byte (0xE9) in the pattern must yield a raw-byte trie prefix, so the request path
+// carrying the same raw byte matches the regex route (never the catch-all). The :path header is
+// set directly -- no codec involvement.
+TEST_F(RouteMatcherTest, RouteIndexLatin1BytePattern) {
+  const std::string pattern = std::string("^/caf\xe9");
+  const std::string path = std::string("/caf\xe9");
+
+  envoy::config::route::v3::RouteConfiguration multi_config;
+  auto* v_host = multi_config.mutable_virtual_hosts()->Add();
+  v_host->set_name("vhost");
+  v_host->add_domains("*");
+  auto* regex_route = v_host->mutable_routes()->Add();
+  regex_route->mutable_direct_response()->set_status(200);
+  const int regex_status = 200;
+  auto* match = regex_route->mutable_match();
+  match->mutable_safe_regex()->mutable_google_re2();
+  match->mutable_safe_regex()->set_regex(pattern);
+  auto* catch_all = v_host->mutable_routes()->Add();
+  catch_all->mutable_direct_response()->set_status(201);
+  catch_all->mutable_match()->set_prefix("/");
+
+  factory_context_.cluster_manager_.initializeClusters({}, {});
+  TestConfigImpl matcher(multi_config, factory_context_, true, creation_status_);
+  ASSERT_TRUE(creation_status_.ok());
+
+  Http::TestRequestHeaderMapImpl headers{{":authority", "example.com"},
+                                         {":path", path},
+                                         {":method", "GET"},
+                                         {":scheme", "http"},
+                                         {"x-forwarded-proto", "http"}};
+  const RouteConstSharedPtr actual = matcher.route(headers, 0);
+  ASSERT_NE(actual, nullptr);
+  const DirectResponseEntry* entry = actual->directResponseEntry();
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(regex_status, static_cast<int>(entry->responseCode()));
+}
+
 TEST_F(RouteMatchOverrideTest, MatchTreeVerifyRouteOverrideStops) {
   const std::string yaml = R"EOF(
 virtual_hosts:

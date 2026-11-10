@@ -1981,6 +1981,9 @@ void VirtualHostImpl::buildRouteCandidateIndex() {
     const RouteEntryImplBaseConstSharedPtr& route = routes_[i];
     switch (route->matchType()) {
     case PathMatchType::Exact: {
+      if (!route->pathMatchCaseSensitive()) {
+        route_index_.has_case_insensitive_routes = true;
+      }
       std::string key = route->pathMatchCaseSensitive() ? route->matcher()
                                                         : absl::AsciiStrToLower(route->matcher());
       route_index_.exact_routes[std::move(key)].push_back(i);
@@ -2006,18 +2009,27 @@ void VirtualHostImpl::buildRouteCandidateIndex() {
       break;
     }
     case PathMatchType::Regex: {
-      // Only safe_regex routes are indexed, and only when RE2's own prefix analysis establishes
-      // a required case-sensitive literal prefix for the pattern. RE2 computes the range against
-      // an anchored-at-start match while Envoy evaluates FullMatch -- a subset of anchored
-      // matches -- so the required-prefix bound holds a fortiori. This handles all the shapes a
-      // hand scan cannot (top-level alternation, quantifiers, groups, escapes, inline flags):
-      // the longest common prefix of the reported range endpoints is required of every match,
-      // so the trie entry can never over-reject (a truncated max remains a valid upper bound).
-      // Anything else -- unanchored patterns, fold-case prefixes, patterns RE2 cannot compile --
-      // stays in the ordered side list, which is scanned for every request. The extraction can
-      // only MISS (a route evaluated more often than strictly necessary), never over-reject,
-      // because every candidate is still fully re-validated by the route's own regex match.
-      const re2::RE2 compiled(route->matcher());
+      // All Regex-kind routes reach this branch; a route is indexed only when its engine is
+      // google_re2 AND RE2's own prefix analysis establishes a required case-sensitive literal
+      // prefix for the pattern. The analysis RE2 is compiled with the same options as the
+      // route's own matcher (Quiet, Latin-1 encoding under
+      // envoy.reloadable_features.re2_use_latin1_mode) so a raw high-byte in the pattern yields
+      // a raw-byte prefix that matches the raw-byte path; a non-RE2 engine's pattern would
+      // recompile differently or as empty pattern() and lands in the side list -- by design.
+      // RE2 computes the range against an anchored-at-start match while Envoy evaluates
+      // FullMatch -- a subset of anchored matches -- so the required-prefix bound holds a
+      // fortiori, and it holds for unanchored patterns too (a full match is also an
+      // anchored-at-start match). The longest common prefix of the reported range endpoints is
+      // required of every match, so the trie entry can never over-reject (a truncated max
+      // remains a valid upper bound). Fold-case prefixes and patterns RE2 cannot compile stay
+      // in the ordered side list, which is scanned for every request. The extraction can only
+      // MISS (a route evaluated more often than strictly necessary), never over-reject, because
+      // every candidate is still fully re-validated by the route's own regex match.
+      re2::RE2::Options options(re2::RE2::CannedOptions::Quiet);
+      if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.re2_use_latin1_mode")) {
+        options.set_encoding(re2::RE2::Options::EncodingLatin1);
+      }
+      const re2::RE2 compiled(route->matcher(), options);
       std::string range_min;
       std::string range_max;
       if (!compiled.ok() ||
@@ -2052,8 +2064,9 @@ void VirtualHostImpl::buildRouteCandidateIndex() {
       break;
     }
     default:
-      // Regex, URI-template, connect and any other match kind stay in the ordered side list,
-      // which is scanned for every request so the candidate set remains a superset.
+      // URI-template, connect and any other match kind stay in the ordered side list, which is
+      // scanned for every request so the candidate set remains a superset. (All Regex-kind
+      // routes are handled above; this branch is for genuinely unrepresentable kinds.)
       route_index_.side_list.push_back(i);
       break;
     }
@@ -2201,11 +2214,11 @@ VirtualHostImpl::getRouteFromEntries(const RouteCallback& cb, const Http::Reques
   }
 
   // Check for a route that matches the request. With the config-time route index enabled, only
-  // the candidate routes it selects are visited, still in configured route order. When the
-  // candidate set comes back empty it is genuinely empty: every configured route is either
-  // represented in the index or carried by the side list, so no route matches and no route is
-  // evaluated. A virtual host containing a route the index cannot represent carries it in the
-  // side list instead, which keeps the conservative scan.
+  // the candidate routes it selects are visited, still in configured route order, and an empty
+  // candidate set is a genuine no-match: every configured route is either represented in the
+  // index or carried by the side list, so no route matches and no route is evaluated. (When the
+  // index is disabled the candidate span is passed empty, which getRouteFromRoutesWithCandidates
+  // treats as visit-every-route.)
   if (route_index_.enabled) {
     absl::InlinedVector<uint32_t, 8> candidates;
     route_index_.collectCandidates(route_match_context.sanitizedPathWithoutQuery(), candidates);
