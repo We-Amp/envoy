@@ -6,7 +6,9 @@
 // consumed or referenced directly by other Envoy code. It serves purely as a
 // porting layer for QUICHE.
 
+#include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <iosfwd>
 #include <sstream>
@@ -242,11 +244,36 @@ QUICHE_IS_LOG_LEVEL_ENABLED_IMPL(ERROR)
 QUICHE_IS_LOG_LEVEL_ENABLED_IMPL(DFATAL)
 inline bool constexpr isLogLevelEnabledFATAL() { return true; }
 
-int getVerbosityLogThreshold();
-void setVerbosityLogThreshold(int new_verbosity);
+// The QUICHE log verbosity threshold, initialized once from the ENVOY_QUICHE_VERBOSITY
+// environment variable at first use. Held inline in this header so that isVerboseLogEnabled() --
+// evaluated per header-field/value/body-chunk on QUICHE's parse hot path -- performs no
+// cross-translation-unit calls in the common (verbosity disabled) case. Mutate through
+// setVerbosityLogThreshold().
+inline std::atomic<int>& verbosityLogThreshold() {
+  static std::atomic<int> threshold = [] {
+    int verbosity = 0;
+    const char* verbosity_str = std::getenv("ENVOY_QUICHE_VERBOSITY");
+    if (verbosity_str != nullptr) {
+      verbosity = atoi(verbosity_str);
+    }
+    return verbosity;
+  }();
+  return threshold;
+}
 
+inline int getVerbosityLogThreshold() {
+  return verbosityLogThreshold().load(std::memory_order_relaxed);
+}
+
+inline void setVerbosityLogThreshold(int new_verbosity) {
+  verbosityLogThreshold().store(new_verbosity, std::memory_order_relaxed);
+}
+
+// The threshold compare is ordered first: it is a single inlined relaxed atomic load that
+// short-circuits the (comparatively expensive) logger-level lookup in the common
+// verbosity-disabled case.
 inline bool isVerboseLogEnabled(int verbosity) {
-  return QUICHE_IS_LOG_LEVEL_ENABLED(INFO) && verbosity <= getVerbosityLogThreshold();
+  return verbosity <= getVerbosityLogThreshold() && QUICHE_IS_LOG_LEVEL_ENABLED(INFO);
 }
 
 bool isDFatalExitDisabled();

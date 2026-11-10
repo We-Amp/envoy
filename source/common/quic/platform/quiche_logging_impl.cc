@@ -7,44 +7,12 @@
 #include "quiche_platform_impl/quiche_logging_impl.h"
 
 #include <atomic>
-#include <cstdlib>
 
 #include "source/common/common/utility.h"
 
 namespace quiche {
 
 namespace {
-
-// Helper class that allows getting and setting QUICHE log verbosity threshold.
-class QuicheLogVerbosityManager {
-public:
-  // Gets QUICHE log verbosity threshold.
-  static int getThreshold() {
-    return getSingleton()->verbosity_threshold_.load(std::memory_order_relaxed);
-  }
-
-  // Sets QUICHE log verbosity threshold.
-  static void setThreshold(int new_verbosity) {
-    getSingleton()->verbosity_threshold_.store(new_verbosity, std::memory_order_relaxed);
-  }
-
-private:
-  static QuicheLogVerbosityManager* getSingleton() {
-    static QuicheLogVerbosityManager manager = QuicheLogVerbosityManager();
-    return &manager;
-  }
-
-  explicit QuicheLogVerbosityManager() {
-    int verbosity = 0;
-    const char* verbosity_str = std::getenv("ENVOY_QUICHE_VERBOSITY");
-    if (verbosity_str != nullptr) {
-      verbosity = atoi(verbosity_str);
-    }
-    verbosity_threshold_.store(verbosity, std::memory_order_relaxed);
-  }
-
-  std::atomic<int> verbosity_threshold_;
-};
 
 std::atomic<bool> g_dfatal_exit_disabled;
 
@@ -54,12 +22,6 @@ std::atomic<bool> g_dfatal_exit_disabled;
 std::atomic<QuicheLogSink*> q_quiche_log_sink;
 absl::Mutex q_quiche_log_sink_mutex;
 } // namespace
-
-int getVerbosityLogThreshold() { return QuicheLogVerbosityManager::getThreshold(); }
-
-void setVerbosityLogThreshold(int new_verbosity) {
-  QuicheLogVerbosityManager::setThreshold(new_verbosity);
-}
 
 QuicheLogEmitter::QuicheLogEmitter(QuicheLogLevel level, const char* file_name, int line,
                                    const char* function_name)
