@@ -1906,37 +1906,136 @@ VirtualHostImpl::VirtualHostImpl(const envoy::config::route::v3::VirtualHost& vi
       createRouteSpecifiers(virtual_host.route_specifiers(), specifier_context);
   SET_AND_RETURN_IF_NOT_OK(route_specifiers_or_error.status(), creation_status);
   route_specifiers_ = std::move(route_specifiers_or_error.value());
+
+  buildRouteCandidateIndex();
+}
+
+void VirtualHostImpl::RouteCandidateIndex::collectCandidates(
+    absl::string_view sanitized_path, absl::InlinedVector<uint32_t, 8>& candidates) const {
+  ASSERT(enabled);
+  const std::string lowered(absl::AsciiStrToLower(sanitized_path));
+
+  auto add_exact = [&](absl::string_view key) {
+    const auto it = exact_routes.find(key);
+    if (it != exact_routes.end()) {
+      candidates.insert(candidates.end(), it->second.begin(), it->second.end());
+    }
+  };
+  add_exact(sanitized_path);
+  if (lowered != sanitized_path) {
+    add_exact(lowered);
+  }
+
+  auto walk_trie = [&](absl::string_view path) {
+    const PrefixTrieNode* node = &prefix_root;
+    candidates.insert(candidates.end(), node->route_indices.begin(), node->route_indices.end());
+    for (const char c : path) {
+      const auto it = node->children.find(c);
+      if (it == node->children.end()) {
+        break;
+      }
+      node = it->second.get();
+      candidates.insert(candidates.end(), node->route_indices.begin(), node->route_indices.end());
+    }
+  };
+  walk_trie(sanitized_path);
+  if (lowered != sanitized_path) {
+    walk_trie(lowered);
+  }
+
+  candidates.insert(candidates.end(), side_list.begin(), side_list.end());
+
+  std::sort(candidates.begin(), candidates.end());
+  candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+}
+
+void VirtualHostImpl::buildRouteCandidateIndex() {
+  if (routes_.size() < 2) {
+    // With a single route (or none) the linear scan is already minimal; nothing to index.
+    return;
+  }
+
+  route_index_.enabled = true;
+  for (uint32_t i = 0; i < routes_.size(); ++i) {
+    const RouteEntryImplBaseConstSharedPtr& route = routes_[i];
+    switch (route->matchType()) {
+    case PathMatchType::Exact: {
+      std::string key = route->case_sensitive() ? route->matcher()
+                                                : absl::AsciiStrToLower(route->matcher());
+      route_index_.exact_routes[std::move(key)].push_back(i);
+      break;
+    }
+    case PathMatchType::Prefix:
+    case PathMatchType::PathSeparatedPrefix: {
+      const std::string path = route->case_sensitive() ? route->matcher()
+                                                       : absl::AsciiStrToLower(route->matcher());
+      RouteCandidateIndex::PrefixTrieNode* node = &route_index_.prefix_root;
+      for (const char c : path) {
+        auto& child = node->children[c];
+        if (child == nullptr) {
+          child = std::make_unique<RouteCandidateIndex::PrefixTrieNode>();
+        }
+        node = child.get();
+      }
+      node->route_indices.push_back(i);
+      break;
+    }
+    default:
+      // Regex, URI-template, connect and any other match kind stay in the ordered side list,
+      // which is scanned for every request so the candidate set remains a superset.
+      route_index_.side_list.push_back(i);
+      break;
+    }
+  }
 }
 
 VirtualHostMatchResult VirtualHostImpl::getRouteFromRoutes(
     const RouteCallback& cb, const RouteMatchContext& route_match_context,
     const StreamInfo::StreamInfo& stream_info, uint64_t random_value,
     absl::Span<const RouteEntryImplBaseConstSharedPtr> routes) const {
+  return getRouteFromRoutesWithCandidates(cb, route_match_context, stream_info, random_value,
+                                          routes, {});
+}
+
+VirtualHostMatchResult VirtualHostImpl::getRouteFromRoutesWithCandidates(
+    const RouteCallback& cb, const RouteMatchContext& route_match_context,
+    const StreamInfo::StreamInfo& stream_info, uint64_t random_value,
+    absl::Span<const RouteEntryImplBaseConstSharedPtr> routes,
+    absl::Span<const uint32_t> candidates) const {
   const Http::RequestHeaderMap& headers = route_match_context.headers();
   const RouteSpecifierSpan config_specifiers =
       shared_virtual_host_->globalRouteConfig().routeSpecifiers();
 
-  for (auto route = routes.begin(); route != routes.end(); ++route) {
-    if (!headers.Path() && !(*route)->supportsPathlessHeaders()) {
+  // Candidates hold route positions in ascending order; an empty candidate set visits every
+  // route in order. A candidate's "no more routes" status is a property of its position in the
+  // configured route list, exactly as in the linear scan.
+  const size_t route_count = routes.size();
+  const size_t visit_count = candidates.empty() ? route_count : candidates.size();
+  for (size_t position = 0; position < visit_count; ++position) {
+    const uint32_t route_index =
+        candidates.empty() ? static_cast<uint32_t>(position) : candidates[position];
+    const bool is_last_route = (route_index == route_count - 1);
+    const RouteEntryImplBaseConstSharedPtr& route = routes[route_index];
+
+    if (!headers.Path() && !route->supportsPathlessHeaders()) {
       continue;
     }
 
-    if (!(*route)->matches(route_match_context, stream_info, random_value)) {
+    if (!route->matches(route_match_context, stream_info, random_value)) {
       continue;
     }
 
-    RouteConstSharedPtr route_entry = (*route)->clusterEntry(headers, stream_info, random_value);
+    RouteConstSharedPtr route_entry = route->clusterEntry(headers, stream_info, random_value);
     if (route_entry == nullptr) {
       continue;
     }
 
-    const RouteSpecifierSpan route_specifiers = (*route)->routeSpecifiers();
+    const RouteSpecifierSpan route_specifiers = route->routeSpecifiers();
     const bool has_route_specifiers =
         !config_specifiers.empty() || !route_specifiers_.empty() || !route_specifiers.empty();
     if (has_route_specifiers) {
-      const OnRouteInputStatus input_status = (std::next(route) == routes.end())
-                                                  ? OnRouteInputStatus::NoMoreRoutes
-                                                  : OnRouteInputStatus::HasMoreRoutes;
+      const OnRouteInputStatus input_status =
+          is_last_route ? OnRouteInputStatus::NoMoreRoutes : OnRouteInputStatus::HasMoreRoutes;
       OnRouteResult result =
           applyRouteSpecifiers(std::move(route_entry), config_specifiers, route_specifiers_,
                                route_specifiers, headers, stream_info, random_value, input_status);
@@ -1957,9 +2056,8 @@ VirtualHostMatchResult VirtualHostImpl::getRouteFromRoutes(
       return {std::move(route_entry), true};
     }
 
-    RouteEvalStatus eval_status = (std::next(route) == routes.end())
-                                      ? RouteEvalStatus::NoMoreRoutes
-                                      : RouteEvalStatus::HasMoreRoutes;
+    const RouteEvalStatus eval_status =
+        is_last_route ? RouteEvalStatus::NoMoreRoutes : RouteEvalStatus::HasMoreRoutes;
     RouteMatchStatus match_status = cb(route_entry, eval_status);
     if (match_status == RouteMatchStatus::Accept) {
       return {std::move(route_entry), true};
@@ -2031,7 +2129,14 @@ VirtualHostImpl::getRouteFromEntries(const RouteCallback& cb, const Http::Reques
     return {};
   }
 
-  // Check for a route that matches the request.
+  // Check for a route that matches the request. With the config-time route index enabled, only
+  // the candidate routes it selects are visited, still in configured route order.
+  if (route_index_.enabled) {
+    absl::InlinedVector<uint32_t, 8> candidates;
+    route_index_.collectCandidates(route_match_context.sanitizedPathWithoutQuery(), candidates);
+    return getRouteFromRoutesWithCandidates(cb, route_match_context, stream_info, random_value,
+                                            routes_, absl::MakeSpan(candidates));
+  }
   return getRouteFromRoutes(cb, route_match_context, stream_info, random_value, routes_);
 }
 
