@@ -6,6 +6,9 @@
 #include "source/common/event/dispatcher_impl.h"
 #include "source/common/stats/isolated_store_impl.h"
 
+#include "absl/flags/flag.h"
+#include "absl/flags/reflection.h"
+
 #include "test/test_common/environment.h"
 #include "test/test_common/utility.h"
 
@@ -108,6 +111,11 @@ TEST_P(FileEventImplActivateTest, Activate) {
 }
 
 TEST_P(FileEventImplActivateTest, ActivateChaining) {
+  // This test encodes the same-turn Write delivery semantics; force the feature on (it is
+  // default-off until the ordering hazard documented on the runtime feature is resolved).
+  const bool saved_flag =
+      absl::GetFlag(FLAGS_envoy_reloadable_features_write_activation_current_iteration);
+  absl::SetFlag(&FLAGS_envoy_reloadable_features_write_activation_current_iteration, true);
   os_fd_t fd = os_sys_calls_.socket(domain(), SOCK_DGRAM, 0).return_value_;
   ASSERT_TRUE(SOCKET_VALID(fd));
 
@@ -158,6 +166,7 @@ TEST_P(FileEventImplActivateTest, ActivateChaining) {
   dispatcher->run(Event::Dispatcher::RunType::NonBlock);
 
   os_sys_calls_.close(fd);
+  absl::SetFlag(&FLAGS_envoy_reloadable_features_write_activation_current_iteration, saved_flag);
 }
 
 TEST_P(FileEventImplActivateTest, SetEnableCancelsActivate) {
