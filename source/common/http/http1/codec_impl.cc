@@ -135,7 +135,11 @@ void StreamEncoderImpl::encodeFormattedHeader(absl::string_view key, absl::strin
 
 void ResponseEncoderImpl::encode1xxHeaders(const ResponseHeaderMap& headers) {
   ASSERT(HeaderUtility::isSpecial1xx(headers));
+  // 1xx responses keep the immediate flush: they are standalone informational messages and
+  // must not be deferred (and must not be coalesced into the following final response).
+  encoding_1xx_ = true;
   encodeHeaders(headers, false);
+  encoding_1xx_ = false;
   // Don't consider 100-continue responses as the actual response.
   started_response_ = false;
 }
@@ -444,7 +448,7 @@ void ResponseEncoderImpl::encodeHeaders(const ResponseHeaderMap& headers, bool e
   // Defer the header write for at most the rest of the current dispatcher turn so that a
   // response whose body follows in the same turn leaves in ONE write (one network-filter pass,
   // one write activation, one writev). Tunneling/upgrade responses must go out immediately.
-  if (!end_stream && !connection_.handlingUpgrade()) {
+  if (!end_stream && !connection_.handlingUpgrade() && !encoding_1xx_) {
     connection_.armDeferredFlush();
   }
 

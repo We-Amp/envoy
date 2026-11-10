@@ -184,6 +184,7 @@ public:
 
 private:
   bool started_response_{};
+  bool encoding_1xx_{false};
   const bool stream_error_on_invalid_http_message_;
 };
 

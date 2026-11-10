@@ -2699,10 +2699,22 @@ TEST_F(Http1ServerConnectionImplTest, WatermarkTest) {
   static_cast<ServerConnection*>(codec_.get())
       ->onUnderlyingConnectionAboveWriteBufferHighWatermark();
 
+  // The deferred header flush keeps the bytes in output_buffer_ (still above the high
+  // watermark) until the end-of-turn flush runs; simulate that dispatcher turn boundary here.
+  std::vector<Event::FakeSchedulableCallback*> schedulable_callbacks;
+  ON_CALL(connection_.dispatcher_, createSchedulableCallback_(_))
+      .WillByDefault([&](std::function<void()> cb) -> Event::SchedulableCallback* {
+        auto* fake = new Event::FakeSchedulableCallback(std::move(cb));
+        schedulable_callbacks.push_back(fake);
+        return fake;
+      });
   EXPECT_CALL(stream_callbacks, onAboveWriteBufferHighWatermark());
   EXPECT_CALL(stream_callbacks, onBelowWriteBufferLowWatermark());
   TestResponseHeaderMapImpl headers{{":status", "200"}};
   response_encoder->encodeHeaders(headers, false);
+  for (auto* cb : schedulable_callbacks) {
+    cb->invokeIfScheduled();
+  }
 
   // Fake out the underlying Network::Connection buffer being drained.
   EXPECT_CALL(stream_callbacks, onBelowWriteBufferLowWatermark());
