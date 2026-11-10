@@ -323,7 +323,7 @@ protected:
     using HeaderLazyMap = absl::flat_hash_map<absl::string_view, HeaderNodeVector>;
 
     HeaderList()
-        : node_pool_(std::make_shared<Detail::HeaderNodePool>()), headers_(node_pool_),
+        : node_pool_(std::make_shared<Detail::HeaderNodePool>()), headers_(typename HeaderListType::allocator_type(node_pool_)),
           pseudo_headers_end_(headers_.end()) {}
 
     template <class Key> bool isPseudoHeader(const Key& key) {
