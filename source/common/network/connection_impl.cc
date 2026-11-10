@@ -190,8 +190,18 @@ void ConnectionImpl::closeInternal(ConnectionCloseType type) {
                        data_to_write, enumToInt(type));
 
   const bool delayed_close_timeout_set = delayed_close_timeout_.count() > 0;
-  if (data_to_write == 0 || type == ConnectionCloseType::NoFlush ||
-      type == ConnectionCloseType::Abort || !transport_socket_->canFlushClose()) {
+  // Give transports with staged write data (e.g. TLS ciphertext batched by the transport and
+  // accepted by SSL but not yet written to the socket) a best-effort flush before deciding how
+  // to close, so the decision sees the post-flush state.
+  if ((type == ConnectionCloseType::FlushWrite ||
+       type == ConnectionCloseType::FlushWriteAndDelay) &&
+      transport_socket_->hasUnflushedData()) {
+    transport_socket_->doWrite(*write_buffer_, false);
+    data_to_write = write_buffer_->length();
+  }
+  if ((data_to_write == 0 && !transport_socket_->hasUnflushedData()) ||
+      type == ConnectionCloseType::NoFlush || type == ConnectionCloseType::Abort ||
+      !transport_socket_->canFlushClose()) {
     if (data_to_write > 0 && type != ConnectionCloseType::Abort) {
       // We aren't going to wait to flush, but try to write as much as we can if there is pending
       // data.
@@ -907,7 +917,9 @@ void ConnectionImpl::onWriteReady() {
     // write callback. This can happen if we manage to complete the SSL handshake in the write
     // callback, raise a connected event, and close the connection.
     closeSocket(ConnectionEvent::RemoteClose);
-  } else if ((inDelayedClose() && new_buffer_size == 0) || bothSidesHalfClosed()) {
+  } else if ((inDelayedClose() && new_buffer_size == 0 &&
+              !transport_socket_->hasUnflushedData()) ||
+             bothSidesHalfClosed()) {
     ENVOY_CONN_LOG(debug, "write flush complete", *this);
     if (delayed_close_state_ == DelayedCloseState::CloseAfterFlushAndWait) {
       ASSERT(delayed_close_timer_ != nullptr && delayed_close_timer_->enabled());

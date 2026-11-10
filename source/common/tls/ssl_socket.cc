@@ -337,6 +337,20 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
     }
   }
 
+  BIO* wbio = SSL_get_wbio(rawSsl());
+  const bool batching = Runtime::runtimeFeatureEnabled(
+      "envoy.reloadable_features.tls_staged_write_batching");
+  uint64_t total_bytes_written = 0;
+
+  if (batching) {
+    // Resume flushing ciphertext staged by a previous call whose flush hit socket backpressure.
+    BIO_io_handle_flush_pending(wbio);
+    if (BIO_io_handle_take_flush_error(wbio)) {
+      drainErrorQueue();
+      return {PostIoAction::Close, total_bytes_written, false, detected_io_error_};
+    }
+  }
+
   uint64_t bytes_to_write;
   if (bytes_to_retry_) {
     bytes_to_write = bytes_to_retry_;
@@ -345,7 +359,6 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
     bytes_to_write = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
   }
 
-  uint64_t total_bytes_written = 0;
   while (bytes_to_write > 0) {
     // TODO(mattklein123): As it relates to our fairness efforts, we might want to limit the number
     // of iterations of this loop, either by pure iterations, bytes written, etc.
@@ -359,7 +372,18 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
     if (rc > 0) {
       ASSERT(rc == static_cast<int>(bytes_to_write));
       total_bytes_written += rc;
+      // With staged-write batching the ciphertext lands in the BIO's pending buffer and is
+      // flushed once below (bounded by an intermediate flush for large writes). BoringSSL has
+      // accepted the plaintext, so it is drained either way; hasUnflushedData() keeps connection
+      // close paths from dropping still-staged ciphertext.
       write_buffer.drain(rc);
+      if (batching && BIO_io_handle_pending_bytes(wbio) >= 128 * 1024) {
+        BIO_io_handle_flush_pending(wbio);
+        if (BIO_io_handle_take_flush_error(wbio)) {
+          drainErrorQueue();
+          return {PostIoAction::Close, total_bytes_written, false, detected_io_error_};
+        }
+      }
       bytes_to_write = std::min(write_buffer.length(), static_cast<uint64_t>(16384));
     } else {
       int err = SSL_get_error(rawSsl(), rc);
@@ -380,11 +404,28 @@ Network::IoResult SslSocket::doWrite(Buffer::Instance& write_buffer, bool end_st
     }
   }
 
+  if (batching) {
+    // Single flush of everything the SSL_write loop staged (typically one writev for the whole
+    // header+body batch instead of one writev per 16 KB record). On socket backpressure the
+    // remainder stays staged; hasUnflushedData() reports it so close paths keep flushing.
+    BIO_io_handle_flush_pending(wbio);
+    if (BIO_io_handle_take_flush_error(wbio)) {
+      drainErrorQueue();
+      return {PostIoAction::Close, total_bytes_written, false, detected_io_error_};
+    }
+  }
+
   if (write_buffer.length() == 0 && end_stream) {
     shutdownSsl();
   }
 
   return {PostIoAction::KeepOpen, total_bytes_written, false};
+}
+
+bool SslSocket::hasUnflushedData() const {
+  return Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tls_staged_write_batching") &&
+         info_->state() == Ssl::SocketState::HandshakeComplete &&
+         BIO_io_handle_pending_bytes(SSL_get_wbio(rawSsl())) > 0;
 }
 
 void SslSocket::onConnected() {
@@ -410,6 +451,11 @@ void SslSocket::shutdownSsl() {
       }
     }
     ENVOY_CONN_LOG(debug, "SSL shutdown: rc={}", callbacks_->connection(), rc);
+    // Push the close_notify (and any data staged ahead of it) out so it cannot be overtaken by
+    // the socket close.
+    if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tls_staged_write_batching")) {
+      BIO_io_handle_flush_pending(SSL_get_wbio(rawSsl()));
+    }
     drainErrorQueue();
     info_->setState(Ssl::SocketState::ShutdownSent);
   }

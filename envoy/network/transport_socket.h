@@ -149,6 +149,13 @@ public:
   virtual bool canFlushClose() PURE;
 
   /**
+   * @return bool whether the transport has accepted data from the stack that has not yet reached
+   *         the socket (e.g. ciphertext batched by a staging transport). Connection close paths
+   *         use this to keep flushing instead of discarding. Default: no such data.
+   */
+  virtual bool hasUnflushedData() const { return false; }
+
+  /**
    * Connect the underlying transport.
    * @param socket provides the socket to connect.
    * @return int the result from connect.

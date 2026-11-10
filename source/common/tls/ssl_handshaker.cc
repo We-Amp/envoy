@@ -6,6 +6,8 @@
 #include "source/common/common/empty_string.h"
 #include "source/common/http/headers.h"
 #include "source/common/runtime/runtime_features.h"
+
+#include "source/common/tls/io_handle_bio.h"
 #include "source/common/tls/context_impl.h"
 #include "source/common/tls/utility.h"
 
@@ -217,6 +219,20 @@ bool sawBytesFromDownstream(SSL* ssl) {
 Network::PostIoAction SslHandshakerImpl::doHandshake() {
   ASSERT(state_ != Ssl::SocketState::HandshakeComplete && state_ != Ssl::SocketState::ShutdownSent);
 
+  if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tls_staged_write_batching")) {
+    // Push any staged handshake flight out before (re-)entering the state machine; on
+    // backpressure retry on the next write-ready event.
+    BIO* wbio = SSL_get_wbio(ssl());
+    BIO_io_handle_flush_pending(wbio);
+    if (BIO_io_handle_take_flush_error(wbio)) {
+      handshake_callbacks_->onFailure();
+      return PostIoAction::Close;
+    }
+    if (BIO_io_handle_pending_bytes(wbio) > 0) {
+      return PostIoAction::KeepOpen;
+    }
+  }
+
   int rc = SSL_do_handshake(ssl());
 
   // On the server side, record the downstream handshake start the first time we actually consume
@@ -227,6 +243,22 @@ Network::PostIoAction SslHandshakerImpl::doHandshake() {
   }
 
   if (rc == 1) {
+    // With staged-write batching the handshake's final flight may still be in the BIO's pending
+    // buffer. Do not complete the handshake until it reached the socket, so the peer's next
+    // flight is always requested only after ours is on the wire. doHandshake() is re-entered on
+    // the next write-ready event to finish the flush.
+    if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tls_staged_write_batching")) {
+      BIO* wbio = SSL_get_wbio(ssl());
+      BIO_io_handle_flush_pending(wbio);
+      if (BIO_io_handle_take_flush_error(wbio)) {
+        handshake_callbacks_->onFailure();
+        return PostIoAction::Close;
+      }
+      if (BIO_io_handle_pending_bytes(wbio) > 0) {
+        state_ = Ssl::SocketState::HandshakeWaitingForConnectionData;
+        return PostIoAction::KeepOpen;
+      }
+    }
     state_ = Ssl::SocketState::HandshakeComplete;
     handshake_callbacks_->onSuccess(ssl());
 

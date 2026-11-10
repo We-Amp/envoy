@@ -59,6 +59,7 @@ public:
   std::string protocol() const override;
   absl::string_view failureReason() const override;
   bool canFlushClose() override { return info_->state() == Ssl::SocketState::HandshakeComplete; }
+  bool hasUnflushedData() const override;
   void closeSocket(Network::ConnectionEvent close_type, bool abort_reset) override;
   Network::IoResult doRead(Buffer::Instance& read_buffer) override;
   Network::IoResult doWrite(Buffer::Instance& write_buffer, bool end_stream) override;
