@@ -6,6 +6,8 @@
 #include "source/common/event/dispatcher_impl.h"
 #include "source/common/runtime/runtime_features.h"
 
+#include <cstdio>
+
 #include "event2/event.h"
 
 namespace Envoy {
@@ -47,13 +49,16 @@ void FileEventImpl::activate(uint32_t events) {
   // in the current iteration removes an extra loop turn and a zero-timeout poll per write. Read
   // activations stay on next-iteration scheduling for fairness, and a per-dispatcher budget
   // bounds how many Write activations a single turn may run in the current iteration.
+  fprintf(stderr, "DBG activate events=%u injected=%u\n", events, injected_activation_events_);
   if (injected_activation_events_ == 0) {
     ASSERT(!activation_cb_->enabled());
     if (events == FileReadyType::Write &&
         Runtime::runtimeFeatureEnabled("envoy.reloadable_features.write_activation_current_iteration") &&
         static_cast<DispatcherImpl&>(dispatcher_).tryConsumeCurrentIterationWriteActivationBudget()) {
+      fprintf(stderr, "DBG -> current-iteration\n");
       activation_cb_->scheduleCallbackCurrentIteration();
     } else {
+      fprintf(stderr, "DBG -> next-iteration\n");
       activation_cb_->scheduleCallbackNextIteration();
     }
   }

@@ -61,6 +61,7 @@ public:
   FileEventImplActivateTest() : os_sys_calls_(Api::OsSysCallsSingleton::get()) {}
 
   static void callPrepareCallback(evwatch*, const evwatch_prepare_cb_info*, void* arg) {
+    fprintf(stderr, "DBG prepare\n");
     // `arg` contains the MockFunction passed in from evwatch_prepare_new.
     auto callback = static_cast<MockFunction<void()>*>(arg);
     callback->Call();
@@ -123,6 +124,7 @@ TEST_P(FileEventImplActivateTest, ActivateChaining) {
   Event::FileEventPtr file_event = dispatcher->createFileEvent(
       fd,
       [&](uint32_t events) {
+        fprintf(stderr, "DBG fd-callback events=%u\n", events);
         fd_callback.Call();
         if (events & FileReadyType::Read) {
           read_callback.Call();
