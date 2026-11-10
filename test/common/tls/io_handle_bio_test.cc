@@ -500,12 +500,6 @@ TEST(IoHandleBioIndependentTest, TwoBiosAreIndependent) {
   BIO_free(bio2);
 }
 
-} // namespace Tls
-} // namespace TransportSockets
-} // namespace Extensions
-} // namespace Envoy
-
-
 TEST_F(IoHandleBioBatchTest, WriteStagesUntilFlush) {
   EXPECT_CALL(io_handle_, writev(_, 1)).WillOnce(Return(testing::ByMove(makeSuccessResult(10))));
   EXPECT_EQ(5, BIO_write(bio_, "hello", 5));
@@ -551,3 +545,9 @@ TEST_F(IoHandleBioBatchTest, ForeignBioIsNullSafe) {
   BIO_free(pair_a);
   BIO_free(pair_b);
 }
+
+} // namespace Tls
+} // namespace TransportSockets
+} // namespace Extensions
+} // namespace Envoy
+
