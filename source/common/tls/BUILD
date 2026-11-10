@@ -33,6 +33,7 @@ envoy_cc_library(
     deps = [
         ":connection_info_impl_base_lib",
         ":context_lib",
+        ":io_handle_bio_lib",
         ":utility_lib",
         "//envoy/network:connection_interface",
         "//envoy/network:transport_socket_interface",
