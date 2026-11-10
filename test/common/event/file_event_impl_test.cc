@@ -20,6 +20,9 @@ namespace {
 
 using ::testing::MockFunction;
 
+// Declared via RUNTIME_GUARD in source/common/runtime/runtime_features.cc.
+ABSL_DECLARE_FLAG(bool, envoy_reloadable_features_write_activation_current_iteration);
+
 class FileEventImplTest : public testing::Test {
 public:
   FileEventImplTest()
