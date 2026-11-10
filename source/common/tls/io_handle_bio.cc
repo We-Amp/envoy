@@ -33,12 +33,10 @@ struct BioContext {
   bool flush_error{false};
 };
 
-const BIO_METHOD* BIO_s_io_handle(void);
-
 // NOLINTNEXTLINE(readability-identifier-naming)
 inline BioContext* bio_context(BIO* bio) {
   // Null for foreign BIOs (e.g. BIO pairs): the SSL layer can hold a wbio that is not ours.
-  if (bio == nullptr || BIO_get_method(bio) != BIO_s_io_handle()) {
+  if (bio == nullptr || BIO_method_type(bio) != BIO_TYPE_SOCKET) {
     return nullptr;
   }
   return reinterpret_cast<BioContext*>(BIO_get_data(bio));
