@@ -1,8 +1,10 @@
 #include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -12514,6 +12516,198 @@ virtual_hosts:
       },
       genHeaders("bat.com", "/foo/bar", "GET"));
   EXPECT_EQ(accepted_route->routeEntry()->clusterName(), "foo");
+}
+
+// Differential coverage for the config-time route index: config.route() must agree with a
+// per-route linear scan built from single-route configurations (which never use the index).
+// The regex case list covers every shape a naive literal-prefix extraction gets wrong --
+// top-level alternation, quantifiers, groups, escapes, inline fold-case flags, end anchors,
+// unanchored patterns -- plus a case-sensitive/insensitive pair whose evaluation order matters.
+TEST_F(RouteMatcherTest, RouteIndexRegexPrefixCaseDifferential) {
+  const std::vector<std::string> regex_cases = {
+      "^/a|^/b", "^/ab?", "^/ab*", "^/a{0}x",   "^(/a)", "(?i)^/A",  "^\\/a",
+      "^/a\\.b", "\\A/a", "^$",    "/noanchor", "^/Api", "(?i)^/api"};
+
+  // The multi-route configuration: an exact and a prefix route, one route per regex case, and
+  // a catch-all in the last position. Each route's direct-response body is its identity.
+  std::vector<std::string> route_bodies;
+  envoy::config::route::v3::RouteConfiguration multi_config;
+  auto* v_host = multi_config.mutable_virtual_hosts()->Add();
+  v_host->set_name("vhost");
+  v_host->add_domains("example.com");
+  auto routes = v_host->mutable_routes();
+  auto add_route = [&](const std::function<void(envoy::config::route::v3::RouteMatch&)>& fill) {
+    const int status = 200 + static_cast<int>(route_bodies.size());
+    route_bodies.push_back(absl::StrCat("r", route_bodies.size()));
+    auto* route = routes->Add();
+    route->mutable_direct_response()->set_status(status);
+    fill(*route->mutable_match());
+  };
+  add_route([](envoy::config::route::v3::RouteMatch& m) { m.set_path("/exact"); });
+  add_route([](envoy::config::route::v3::RouteMatch& m) { m.set_prefix("/pre"); });
+  for (const auto& regex : regex_cases) {
+    add_route([regex](envoy::config::route::v3::RouteMatch& m) {
+      m.mutable_safe_regex()->mutable_google_re2();
+      m.mutable_safe_regex()->set_regex(regex);
+    });
+  }
+  add_route([](envoy::config::route::v3::RouteMatch& m) { m.set_prefix("/"); });
+
+  // One single-route configuration per position: these never use the index, so evaluating them
+  // in order reproduces the linear scan.
+  std::vector<envoy::config::route::v3::RouteConfiguration> single_configs;
+  single_configs.reserve(route_bodies.size());
+  for (int i = 0; i < routes->size(); ++i) {
+    single_configs.push_back(multi_config);
+    auto* single_routes = single_configs.back().mutable_virtual_hosts(0)->mutable_routes();
+    single_routes->SwapElements(0, i);
+    while (single_routes->size() > 1) {
+      single_routes->RemoveLast();
+    }
+  }
+
+  factory_context_.cluster_manager_.initializeClusters({}, {});
+  TestConfigImpl multi_route_matcher(multi_config, factory_context_, true, creation_status_);
+  ASSERT_TRUE(creation_status_.ok());
+  std::vector<std::unique_ptr<TestConfigImpl>> single_matchers;
+  single_matchers.reserve(single_configs.size());
+  for (const auto& single : single_configs) {
+    absl::Status status = creation_status_;
+    single_matchers.push_back(
+        std::make_unique<TestConfigImpl>(single, factory_context_, true, status));
+    ASSERT_TRUE(status.ok()) << status.message();
+  }
+
+  const auto scan_for = [&](const Http::TestRequestHeaderMapImpl& headers) -> int {
+    for (size_t i = 0; i < single_matchers.size(); ++i) {
+      const RouteConstSharedPtr matched = single_matchers[i]->route(headers, 0);
+      if (matched != nullptr) {
+        return static_cast<int>(i);
+      }
+    }
+    return -1;
+  };
+  const std::vector<std::string> paths = {"/a",     "/b",       "/ab",    "/abc",   "/a.b",
+                                          "/axb",   "/API/x",   "/Api/x", "/api/x", "/noanchor",
+                                          "/exact", "/exact/x", "/pre",   "/pre/x", "/ab/x",
+                                          "/zzz",   "/A",       "/Ax",    "/Ax/b",  "/a/b"};
+  for (const auto& path : paths) {
+    Http::TestRequestHeaderMapImpl headers{{":authority", "example.com"},
+                                           {":path", path},
+                                           {":method", "GET"},
+                                           {":scheme", "http"},
+                                           {"x-forwarded-proto", "http"}};
+    const int expected = scan_for(headers);
+    ASSERT_GE(expected, 0) << "path " << path << " matched nothing in the scan";
+    const RouteConstSharedPtr actual = multi_route_matcher.route(headers, 0);
+    ASSERT_NE(actual, nullptr) << "path " << path;
+    EXPECT_EQ(200 + expected, static_cast<int>(actual->directResponseEntry()->responseCode()))
+        << "path " << path << " diverged from the linear scan";
+  }
+}
+
+// Randomized table-vs-scan fuzz: generate tables of mixed matchers and random request paths,
+// and require agreement between config.route() and the single-route linear scan on every
+// request.
+TEST_F(RouteMatcherTest, RouteIndexRandomizedDifferential) {
+  std::mt19937 rng(1234);
+  const std::vector<std::string> shapes = {
+      "exact:/gen/{n}",      "prefix:/gen/{n}/", "regex:^/gen/[ab]+/{n}$", "regex:^/gen{1}x",
+      "regex:(?i)^/gen/{n}", "regex:^/gen(/|x)", "separated:/gen{n}",      "regex:^$"};
+  const int kRoutes = 16;
+  const int kRequests = 60;
+
+  envoy::config::route::v3::RouteConfiguration multi_config;
+  auto* v_host = multi_config.mutable_virtual_hosts()->Add();
+  v_host->set_name("vhost");
+  v_host->add_domains("*");
+  auto routes = v_host->mutable_routes();
+  auto fill_match = [](envoy::config::route::v3::RouteMatch& m, const std::string& shape, int n) {
+    const std::string expanded = absl::StrReplaceAll(shape, {{"{n}", absl::StrCat(n)}});
+    const size_t colon = expanded.find(':');
+    const std::string kind = expanded.substr(0, colon);
+    const std::string value = expanded.substr(colon + 1);
+    if (kind == "exact") {
+      m.set_path(value);
+    } else if (kind == "prefix" || kind == "separated") {
+      if (kind == "separated") {
+        m.set_path_separated_prefix(value);
+      } else {
+        m.set_prefix(value);
+      }
+    } else {
+      m.mutable_safe_regex()->mutable_google_re2();
+      m.mutable_safe_regex()->set_regex(value);
+    }
+  };
+  std::vector<std::string> route_bodies;
+  for (int i = 0; i < kRoutes - 1; ++i) {
+    const std::string& shape = shapes[rng() % shapes.size()];
+    route_bodies.push_back(absl::StrCat("r", i));
+    auto* route = routes->Add();
+    route->mutable_direct_response()->set_status(200 + i);
+    fill_match(*route->mutable_match(), shape, i);
+  }
+  // The last route is always the catch-all so every request matches something.
+  route_bodies.push_back(absl::StrCat("r", kRoutes - 1));
+  auto* catch_all = routes->Add();
+  catch_all->mutable_direct_response()->set_status(200 + kRoutes - 1);
+  catch_all->mutable_match()->set_prefix("/");
+
+  std::vector<envoy::config::route::v3::RouteConfiguration> single_configs;
+  single_configs.reserve(kRoutes);
+  for (int i = 0; i < routes->size(); ++i) {
+    single_configs.push_back(multi_config);
+    auto* single_routes = single_configs.back().mutable_virtual_hosts(0)->mutable_routes();
+    single_routes->SwapElements(0, i);
+    while (single_routes->size() > 1) {
+      single_routes->RemoveLast();
+    }
+  }
+
+  factory_context_.cluster_manager_.initializeClusters({}, {});
+  TestConfigImpl multi_route_matcher(multi_config, factory_context_, true, creation_status_);
+  ASSERT_TRUE(creation_status_.ok());
+  std::vector<std::unique_ptr<TestConfigImpl>> single_matchers;
+  single_matchers.reserve(kRoutes);
+  for (const auto& single : single_configs) {
+    absl::Status status = creation_status_;
+    single_matchers.push_back(
+        std::make_unique<TestConfigImpl>(single, factory_context_, true, status));
+    ASSERT_TRUE(status.ok()) << status.message();
+  }
+
+  const std::string alphabet = "/abcx.";
+  std::uniform_int_distribution<size_t> length(1, 7);
+  std::uniform_int_distribution<size_t> pick(0, alphabet.size() - 1);
+  for (int r = 0; r < kRequests; ++r) {
+    std::string path;
+    path += '/';
+    for (size_t c = 0, n = length(rng); c < n; ++c) {
+      path += alphabet[pick(rng)];
+    }
+    Http::TestRequestHeaderMapImpl headers{{":authority", "example.com"},
+                                           {":path", path},
+                                           {":method", "GET"},
+                                           {":scheme", "http"},
+                                           {"x-forwarded-proto", "http"}};
+    int expected = -1;
+    for (size_t i = 0; i < single_matchers.size(); ++i) {
+      const RouteConstSharedPtr matched = single_matchers[i]->route(headers, 0);
+      if (matched != nullptr) {
+        expected = static_cast<int>(i);
+        break;
+      }
+    }
+    if (expected == -1) {
+      // The catch-all prefix "/" is always in the table, so every request matches something.
+      FAIL() << "scan matched nothing for " << path;
+    }
+    const RouteConstSharedPtr actual = multi_route_matcher.route(headers, 0);
+    ASSERT_NE(actual, nullptr) << "path " << path;
+    EXPECT_EQ(200 + expected, static_cast<int>(actual->directResponseEntry()->responseCode()))
+        << "path " << path << " diverged from the linear scan";
+  }
 }
 
 TEST_F(RouteMatchOverrideTest, MatchTreeVerifyRouteOverrideStops) {

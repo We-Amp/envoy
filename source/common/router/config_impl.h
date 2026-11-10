@@ -559,6 +559,9 @@ private:
                            absl::InlinedVector<uint32_t, 8>& candidates) const;
 
     bool enabled{false};
+    // True when at least one indexed route is case-insensitive; when false, lookups skip the
+    // lower-cased path entirely (no per-request allocation).
+    bool has_case_insensitive_routes{false};
     absl::flat_hash_map<std::string, std::vector<uint32_t>> exact_routes;
     PrefixTrieNode prefix_root;
     std::vector<uint32_t> side_list;

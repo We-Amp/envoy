@@ -63,9 +63,21 @@
 #include "absl/container/inlined_vector.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "re2/re2.h"
 
 namespace Envoy {
 namespace Router {
+
+namespace {
+// Maximum length of the required literal prefix derived from a safe_regex pattern for the
+// config-time route index (see VirtualHostImpl::RouteCandidateIndex). PossibleMatchRange
+// truncates the reported range endpoints to this length; a TRUNCATED max is still a valid
+// lexicographic upper bound for every match, so the longest common prefix of the truncated
+// endpoints remains a required prefix of every match -- truncation can only shorten the
+// derived prefix, never invalidate it.
+constexpr size_t kMaxIndexedPrefixLen = 256;
+} // namespace
+
 class RouteCreator {
 public:
   static absl::StatusOr<RouteEntryImplBaseConstSharedPtr>
@@ -1920,7 +1932,9 @@ VirtualHostImpl::VirtualHostImpl(const envoy::config::route::v3::VirtualHost& vi
 void VirtualHostImpl::RouteCandidateIndex::collectCandidates(
     absl::string_view sanitized_path, absl::InlinedVector<uint32_t, 8>& candidates) const {
   ASSERT(enabled);
-  const std::string lowered(absl::AsciiStrToLower(sanitized_path));
+  const bool needs_folded_lookup = has_case_insensitive_routes;
+  const std::string lowered =
+      needs_folded_lookup ? std::string(absl::AsciiStrToLower(sanitized_path)) : std::string();
 
   auto add_exact = [&](absl::string_view key) {
     const auto it = exact_routes.find(key);
@@ -1929,7 +1943,7 @@ void VirtualHostImpl::RouteCandidateIndex::collectCandidates(
     }
   };
   add_exact(sanitized_path);
-  if (lowered != sanitized_path) {
+  if (needs_folded_lookup && lowered != sanitized_path) {
     add_exact(lowered);
   }
 
@@ -1946,7 +1960,7 @@ void VirtualHostImpl::RouteCandidateIndex::collectCandidates(
     }
   };
   walk_trie(sanitized_path);
-  if (lowered != sanitized_path) {
+  if (needs_folded_lookup && lowered != sanitized_path) {
     walk_trie(lowered);
   }
 
@@ -1968,14 +1982,18 @@ void VirtualHostImpl::buildRouteCandidateIndex() {
     switch (route->matchType()) {
     case PathMatchType::Exact: {
       std::string key = route->pathMatchCaseSensitive() ? route->matcher()
-                                                : absl::AsciiStrToLower(route->matcher());
+                                                        : absl::AsciiStrToLower(route->matcher());
       route_index_.exact_routes[std::move(key)].push_back(i);
       break;
     }
     case PathMatchType::Prefix:
     case PathMatchType::PathSeparatedPrefix: {
-      const std::string path = route->pathMatchCaseSensitive() ? route->matcher()
-                                                       : absl::AsciiStrToLower(route->matcher());
+      if (!route->pathMatchCaseSensitive()) {
+        route_index_.has_case_insensitive_routes = true;
+      }
+      const std::string path = route->pathMatchCaseSensitive()
+                                   ? route->matcher()
+                                   : absl::AsciiStrToLower(route->matcher());
       RouteCandidateIndex::PrefixTrieNode* node = &route_index_.prefix_root;
       for (const char c : path) {
         auto& child = node->children[c];
@@ -1988,29 +2006,40 @@ void VirtualHostImpl::buildRouteCandidateIndex() {
       break;
     }
     case PathMatchType::Regex: {
-      // Conservative literal-prefix extraction from the regex text: only an anchored ('^') run
-      // of plain literal characters becomes a prefix-trie entry (regexes are case-sensitive, so
-      // the raw prefix is used). Anything else -- unanchored patterns, metacharacters, escapes --
-      // stays in the ordered side list. A conservative miss only costs a side-list scan for that
-      // route; it can never produce a wrong candidate set, because every candidate is still
-      // re-validated by the route's full regex match.
-      static constexpr absl::string_view kMetachars = "()[]{}|?*+$.^\\";
-      const std::string& pattern = route->matcher();
-      if (pattern.empty() || pattern[0] != '^') {
+      // Only safe_regex routes are indexed, and only when RE2's own prefix analysis establishes
+      // a required case-sensitive literal prefix for the pattern. RE2 computes the range against
+      // an anchored-at-start match while Envoy evaluates FullMatch -- a subset of anchored
+      // matches -- so the required-prefix bound holds a fortiori. This handles all the shapes a
+      // hand scan cannot (top-level alternation, quantifiers, groups, escapes, inline flags):
+      // the longest common prefix of the reported range endpoints is required of every match,
+      // so the trie entry can never over-reject (a truncated max remains a valid upper bound).
+      // Anything else -- unanchored patterns, fold-case prefixes, patterns RE2 cannot compile --
+      // stays in the ordered side list, which is scanned for every request. The extraction can
+      // only MISS (a route evaluated more often than strictly necessary), never over-reject,
+      // because every candidate is still fully re-validated by the route's own regex match.
+      const re2::RE2 compiled(route->matcher());
+      std::string range_min;
+      std::string range_max;
+      if (!compiled.ok() ||
+          !compiled.PossibleMatchRange(&range_min, &range_max, kMaxIndexedPrefixLen)) {
         route_index_.side_list.push_back(i);
         break;
       }
-      size_t literal_end = 1;
-      while (literal_end < pattern.size() &&
-             kMetachars.find(pattern[literal_end]) == absl::string_view::npos) {
-        ++literal_end;
+      // Any anchored match of the pattern lies within [range_min, range_max]; the longest common
+      // prefix of the range endpoints is therefore a prefix of every match. Fold-case patterns
+      // yield a short (often empty) common prefix and fall back to the side list naturally. An
+      // empty common prefix must NEVER enter the trie (that would make every request a
+      // candidate), hence the side list.
+      size_t common = 0;
+      while (common < range_min.size() && common < range_max.size() &&
+             range_min[common] == range_max[common]) {
+        ++common;
       }
-      if (literal_end == 1) {
-        // Anchored but no literal prefix (e.g. "^$" or "^(a|b)/rest").
+      if (common == 0) {
         route_index_.side_list.push_back(i);
         break;
       }
-      const absl::string_view prefix = absl::string_view(pattern).substr(1, literal_end - 1);
+      const absl::string_view prefix = absl::string_view(range_min).substr(0, common);
       RouteCandidateIndex::PrefixTrieNode* node = &route_index_.prefix_root;
       for (const char c : prefix) {
         auto& child = node->children[c];
@@ -2172,7 +2201,11 @@ VirtualHostImpl::getRouteFromEntries(const RouteCallback& cb, const Http::Reques
   }
 
   // Check for a route that matches the request. With the config-time route index enabled, only
-  // the candidate routes it selects are visited, still in configured route order.
+  // the candidate routes it selects are visited, still in configured route order. When the
+  // candidate set comes back empty it is genuinely empty: every configured route is either
+  // represented in the index or carried by the side list, so no route matches and no route is
+  // evaluated. A virtual host containing a route the index cannot represent carries it in the
+  // side list instead, which keeps the conservative scan.
   if (route_index_.enabled) {
     absl::InlinedVector<uint32_t, 8> candidates;
     route_index_.collectCandidates(route_match_context.sanitizedPathWithoutQuery(), candidates);
