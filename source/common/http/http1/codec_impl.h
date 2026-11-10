@@ -11,6 +11,7 @@
 #include "envoy/config/core/v3/protocol.pb.h"
 #include "envoy/http/codec.h"
 #include "envoy/network/connection.h"
+#include "envoy/event/schedulable_cb.h"
 #include "envoy/server/overload/overload_manager.h"
 
 #include "source/common/buffer/watermark_buffer.h"
@@ -92,6 +93,28 @@ public:
 
   // http1 doesn't have a codec level stream id.
   std::optional<uint32_t> codecStreamId() const override { return std::nullopt; }
+
+  /**
+   * Restore fresh-constructor state so a retired encoder (embedded in a reused ActiveRequest)
+   * can serve a new stream. Every per-stream field must be covered here.
+   */
+  virtual void resetForReuse(StreamInfo::BytesMeterSharedPtr&& bytes_meter) {
+    if (buffer_memory_account_) {
+      // Mirror the destructor's account teardown (see ~ResponseEncoderImpl).
+      buffer_memory_account_->clearDownstream();
+    }
+    buffer_memory_account_ = nullptr;
+    read_disable_calls_ = 0;
+    disable_chunk_encoding_ = false;
+    chunk_encoding_ = true;
+    connect_request_ = false;
+    is_tcp_tunneling_ = false;
+    is_response_to_head_request_ = false;
+    is_response_to_connect_request_ = false;
+    details_ = absl::string_view();
+    bytes_meter_ = std::move(bytes_meter);
+    codec_callbacks_ = nullptr;
+  }
 
 protected:
   StreamEncoderImpl(ConnectionImpl& connection, StreamInfo::BytesMeterSharedPtr&& bytes_meter);
@@ -181,6 +204,10 @@ public:
 
   // Http1::StreamEncoderImpl
   void resetStream(StreamResetReason reason) override;
+  void resetForReuse(StreamInfo::BytesMeterSharedPtr&& bytes_meter) override {
+    StreamEncoderImpl::resetForReuse(std::move(bytes_meter));
+    started_response_ = false;
+  }
 
 private:
   bool started_response_{};
@@ -473,6 +500,16 @@ protected:
                             connection.codec_settings_.stream_error_on_invalid_http_message_) {}
     ~ActiveRequest() override = default;
 
+    /**
+     * Restore fresh-constructor state so a retired request can serve a new stream.
+     */
+    void resetForReuse(StreamInfo::BytesMeterSharedPtr&& bytes_meter) {
+      request_url_.clear();
+      request_decoder_handle_ = nullptr;
+      response_encoder_.resetForReuse(std::move(bytes_meter));
+      remote_complete_ = false;
+    }
+
     void dumpState(std::ostream& os, int indent_level) const;
     HeaderString request_url_;
     RequestDecoderHandlePtr request_decoder_handle_;
@@ -483,6 +520,19 @@ protected:
   CallbackResult onMessageCompleteBase() override;
   // Add the size of the request_url to the reported header size when processing request headers.
   uint32_t getHeadersSize() override;
+
+  /**
+   * Free-list retirement of the per-request ActiveRequest on the H1 path (one in-flight request
+   * per connection): keep the wrapper alive and pointer-stable until the end of the current
+   * dispatcher turn, then move it into the reusable slot for the next request. Non-cleanly
+   * completed requests keep the old deferredDelete behavior.
+   */
+  void maybeRetireActiveRequest(ActiveRequestPtr request);
+
+  // Test probe: address of the ActiveRequest currently active, for reuse assertions.
+  void* activeRequestAddressForTest() const {
+    return active_request_ == nullptr ? nullptr : static_cast<void*>(active_request_.get());
+  }
 
 private:
   /**
@@ -555,6 +605,10 @@ private:
 
   ServerConnectionCallbacks& callbacks_;
   std::unique_ptr<ActiveRequest> active_request_;
+  // H1 wrapper free-list state (see maybeRetireActiveRequest).
+  std::unique_ptr<ActiveRequest> pending_retire_request_;
+  std::unique_ptr<ActiveRequest> retired_request_;
+  Event::SchedulableCallbackPtr retire_callback_;
   const Buffer::OwnedBufferFragmentImpl::Releasor response_buffer_releasor_;
   uint32_t outbound_responses_{};
   // Buffer used to encode the HTTP message before moving it to the network connection's output

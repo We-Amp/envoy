@@ -252,6 +252,36 @@ private:
   testing::MockFunction<void()>* destroy_cb_{nullptr};
 };
 
+// A concrete (non-mock) SchedulableCallback that tracks its scheduled state and can be invoked
+// by tests to simulate the end-of-loop-iteration callback dispatch. Used as the default
+// createSchedulableCallback() answer of MockDispatcher so production code paths that lazily
+// create schedulable callbacks work out of the box in tests.
+class FakeSchedulableCallback : public SchedulableCallback {
+public:
+  explicit FakeSchedulableCallback(std::function<void()> cb) : cb_(std::move(cb)) {}
+  ~FakeSchedulableCallback() override = default;
+
+  // SchedulableCallback
+  void scheduleCallbackCurrentIteration() override { scheduled_ = true; }
+  void scheduleCallbackNextIteration() override { scheduled_ = true; }
+  void cancel() override { scheduled_ = false; }
+  bool enabled() override { return scheduled_; }
+
+  // Runs the callback if scheduled, clearing the scheduled state, as the dispatcher would.
+  void invokeIfScheduled() {
+    if (scheduled_) {
+      scheduled_ = false;
+      cb_();
+    }
+  }
+
+  bool scheduledForTest() const { return scheduled_; }
+
+private:
+  std::function<void()> cb_;
+  bool scheduled_{false};
+};
+
 class MockSignalEvent : public SignalEvent {
 public:
   MockSignalEvent(MockDispatcher* dispatcher);

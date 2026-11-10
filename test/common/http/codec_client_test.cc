@@ -114,6 +114,129 @@ TEST_F(CodecClientTest, NotCallDetectEarlyCloseWhenReadDiabledUsingHttp3) {
                                                  nullptr, host_, dispatcher_);
 }
 
+TEST_F(CodecClientTest, ActiveRequestReuseOnCleanCompletion) {
+  initialize();
+
+  // Capture created schedulable callbacks so the test can run the end-of-turn promotion
+  // (the dispatcher-loop behavior the wrapper retirement relies on).
+  std::vector<Event::FakeSchedulableCallback*> schedulable_callbacks;
+  ON_CALL(dispatcher_, createSchedulableCallback_(_))
+      .WillByDefault(
+          [&](std::function<void()> cb) -> Event::SchedulableCallback* {
+            auto* fake = new Event::FakeSchedulableCallback(std::move(cb));
+            schedulable_callbacks.push_back(fake);
+            return fake;
+          });
+  auto runEndOfTurnCallbacks = [&schedulable_callbacks]() {
+    for (auto* cb : schedulable_callbacks) {
+      cb->invokeIfScheduled();
+    }
+  };
+
+  ResponseDecoder* inner_decoder1;
+  NiceMock<MockRequestEncoder> inner_encoder1;
+  ResponseDecoder* inner_decoder2;
+  NiceMock<MockRequestEncoder> inner_encoder2;
+
+  {
+    EXPECT_CALL(*codec_, newStream(_)).WillOnce([&](ResponseDecoder& decoder) -> RequestEncoder& {
+      inner_decoder1 = &decoder;
+      return inner_encoder1;
+    });
+    Http::MockResponseDecoder outer_decoder1;
+    Http::RequestEncoder& request_encoder1 = client_->newStream(outer_decoder1);
+    const void* wrapper1 = client_->activeRequestAddressForTest();
+    EXPECT_NE(wrapper1, nullptr);
+
+    TestRequestHeaderMapImpl request_headers{
+        {":authority", "host"}, {":path", "/"}, {":method", "GET"}};
+    EXPECT_OK(request_encoder1.encodeHeaders(request_headers, true));
+    ResponseHeaderMapPtr response_headers1{new TestResponseHeaderMapImpl{{":status", "200"}}};
+    EXPECT_CALL(outer_decoder1, decodeHeaders_(Pointee(Ref(*response_headers1)), true));
+    inner_decoder1->decodeHeaders(std::move(response_headers1), true);
+    EXPECT_EQ(0U, client_->numActiveRequests());
+
+    // End of the dispatcher turn: the retired wrapper is promoted into the reusable slot.
+    runEndOfTurnCallbacks();
+
+    // Second stream on the same connection reuses the wrapper.
+    EXPECT_CALL(*codec_, newStream(_)).WillOnce([&](ResponseDecoder& decoder) -> RequestEncoder& {
+      inner_decoder2 = &decoder;
+      return inner_encoder2;
+    });
+    Http::MockResponseDecoder outer_decoder2;
+    Http::RequestEncoder& request_encoder2 = client_->newStream(outer_decoder2);
+    EXPECT_EQ(wrapper1, client_->activeRequestAddressForTest());
+    // The reused wrapper is what the codec sees as the response decoder for stream 2.
+    EXPECT_EQ(wrapper1, inner_decoder2);
+
+    EXPECT_OK(request_encoder2.encodeHeaders(request_headers, true));
+    ResponseHeaderMapPtr response_headers2{new TestResponseHeaderMapImpl{{":status", "200"}}};
+    EXPECT_CALL(outer_decoder2, decodeHeaders_(Pointee(Ref(*response_headers2)), true));
+    inner_decoder2->decodeHeaders(std::move(response_headers2), true);
+    EXPECT_EQ(0U, client_->numActiveRequests());
+    runEndOfTurnCallbacks();
+  }
+}
+
+TEST_F(CodecClientTest, ActiveRequestNotReusedOnIncompleteEncode) {
+  initialize();
+
+  std::vector<Event::FakeSchedulableCallback*> schedulable_callbacks;
+  ON_CALL(dispatcher_, createSchedulableCallback_(_))
+      .WillByDefault(
+          [&](std::function<void()> cb) -> Event::SchedulableCallback* {
+            auto* fake = new Event::FakeSchedulableCallback(std::move(cb));
+            schedulable_callbacks.push_back(fake);
+            return fake;
+          });
+  auto runEndOfTurnCallbacks = [&schedulable_callbacks]() {
+    for (auto* cb : schedulable_callbacks) {
+      cb->invokeIfScheduled();
+    }
+  };
+
+  ResponseDecoder* inner_decoder1;
+  NiceMock<MockRequestEncoder> inner_encoder1;
+  ResponseDecoder* inner_decoder2;
+  NiceMock<MockRequestEncoder> inner_encoder2;
+
+  EXPECT_CALL(*codec_, newStream(_)).WillOnce([&](ResponseDecoder& decoder) -> RequestEncoder& {
+    inner_decoder1 = &decoder;
+    return inner_encoder1;
+  });
+  Http::MockResponseDecoder outer_decoder1;
+  Http::RequestEncoder& request_encoder1 = client_->newStream(outer_decoder1);
+  const void* wrapper1 = client_->activeRequestAddressForTest();
+
+  // Encode without end_stream: encode_complete_ stays false, so the wrapper completes via the
+  // H1 wait_encode_complete_ shortcut but is NOT reusable and must take the deferredDelete path.
+  TestRequestHeaderMapImpl request_headers{
+      {":authority", "host"}, {":path", "/"}, {":method", "GET"}};
+  EXPECT_OK(request_encoder1.encodeHeaders(request_headers, false));
+  ResponseHeaderMapPtr response_headers{new TestResponseHeaderMapImpl{{":status", "200"}}};
+  EXPECT_CALL(outer_decoder1, decodeHeaders_(Pointee(Ref(*response_headers)), true));
+  inner_decoder1->decodeHeaders(std::move(response_headers), true);
+  EXPECT_EQ(0U, client_->numActiveRequests());
+  runEndOfTurnCallbacks();
+
+  EXPECT_CALL(*codec_, newStream(_)).WillOnce([&](ResponseDecoder& decoder) -> RequestEncoder& {
+    inner_decoder2 = &decoder;
+    return inner_encoder2;
+  });
+  Http::MockResponseDecoder outer_decoder2;
+  Http::RequestEncoder& request_encoder2 = client_->newStream(outer_decoder2);
+  EXPECT_NE(wrapper1, client_->activeRequestAddressForTest());
+  EXPECT_NE(wrapper1, inner_decoder2);
+
+  // Clean up stream 2.
+  EXPECT_OK(request_encoder2.encodeHeaders(request_headers, true));
+  ResponseHeaderMapPtr response_headers2{new TestResponseHeaderMapImpl{{":status", "200"}}};
+  EXPECT_CALL(outer_decoder2, decodeHeaders_(Pointee(Ref(*response_headers2)), true));
+  inner_decoder2->decodeHeaders(std::move(response_headers2), true);
+  runEndOfTurnCallbacks();
+}
+
 TEST_F(CodecClientTest, BasicHeaderOnlyResponse) {
   initialize();
 

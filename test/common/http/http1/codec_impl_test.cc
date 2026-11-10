@@ -2115,6 +2115,82 @@ TEST_F(Http1ServerConnectionImplTest, ContentLengthResponse) {
   EXPECT_EQ("HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nHello World", output);
 }
 
+TEST_F(Http1ServerConnectionImplTest, ActiveRequestReuseOnKeepAliveRequests) {
+  initialize();
+
+  // Capture created schedulable callbacks so the test can run the end-of-turn promotion
+  // (the dispatcher-loop behavior the wrapper retirement relies on).
+  std::vector<Event::FakeSchedulableCallback*> schedulable_callbacks;
+  ON_CALL(connection_.dispatcher_, createSchedulableCallback_(_))
+      .WillByDefault([&](std::function<void()> cb) -> Event::SchedulableCallback* {
+        auto* fake = new Event::FakeSchedulableCallback(std::move(cb));
+        schedulable_callbacks.push_back(fake);
+        return fake;
+      });
+  auto runEndOfTurnCallbacks = [&schedulable_callbacks]() {
+    for (auto* cb : schedulable_callbacks) {
+      cb->invokeIfScheduled();
+    }
+  };
+
+  auto* server_codec = static_cast<Http1::ServerConnectionImpl*>(codec_.get());
+
+  // Request 1.
+  NiceMock<MockRequestDecoder> decoder1;
+  setupRequestDecoderMock(decoder1);
+  Http::ResponseEncoder* response_encoder1 = nullptr;
+  TestRequestHeaderMapImpl expected_headers1{
+      {{":path", "/a"}, {":method", "GET"}, {":authority", "host"}}};
+  EXPECT_CALL(callbacks_, newStream(_, _))
+      .WillOnce([&](ResponseEncoder& encoder, bool) -> RequestDecoder& {
+        response_encoder1 = &encoder;
+        return decoder1;
+      });
+  EXPECT_CALL(decoder1, decodeHeaders_(HeaderMapEqual(&expected_headers1), true));
+  Buffer::OwnedImpl buffer1("GET /a HTTP/1.1\r\nhost: host\r\n\r\n");
+  auto status = codec_->dispatch(buffer1);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer1.length());
+  const void* wrapper1 = server_codec->activeRequestAddressForTest();
+  EXPECT_NE(wrapper1, nullptr);
+
+  // Response 1 completes cleanly: the codec retires its ActiveRequest instead of
+  // deferred-deleting it.
+  std::string output1;
+  ON_CALL(connection_, write(_, _)).WillByDefault(AddBufferToString(&output1));
+  TestResponseHeaderMapImpl headers1{{":status", "200"}};
+  response_encoder1->encodeHeaders(headers1, true);
+  EXPECT_THAT(output1, StartsWith("HTTP/1.1 200 OK\r\n"));
+  runEndOfTurnCallbacks();
+
+  // Request 2 on the same connection: same wrapper object, same encoder object, and full fresh
+  // behavior (URL/headers parsed per request, encode state reset).
+  NiceMock<MockRequestDecoder> decoder2;
+  setupRequestDecoderMock(decoder2);
+  Http::ResponseEncoder* response_encoder2 = nullptr;
+  TestRequestHeaderMapImpl expected_headers2{
+      {{":path", "/b"}, {":method", "GET"}, {":authority", "host"}}};
+  EXPECT_CALL(callbacks_, newStream(_, _))
+      .WillOnce([&](ResponseEncoder& encoder, bool) -> RequestDecoder& {
+        response_encoder2 = &encoder;
+        return decoder2;
+      });
+  EXPECT_CALL(decoder2, decodeHeaders_(HeaderMapEqual(&expected_headers2), true));
+  Buffer::OwnedImpl buffer2("GET /b HTTP/1.1\r\nhost: host\r\n\r\n");
+  status = codec_->dispatch(buffer2);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer2.length());
+  EXPECT_EQ(wrapper1, server_codec->activeRequestAddressForTest());
+  EXPECT_EQ(response_encoder1, response_encoder2);
+
+  // Response 2 is byte-identical to a fresh-codec response (encoder state fully reset).
+  std::string output2;
+  ON_CALL(connection_, write(_, _)).WillByDefault(AddBufferToString(&output2));
+  TestResponseHeaderMapImpl headers2{{":status", "200"}};
+  response_encoder2->encodeHeaders(headers2, true);
+  EXPECT_THAT(output2, testing::Eq(output1));
+}
+
 TEST_F(Http1ServerConnectionImplTest, HeadRequestResponse) {
   initialize();
 

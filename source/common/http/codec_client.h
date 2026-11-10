@@ -6,6 +6,7 @@
 
 #include "envoy/common/random_generator.h"
 #include "envoy/event/deferred_deletable.h"
+#include "envoy/event/schedulable_cb.h"
 #include "envoy/event/timer.h"
 #include "envoy/http/codec.h"
 #include "envoy/http/header_validator.h"
@@ -305,6 +306,29 @@ private:
 
     void removeEncoderCallbacks() { inner_encoder_->getStream().removeCallbacks(*this); }
 
+    /**
+     * Restore fresh-constructor state so a retired wrapper can serve a new stream.
+     * The protocol is fixed per codec connection, so wait_encode_complete_ is unchanged.
+     */
+    void resetForReuse(ResponseDecoderHandlePtr&& inner_handle) {
+      inner_handle_ = std::move(inner_handle);
+      inner_ = nullptr;
+      header_validator_ = parent_.host_->cluster().makeHeaderValidator(parent_.codec_->protocol());
+      encode_complete_ = false;
+      decode_complete_ = false;
+    }
+
+    void resetForReuse(ResponseDecoder& inner_decoder) {
+      inner_handle_ = nullptr;
+      inner_ = &inner_decoder;
+      header_validator_ = parent_.host_->cluster().makeHeaderValidator(parent_.codec_->protocol());
+      encode_complete_ = false;
+      decode_complete_ = false;
+    }
+
+    // A wrapper is only reusable when its stream completed both directions cleanly.
+    bool reusable() const { return encode_complete_ && decode_complete_; }
+
     CodecClient& parent_;
     Http::ClientHeaderValidatorPtr header_validator_;
     bool wait_encode_complete_{true};
@@ -338,6 +362,20 @@ private:
   }
   RequestEncoder& enlistAndCreateEncoder(ActiveRequestPtr request);
 
+  /**
+   * Free-list retirement of the per-request wrapper on the H1 path (one in-flight request per
+   * connection): move the wrapper into a pending slot that is promoted to the reusable slot at
+   * the end of the current dispatcher turn (preserving the deferred-delete pointer-stability
+   * contract), and reuse it on the next newStream. Non-H1 or non-cleanly-completed wrappers take
+   * the old deferredDelete path.
+   */
+  void maybeRetireRequest(ActiveRequestPtr request);
+
+  // Test probe: address of the ActiveRequest currently enlisted, for reuse assertions.
+  void* activeRequestAddressForTest() const {
+    return active_requests_.empty() ? nullptr : static_cast<void*>(active_requests_.front().get());
+  }
+
   std::list<ActiveRequestPtr> active_requests_;
   Http::ConnectionCallbacks* codec_callbacks_{};
   CodecClientCallbacks* codec_client_callbacks_{};
@@ -345,6 +383,11 @@ private:
   bool remote_closed_{};
   bool protocol_error_{false};
   bool connect_called_{false};
+
+  // H1 wrapper free-list state (see maybeRetireRequest).
+  ActiveRequestPtr pending_retire_request_;
+  ActiveRequestPtr retired_request_;
+  Event::SchedulableCallbackPtr retire_callback_;
 };
 
 using CodecClientPtr = std::unique_ptr<CodecClient>;

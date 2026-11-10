@@ -47,6 +47,10 @@ MockDispatcher::MockDispatcher(const std::string& name)
   ON_CALL(*this, isThreadSafe()).WillByDefault([thread_factory, thread_id]() {
     return thread_factory->currentThreadId() == thread_id;
   });
+  ON_CALL(*this, createSchedulableCallback_(_))
+      .WillByDefault([](std::function<void()> cb) -> SchedulableCallback* {
+        return new FakeSchedulableCallback(std::move(cb));
+      });
 }
 
 MockDispatcher::~MockDispatcher() = default;

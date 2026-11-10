@@ -65,7 +65,7 @@ void CodecClient::close(Network::ConnectionCloseType type, absl::string_view det
 }
 
 void CodecClient::deleteRequest(ActiveRequest& request) {
-  connection_->dispatcher().deferredDelete(request.removeFromList(active_requests_));
+  maybeRetireRequest(request.removeFromList(active_requests_));
   if (codec_client_callbacks_) {
     codec_client_callbacks_->onStreamDestroy();
   }
@@ -74,13 +74,50 @@ void CodecClient::deleteRequest(ActiveRequest& request) {
   }
 }
 
+void CodecClient::maybeRetireRequest(ActiveRequestPtr request) {
+  // Reuse is only safe on the strictly-serial H1 path, and only for wrappers whose stream
+  // completed both directions cleanly (reset paths keep the old deferredDelete behavior).
+  if (type_ != CodecType::HTTP1 || !request->reusable()) {
+    connection_->dispatcher().deferredDelete(std::move(request));
+    return;
+  }
+
+  // Keep the wrapper alive and pointer-stable until the end of the current dispatcher turn
+  // (the contract deferredDelete used to fulfill), then promote it into the reusable slot.
+  // A same-turn new stream finds the reusable slot still empty and constructs a fresh wrapper.
+  if (pending_retire_request_ != nullptr) {
+    // Unreachable on the serialized H1 path; keep the old behavior if it ever happens.
+    connection_->dispatcher().deferredDelete(std::move(pending_retire_request_));
+  }
+  pending_retire_request_ = std::move(request);
+  if (retire_callback_ == nullptr) {
+    retire_callback_ = connection_->dispatcher().createSchedulableCallback([this]() -> void {
+      retired_request_ = std::move(pending_retire_request_);
+    });
+  }
+  retire_callback_->scheduleCallbackNextIteration();
+}
+
 RequestEncoder& CodecClient::newStream(ResponseDecoderHandlePtr response_decoder_handle) {
-  return enlistAndCreateEncoder(
-      std::make_unique<ActiveRequest>(*this, std::move(response_decoder_handle)));
+  ActiveRequestPtr request;
+  if (retired_request_ != nullptr) {
+    request = std::move(retired_request_);
+    request->resetForReuse(std::move(response_decoder_handle));
+  } else {
+    request = std::make_unique<ActiveRequest>(*this, std::move(response_decoder_handle));
+  }
+  return enlistAndCreateEncoder(std::move(request));
 }
 
 RequestEncoder& CodecClient::newStream(ResponseDecoder& response_decoder) {
-  return enlistAndCreateEncoder(std::make_unique<ActiveRequest>(*this, response_decoder));
+  ActiveRequestPtr request;
+  if (retired_request_ != nullptr) {
+    request = std::move(retired_request_);
+    request->resetForReuse(response_decoder);
+  } else {
+    request = std::make_unique<ActiveRequest>(*this, response_decoder);
+  }
+  return enlistAndCreateEncoder(std::move(request));
 }
 
 RequestEncoder& CodecClient::enlistAndCreateEncoder(ActiveRequestPtr request) {

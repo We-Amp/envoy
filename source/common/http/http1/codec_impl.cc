@@ -1093,8 +1093,30 @@ void ServerConnectionImpl::onEncodeComplete() {
     // Only do this if remote is complete. If we are replying before the request is complete the
     // only logical thing to do is for higher level code to reset() / close the connection so we
     // leave the request around so that it can fire reset callbacks.
-    connection_.dispatcher().deferredDelete(std::move(active_request_));
+    maybeRetireActiveRequest(std::move(active_request_));
   }
+}
+
+void ServerConnectionImpl::maybeRetireActiveRequest(ActiveRequestPtr request) {
+  if (!request->remote_complete_) {
+    connection_.dispatcher().deferredDelete(std::move(request));
+    return;
+  }
+
+  // Keep the wrapper alive and pointer-stable until the end of the current dispatcher turn (the
+  // contract deferredDelete used to fulfill), then promote it into the reusable slot. A same-turn
+  // new message finds the reusable slot still empty and constructs a fresh wrapper.
+  if (pending_retire_request_ != nullptr) {
+    // Unreachable on the serialized H1 path; keep the old behavior if it ever happens.
+    connection_.dispatcher().deferredDelete(std::move(pending_retire_request_));
+  }
+  pending_retire_request_ = std::move(request);
+  if (retire_callback_ == nullptr) {
+    retire_callback_ = connection_.dispatcher().createSchedulableCallback([this]() -> void {
+      retired_request_ = std::move(pending_retire_request_);
+    });
+  }
+  retire_callback_->scheduleCallbackNextIteration();
 }
 
 Status ServerConnectionImpl::handlePath(RequestHeaderMap& headers, absl::string_view method) {
@@ -1257,7 +1279,13 @@ Envoy::StatusOr<CallbackResult> ServerConnectionImpl::onHeadersCompleteBase() {
 Status ServerConnectionImpl::onMessageBeginBase() {
   if (!resetStreamCalled()) {
     ASSERT(active_request_ == nullptr);
-    active_request_ = std::make_unique<ActiveRequest>(*this, std::move(bytes_meter_before_stream_));
+    if (retired_request_ != nullptr) {
+      active_request_ = std::move(retired_request_);
+      active_request_->resetForReuse(std::move(bytes_meter_before_stream_));
+    } else {
+      active_request_ =
+          std::make_unique<ActiveRequest>(*this, std::move(bytes_meter_before_stream_));
+    }
     active_request_->request_decoder_handle_ =
         callbacks_.newStream(active_request_->response_encoder_).getRequestDecoderHandle();
 
