@@ -490,6 +490,11 @@ public:
                        Server::OverloadManager& overload_manager);
   bool supportsHttp10() override { return codec_settings_.accept_http_10_; }
 
+  // Test probe: address of the ActiveRequest currently active, for reuse assertions.
+  void* activeRequestAddressForTest() const {
+    return active_request_ == nullptr ? nullptr : static_cast<void*>(active_request_.get());
+  }
+
 protected:
   /**
    * An active HTTP/1.1 request.
@@ -516,10 +521,7 @@ protected:
     ResponseEncoderImpl response_encoder_;
     bool remote_complete_{};
   };
-  // ConnectionImpl
-  CallbackResult onMessageCompleteBase() override;
-  // Add the size of the request_url to the reported header size when processing request headers.
-  uint32_t getHeadersSize() override;
+  using ActiveRequestPtr = std::unique_ptr<ActiveRequest>;
 
   /**
    * Free-list retirement of the per-request ActiveRequest on the H1 path (one in-flight request
@@ -529,11 +531,10 @@ protected:
    */
   void maybeRetireActiveRequest(ActiveRequestPtr request);
 
-  // Test probe: address of the ActiveRequest currently active, for reuse assertions.
-  void* activeRequestAddressForTest() const {
-    return active_request_ == nullptr ? nullptr : static_cast<void*>(active_request_.get());
-  }
-
+  // ConnectionImpl
+  CallbackResult onMessageCompleteBase() override;
+  // Add the size of the request_url to the reported header size when processing request headers.
+  uint32_t getHeadersSize() override;
 private:
   /**
    * Manipulate the request's first line, parsing the url and converting to a relative path if

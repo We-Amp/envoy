@@ -110,6 +110,11 @@ public:
    */
   size_t numActiveRequests() { return active_requests_.size(); }
 
+  // Test probe: address of the ActiveRequest currently enlisted, for reuse assertions.
+  void* activeRequestAddressForTest() const {
+    return active_requests_.empty() ? nullptr : static_cast<void*>(active_requests_.front().get());
+  }
+
   /**
    * Create a new stream. Note: The CodecClient will NOT buffer multiple requests for HTTP1
    * connections. Thus, calling newStream() before the previous request has been fully encoded
@@ -370,11 +375,6 @@ private:
    * the old deferredDelete path.
    */
   void maybeRetireRequest(ActiveRequestPtr request);
-
-  // Test probe: address of the ActiveRequest currently enlisted, for reuse assertions.
-  void* activeRequestAddressForTest() const {
-    return active_requests_.empty() ? nullptr : static_cast<void*>(active_requests_.front().get());
-  }
 
   std::list<ActiveRequestPtr> active_requests_;
   Http::ConnectionCallbacks* codec_callbacks_{};
