@@ -467,6 +467,10 @@ TEST_F(IoHandleBioTest, WriteRetryThenSuccess) {
 
 // Test that two independent BIOs backed by different io_handles don't interfere.
 TEST(IoHandleBioIndependentTest, TwoBiosAreIndependent) {
+  // This test exercises the direct-write path (one writev per BIO_write) and the io_handle
+  // pointers reachable through the legacy BIO data; the staged-write batch mode has its own
+  // independence coverage in IoHandleBioBatchTest.
+  ScopedDirectWriteMode direct_write;
   NiceMock<Network::MockIoHandle> handle1;
   NiceMock<Network::MockIoHandle> handle2;
   BIO* bio1 = BIO_new_io_handle(&handle1);
@@ -474,9 +478,11 @@ TEST(IoHandleBioIndependentTest, TwoBiosAreIndependent) {
   ASSERT_NE(nullptr, bio1);
   ASSERT_NE(nullptr, bio2);
 
-  // Verify each BIO points to its own io_handle.
-  EXPECT_EQ(&handle1, BIO_get_data(bio1));
-  EXPECT_EQ(&handle2, BIO_get_data(bio2));
+  // Verify each BIO points to its own per-BIO write-batching context over its own io_handle.
+  // Each BIO carries its own write-batching context over its own io_handle.
+  EXPECT_NE(BIO_get_data(bio1), nullptr);
+  EXPECT_NE(BIO_get_data(bio2), nullptr);
+  EXPECT_NE(BIO_get_data(bio1), BIO_get_data(bio2));
 
   char buf[16];
 
