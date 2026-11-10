@@ -221,6 +221,7 @@ public:
   StatefulHeaderKeyFormatterOptRef formatter() { return makeOptRefFromPtr(formatter_.get()); }
 
 protected:
+  struct HeaderEntryImpl;
   // The header list's underlying std::list over a chunked node pool (no per-node operator new).
   using HeaderListType =
       std::list<HeaderEntryImpl, Detail::HeaderNodePoolAllocator<HeaderEntryImpl>>;
