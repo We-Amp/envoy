@@ -120,7 +120,7 @@ TEST_F(CodecClientTest, ActiveRequestReuseOnCleanCompletion) {
   // Capture created schedulable callbacks so the test can run the end-of-turn promotion
   // (the dispatcher-loop behavior the wrapper retirement relies on).
   std::vector<Event::FakeSchedulableCallback*> schedulable_callbacks;
-  ON_CALL(dispatcher_, createSchedulableCallback_(_))
+  ON_CALL(connection_->dispatcher_, createSchedulableCallback_(_))
       .WillByDefault(
           [&](std::function<void()> cb) -> Event::SchedulableCallback* {
             auto* fake = new Event::FakeSchedulableCallback(std::move(cb));
@@ -183,7 +183,7 @@ TEST_F(CodecClientTest, ActiveRequestNotReusedOnIncompleteEncode) {
   initialize();
 
   std::vector<Event::FakeSchedulableCallback*> schedulable_callbacks;
-  ON_CALL(dispatcher_, createSchedulableCallback_(_))
+  ON_CALL(connection_->dispatcher_, createSchedulableCallback_(_))
       .WillByDefault(
           [&](std::function<void()> cb) -> Event::SchedulableCallback* {
             auto* fake = new Event::FakeSchedulableCallback(std::move(cb));
