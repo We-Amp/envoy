@@ -27,6 +27,7 @@
 #include "source/common/runtime/runtime_features.h"
 
 #include "absl/container/fixed_array.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/ascii.h"
 
 namespace Envoy {
@@ -150,25 +151,54 @@ void StreamEncoderImpl::encodeHeadersBase(const RequestOrResponseHeaderMap& head
 
   const Http::HeaderValues& header_values = Http::Headers::get();
   bool saw_content_length = false;
-  headers.iterate(
-      [this, &header_values, formatter](const HeaderEntry& header) -> HeaderMap::Iterate {
-        absl::string_view key_to_use = header.key().getStringView();
-        uint32_t key_size_to_use = header.key().size();
-        // Translate :authority -> host so that upper layers do not need to deal with this.
-        if (key_size_to_use > 1 && key_to_use[0] == ':' && key_to_use[1] == 'a') {
-          key_to_use = absl::string_view(header_values.HostLegacy.get());
-          key_size_to_use = header_values.HostLegacy.get().size();
-        }
 
-        // Skip all headers starting with ':' that make it here.
-        if (key_to_use[0] == ':') {
-          return HeaderMap::Iterate::Continue;
-        }
+  // A formatter attached to the header map is stateful (StatefulHeaderKeyFormatter): its
+  // format() must observe headers one at a time, in order, as they are encoded, so the
+  // per-header encode path is kept for that configuration. For every other configuration (no
+  // formatter, or the stateless connection-level formatter), all headers are staged first and
+  // then written with a single buffer reservation, a single watermark check and a single
+  // bytes-meter update, producing byte-identical output to the per-header path below.
+  const bool one_pass_encode = !headers.formatter().has_value();
 
-        encodeFormattedHeader(key_to_use, header.value().getStringView(), formatter);
+  // Staging for the one-pass path. raw_key/value reference the header map (or config-owned
+  // literal) storage that stays alive for the duration of this call; formatted_key owns the
+  // formatted key when a stateless key formatter is configured. Final key views are derived
+  // only after staging is complete, because the staged vector may reallocate and a moved
+  // short-string-optimized std::string would leave any earlier key view dangling.
+  struct StagedHeader {
+    std::string formatted_key;
+    absl::string_view raw_key;
+    absl::string_view value;
+  };
+  absl::InlinedVector<StagedHeader, 16> staged;
+  auto emit_header = [&](absl::string_view raw_key, absl::string_view value) {
+    if (!one_pass_encode) {
+      encodeFormattedHeader(raw_key, value, formatter);
+      return;
+    }
+    if (formatter.has_value()) {
+      staged.push_back(StagedHeader{formatter->format(raw_key), raw_key, value});
+    } else {
+      staged.push_back(StagedHeader{{}, raw_key, value});
+    }
+  };
 
-        return HeaderMap::Iterate::Continue;
-      });
+  headers.iterate([&](const HeaderEntry& header) -> HeaderMap::Iterate {
+    absl::string_view key_to_use = header.key().getStringView();
+    // Translate :authority -> host so that upper layers do not need to deal with this.
+    if (key_to_use.size() > 1 && key_to_use[0] == ':' && key_to_use[1] == 'a') {
+      key_to_use = absl::string_view(header_values.HostLegacy.get());
+    }
+
+    // Skip all headers starting with ':' that make it here.
+    if (key_to_use[0] == ':') {
+      return HeaderMap::Iterate::Continue;
+    }
+
+    emit_header(key_to_use, header.value().getStringView());
+
+    return HeaderMap::Iterate::Continue;
+  });
 
   if (headers.ContentLength()) {
     saw_content_length = true;
@@ -207,7 +237,7 @@ void StreamEncoderImpl::encodeHeadersBase(const RequestOrResponseHeaderMap& head
       // body, per https://tools.ietf.org/html/rfc7230#section-3.3.2
       if (!status || (*status >= 200 && *status != 204)) {
         if (!bodiless_request) {
-          encodeFormattedHeader(header_values.ContentLength.get(), "0", formatter);
+          emit_header(header_values.ContentLength.get(), "0");
         }
       }
       chunk_encoding_ = false;
@@ -217,8 +247,8 @@ void StreamEncoderImpl::encodeHeadersBase(const RequestOrResponseHeaderMap& head
       // For responses to connect requests, do not send the chunked encoding header:
       // https://tools.ietf.org/html/rfc7231#section-4.3.6.
       if (!is_response_to_connect_request_) {
-        encodeFormattedHeader(header_values.TransferEncoding.get(),
-                              header_values.TransferEncodingValues.Chunked, formatter);
+        emit_header(header_values.TransferEncoding.get(),
+                    header_values.TransferEncodingValues.Chunked);
       }
       // We do not apply chunk encoding for HTTP upgrades, including CONNECT style upgrades.
       // If there is a body in a response on the upgrade path, the chunks will be
@@ -230,6 +260,24 @@ void StreamEncoderImpl::encodeHeadersBase(const RequestOrResponseHeaderMap& head
       chunk_encoding_ = !Utility::isUpgrade(headers) && !is_response_to_head_request_ &&
                         !is_response_to_connect_request_;
     }
+  }
+
+  if (one_pass_encode && !staged.empty()) {
+    absl::InlinedVector<absl::string_view, 64> fragments;
+    fragments.reserve(staged.size() * 4);
+    uint64_t total_wire_size = 0;
+    for (const auto& header : staged) {
+      const absl::string_view key =
+          formatter.has_value() ? absl::string_view(header.formatted_key) : header.raw_key;
+      fragments.insert(fragments.end(), {key, COLON_SPACE, header.value, CRLF});
+      total_wire_size += key.size() + COLON_SPACE.size() + header.value.size() + CRLF.size();
+    }
+    const uint64_t written = connection_.buffer().addFragments(absl::MakeConstSpan(fragments));
+    ASSERT(written == total_wire_size);
+    // There is no header field compression in HTTP/1.1, so the wire representation is the same as
+    // the decompressed representation.
+    bytes_meter_->addHeaderBytesSent(written);
+    bytes_meter_->addDecompressedHeaderBytesSent(written);
   }
 
   connection_.buffer().add(CRLF);
