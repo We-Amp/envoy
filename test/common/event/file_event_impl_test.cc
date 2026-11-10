@@ -148,6 +148,11 @@ TEST_P(FileEventImplActivateTest, ActivateChaining) {
   EXPECT_CALL(write_callback, Call);
   EXPECT_CALL(fd_callback, Call);
   EXPECT_CALL(write_callback, Call);
+  if constexpr (Event::PlatformDefaultTriggerType != Event::FileTriggerType::EmulatedEdge) {
+    // Second loop iteration: poll returned no new real events (with edge-style emulation the
+    // event registration is dropped after delivery, so the loop exits without this pass).
+    EXPECT_CALL(prepare_callback, Call);
+  }
 
   file_event->activate(FileReadyType::Read);
   dispatcher->run(Event::Dispatcher::RunType::NonBlock);
