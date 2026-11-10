@@ -236,7 +236,10 @@ void StreamEncoderImpl::encodeHeadersBase(const RequestOrResponseHeaderMap& head
 
   if (end_stream) {
     endEncode();
-  } else {
+  } else if (!connection_.deferredFlushPending()) {
+    // When a deferred flush is armed (deferred response-header coalescing, see
+    // ConnectionImpl::armDeferredFlush), the encoded headers stay in output_buffer_ and are
+    // written together with the first following body encode or at the end of the turn.
     flushOutput();
   }
 }
@@ -347,6 +350,11 @@ Status ServerConnectionImpl::doFloodProtectionChecks() const {
 }
 
 uint64_t ConnectionImpl::flushOutput(bool end_encode) {
+  if (deferred_flush_pending_) {
+    // This flush covers the deferred headers (they sit at the front of output_buffer_).
+    deferred_flush_pending_ = false;
+    deferred_flush_callback_->cancel();
+  }
   if (end_encode) {
     // If this is an HTTP response in ServerConnectionImpl, track outbound responses for flood
     // protection
@@ -356,6 +364,26 @@ uint64_t ConnectionImpl::flushOutput(bool end_encode) {
   connection().write(*output_buffer_, false);
   ASSERT(0UL == output_buffer_->length());
   return bytes_encoded;
+}
+
+void ConnectionImpl::armDeferredFlush() {
+  ASSERT(!deferred_flush_pending_);
+  deferred_flush_pending_ = true;
+  if (deferred_flush_callback_ == nullptr) {
+    deferred_flush_callback_ = connection().dispatcher().createSchedulableCallback(
+        [this]() -> void { flushDeferredOutput(); });
+  }
+  deferred_flush_callback_->scheduleCallbackNextIteration();
+}
+
+void ConnectionImpl::flushDeferredOutput() {
+  if (!deferred_flush_pending_) {
+    return;
+  }
+  // Runs at the end of the dispatcher turn when no body encode followed the deferred response
+  // headers: write them now, exactly one loop iteration later than an immediate flush would have
+  // (which is when the merged write-activation turn would have run anyway).
+  flushOutput(false);
 }
 
 CodecEventCallbacks*
@@ -406,6 +434,19 @@ static constexpr absl::string_view HTTP_10_RESPONSE_PREFIX = "HTTP/1.0 ";
 
 void ResponseEncoderImpl::encodeHeaders(const ResponseHeaderMap& headers, bool end_stream) {
   started_response_ = true;
+
+  // Ordering guard: flush any still-pending deferred output before encoding new headers
+  // (e.g. a local reply after a started response).
+  if (connection_.deferredFlushPending()) {
+    connection_.flushDeferredOutput();
+  }
+
+  // Defer the header write for at most the rest of the current dispatcher turn so that a
+  // response whose body follows in the same turn leaves in ONE write (one network-filter pass,
+  // one write activation, one writev). Tunneling/upgrade responses must go out immediately.
+  if (!end_stream && !connection_.handling_upgrade_) {
+    connection_.armDeferredFlush();
+  }
 
   // The contract is that client codecs must ensure that :status is present and valid.
   ASSERT(headers.Status() != nullptr);

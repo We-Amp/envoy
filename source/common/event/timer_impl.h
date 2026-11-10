@@ -64,6 +64,17 @@ public:
 
   bool enabled() override;
 
+  // Per-request timer objects (stream idle/request timeouts, per-try/response timeouts) are
+  // created, armed, canceled and freed in tight per-request loops on the dispatcher thread.
+  // Recycle their storage through a fixed-capacity thread-local free list instead of hitting the
+  // allocator on every createTimer/destroy pair; the embedded libevent event is fully
+  // re-initialized by the constructor (evtimer_assign), so a recycled object is fresh by
+  // construction. Dispatchers are single-threaded, and a TimerImpl lives and dies on its owning
+  // dispatcher's thread, so a thread-local free list is sound. Timer's destructor is virtual, so
+  // deleting through a TimerPtr selects these most-derived operators (including for subclasses).
+  static void* operator new(size_t size);
+  static void operator delete(void* ptr);
+
 private:
   void internalEnableTimer(const timeval& tv, const ScopeTrackedObject* scope);
   TimerCb cb_;

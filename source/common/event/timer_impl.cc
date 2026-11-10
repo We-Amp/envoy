@@ -1,6 +1,7 @@
 #include "source/common/event/timer_impl.h"
 
 #include <chrono>
+#include <vector>
 
 #include "source/common/common/assert.h"
 
@@ -55,6 +56,46 @@ void TimerImpl::internalEnableTimer(const timeval& tv, const ScopeTrackedObject*
 bool TimerImpl::enabled() {
   ASSERT(dispatcher_.isThreadSafe());
   return 0 != evtimer_pending(&raw_event_, nullptr);
+}
+
+namespace {
+// Fixed-capacity per-thread free list of TimerImpl storage. See the operator new/delete comment
+// in timer_impl.h.
+constexpr size_t kTimerFreeListCapacity = 64;
+
+struct TimerFreeList {
+  ~TimerFreeList() {
+    for (void* ptr : slots) {
+      ::operator delete(ptr);
+    }
+  }
+  std::vector<void*> slots;
+};
+
+thread_local TimerFreeList timer_free_list;
+} // namespace
+
+void* TimerImpl::operator new(size_t size) {
+  if (size != sizeof(TimerImpl)) {
+    // A subclass with extra members; the pooled blocks are the wrong size.
+    return ::operator new(size);
+  }
+  if (!timer_free_list.slots.empty()) {
+    void* ptr = timer_free_list.slots.back();
+    timer_free_list.slots.pop_back();
+    return ptr;
+  }
+  return ::operator new(size);
+}
+
+void TimerImpl::operator delete(void* ptr) {
+  if (timer_free_list.slots.size() < kTimerFreeListCapacity) {
+    // ~ImplBase has already event_del()ed the embedded event, so a parked timer cannot fire and
+    // cb_ is re-bound by the next construction before any arm.
+    timer_free_list.slots.push_back(ptr);
+    return;
+  }
+  ::operator delete(ptr);
 }
 
 } // namespace Event

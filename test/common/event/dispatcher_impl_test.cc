@@ -1083,6 +1083,38 @@ TEST_F(TimerImplTest, TimerOrderAndDisableAlarm) {
   });
 }
 
+// Destroyed timer objects recycle their storage through the thread-local free list, and a
+// recycled timer is fully functional (constructor re-initializes the embedded libevent event).
+TEST_F(TimerImplTest, TimerStorageIsRecycled) {
+  void* first_timer_address = nullptr;
+  bool fired = false;
+  {
+    Event::TimerPtr timer = dispatcher_->createTimer([] {});
+    first_timer_address = timer.get();
+    timer->enableTimer(std::chrono::milliseconds(0));
+  }
+
+  {
+    Event::TimerPtr recycled = dispatcher_->createTimer([&fired]() { fired = true; });
+    EXPECT_EQ(first_timer_address, recycled.get());
+    recycled->enableTimer(std::chrono::milliseconds(0));
+    EXPECT_CALL(prepare_callback_, Call);
+    runInEventLoop([&]() {
+      advanceLibeventTime(absl::Milliseconds(10));
+    });
+    EXPECT_TRUE(fired);
+  }
+
+  // Multiple live timers still work normally alongside the free list.
+  std::vector<Event::TimerPtr> timers;
+  for (int i = 0; i < 3; ++i) {
+    timers.push_back(dispatcher_->createTimer([] {}));
+  }
+  for (const auto& timer : timers) {
+    EXPECT_NE(timer, nullptr);
+  }
+}
+
 // Change the registration time for a timer that is already activated by disabling and re-enabling
 // the timer. Verify that execution is delayed.
 TEST_F(TimerImplTest, TimerOrderDisableAndReschedule) {

@@ -2115,6 +2115,156 @@ TEST_F(Http1ServerConnectionImplTest, ContentLengthResponse) {
   EXPECT_EQ("HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nHello World", output);
 }
 
+TEST_F(Http1ServerConnectionImplTest, DeferredHeaderFlushCoalescesHeadersAndBodyIntoOneWrite) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  Http::ResponseEncoder* response_encoder = nullptr;
+  EXPECT_CALL(callbacks_, newStream(_, _))
+      .WillOnce([&](ResponseEncoder& encoder, bool) -> RequestDecoder& {
+        response_encoder = &encoder;
+        return decoder;
+      });
+
+  Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer.length());
+
+  std::string output;
+  int write_calls = 0;
+  ON_CALL(connection_, write(_, _))
+      .WillByDefault([&output, &write_calls](Buffer::Instance& data, bool) {
+        write_calls++;
+        output.append(data.toString());
+        data.drain(data.length());
+      });
+
+  // Response headers with a body following in the same turn: no connection write yet.
+  TestResponseHeaderMapImpl headers{{":status", "200"}, {"content-length", "11"}};
+  response_encoder->encodeHeaders(headers, false);
+  EXPECT_EQ(0, write_calls);
+
+  // The body encode flushes headers+body in a single connection write.
+  Buffer::OwnedImpl data("Hello World");
+  response_encoder->encodeData(data, true);
+  EXPECT_EQ(1, write_calls);
+  EXPECT_EQ("HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nHello World", output);
+}
+
+TEST_F(Http1ServerConnectionImplTest, DeferredHeaderFlushFlushesAtEndOfLoopIteration) {
+  initialize();
+
+  std::vector<Event::FakeSchedulableCallback*> schedulable_callbacks;
+  ON_CALL(connection_.dispatcher_, createSchedulableCallback_(_))
+      .WillByDefault([&](std::function<void()> cb) -> Event::SchedulableCallback* {
+        auto* fake = new Event::FakeSchedulableCallback(std::move(cb));
+        schedulable_callbacks.push_back(fake);
+        return fake;
+      });
+
+  NiceMock<MockRequestDecoder> decoder;
+  Http::ResponseEncoder* response_encoder = nullptr;
+  EXPECT_CALL(callbacks_, newStream(_, _))
+      .WillOnce([&](ResponseEncoder& encoder, bool) -> RequestDecoder& {
+        response_encoder = &encoder;
+        return decoder;
+      });
+
+  Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer.length());
+
+  std::string output;
+  int write_calls = 0;
+  ON_CALL(connection_, write(_, _))
+      .WillByDefault([&output, &write_calls](Buffer::Instance& data, bool) {
+        write_calls++;
+        output.append(data.toString());
+        data.drain(data.length());
+      });
+
+  // Headers encoded with no body following: nothing written yet.
+  TestResponseHeaderMapImpl headers{{":status", "200"}, {"content-length", "11"}};
+  response_encoder->encodeHeaders(headers, false);
+  EXPECT_EQ(0, write_calls);
+
+  // End of the dispatcher turn: the scheduled safety flush writes the headers.
+  for (auto* cb : schedulable_callbacks) {
+    cb->invokeIfScheduled();
+  }
+  EXPECT_EQ(1, write_calls);
+  EXPECT_EQ("HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\n", output);
+
+  // A later body encode writes normally.
+  output.clear();
+  Buffer::OwnedImpl data("Hello World");
+  response_encoder->encodeData(data, true);
+  EXPECT_EQ(2, write_calls);
+  EXPECT_EQ("Hello World", output);
+}
+
+TEST_F(Http1ServerConnectionImplTest, UpgradeResponseHeadersAreNotDeferred) {
+  initialize();
+
+  NiceMock<MockRequestDecoder> decoder;
+  Http::ResponseEncoder* response_encoder = nullptr;
+  EXPECT_CALL(callbacks_, newStream(_, _))
+      .WillOnce([&](ResponseEncoder& encoder, bool) -> RequestDecoder& {
+        response_encoder = &encoder;
+        return decoder;
+      });
+
+  Buffer::OwnedImpl buffer("GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: foo\r\n\r\n");
+  auto status = codec_->dispatch(buffer);
+  EXPECT_OK(status);
+  EXPECT_EQ(0U, buffer.length());
+
+  std::string output;
+  int write_calls = 0;
+  ON_CALL(connection_, write(_, _))
+      .WillByDefault([&output, &write_calls](Buffer::Instance& data, bool) {
+        write_calls++;
+        output.append(data.toString());
+        data.drain(data.length());
+      });
+
+  // Tunneling/upgrade response headers must not be deferred.
+  TestResponseHeaderMapImpl headers{{":status", "101"}};
+  response_encoder->encodeHeaders(headers, false);
+  EXPECT_EQ(1, write_calls);
+  EXPECT_EQ("HTTP/1.1 101 Switching Protocols\r\n\r\n", output);
+}
+
+TEST_F(Http1ServerConnectionImplTest, ClientRequestEncodeHeadersAreNotDeferred) {
+  // Scope pin: the deferred flush targets response headers only; upstream request encodes
+  // keep today's immediate-flush behavior.
+  initialize();
+  NiceMock<Network::MockConnection> client_connection;
+  NiceMock<Http::MockConnectionCallbacks> client_callbacks;
+  Http1::ClientConnectionImpl client_codec(
+      client_connection, http1CodecStats(), client_callbacks, codec_settings_,
+      Http::Http1::MAX_RESPONSE_HEADERS_KB, Http::DEFAULT_MAX_HEADERS_COUNT);
+  NiceMock<MockResponseDecoder> response_decoder;
+
+  std::string output;
+  int write_calls = 0;
+  ON_CALL(client_connection, write(_, _))
+      .WillByDefault([&output, &write_calls](Buffer::Instance& data, bool) {
+        write_calls++;
+        output.append(data.toString());
+        data.drain(data.length());
+      });
+
+  RequestEncoder& request_encoder = client_codec.newStream(response_decoder);
+  TestRequestHeaderMapImpl headers{
+      {":authority", "host"}, {":path", "/"}, {":method", "POST"}};
+  EXPECT_OK(request_encoder.encodeHeaders(headers, false));
+  EXPECT_EQ(1, write_calls);
+  EXPECT_THAT(output, StartsWith("POST / HTTP/1.1\r\n"));
+}
+
 TEST_F(Http1ServerConnectionImplTest, HeadRequestResponse) {
   initialize();
 

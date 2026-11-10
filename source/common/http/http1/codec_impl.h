@@ -301,6 +301,19 @@ protected:
    */
   Status checkMaxHeadersSize();
 
+  /**
+   * Defer the write of the encoded response headers to (at latest) the end of the current
+   * dispatcher turn: the headers stay in output_buffer_ and are flushed together with the first
+   * following body/trailers encode (one network-filter pass, one write activation, one writev),
+   * or by the scheduled end-of-turn callback if no body encode follows. Used by
+   * ResponseEncoderImpl for non-end-stream response headers; see s7-design.md.
+   */
+  void armDeferredFlush();
+  // Flushes output_buffer_ if a deferred header flush is still pending. Ordering guard for a
+  // second encodeHeaders and the end-of-turn safety flush.
+  void flushDeferredOutput();
+  bool deferredFlushPending() const { return deferred_flush_pending_; }
+
   Network::Connection& connection_;
   CodecStats& stats_;
   const Http1Settings codec_settings_;
@@ -313,7 +326,9 @@ protected:
   HeaderString current_header_value_;
   bool processing_trailers_ : 1 = false;
   bool handling_upgrade_ : 1 = false;
+  bool deferred_flush_pending_ : 1 = false;
   bool reset_stream_called_ : 1 = false;
+  Event::SchedulableCallbackPtr deferred_flush_callback_;
   // Deferred end stream headers indicate that we are not going to raise headers until the full
   // HTTP/1 message has been flushed from the parser. This allows raising an HTTP/2 style headers
   // block with end stream set to true with no further protocol data remaining.
