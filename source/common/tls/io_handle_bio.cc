@@ -33,8 +33,14 @@ struct BioContext {
   bool flush_error{false};
 };
 
+const BIO_METHOD* BIO_s_io_handle(void);
+
 // NOLINTNEXTLINE(readability-identifier-naming)
 inline BioContext* bio_context(BIO* bio) {
+  // Null for foreign BIOs (e.g. BIO pairs): the SSL layer can hold a wbio that is not ours.
+  if (bio == nullptr || BIO_get_method(bio) != BIO_s_io_handle()) {
+    return nullptr;
+  }
   return reinterpret_cast<BioContext*>(BIO_get_data(bio));
 }
 
@@ -113,6 +119,9 @@ int io_handle_read(BIO* b, char* out, int outl) {
 int io_handle_write(BIO* b, const char* in, int inl) {
   BIO_clear_retry_flags(b);
   auto* ctx = bio_context(b);
+  if (ctx == nullptr) {
+    return 0;
+  }
   if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tls_staged_write_batching")) {
     // Stage the ciphertext; the owner flushes with a single writev across all staged records.
     // The staging buffer is bounded: above the cap a best-effort flush runs first, so the hard
@@ -181,6 +190,9 @@ const BIO_METHOD* BIO_s_io_handle(void) {
 // NOLINTNEXTLINE(readability-identifier-naming)
 size_t BIO_io_handle_flush_pending(BIO* bio) {
   auto* ctx = bio_context(bio);
+  if (ctx == nullptr) {
+    return 0;
+  }
   flush_pending(ctx);
   return ctx->pending.size() - ctx->flushed;
 }
@@ -188,12 +200,18 @@ size_t BIO_io_handle_flush_pending(BIO* bio) {
 // NOLINTNEXTLINE(readability-identifier-naming)
 size_t BIO_io_handle_pending_bytes(BIO* bio) {
   auto* ctx = bio_context(bio);
+  if (ctx == nullptr) {
+    return 0;
+  }
   return ctx->pending.size() - ctx->flushed;
 }
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 bool BIO_io_handle_take_flush_error(BIO* bio) {
   auto* ctx = bio_context(bio);
+  if (ctx == nullptr) {
+    return false;
+  }
   const bool error = ctx->flush_error;
   ctx->flush_error = false;
   return error;

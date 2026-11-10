@@ -1,8 +1,12 @@
+#include <optional>
+
 #include "source/common/network/io_socket_error_impl.h"
 #include "source/common/tls/io_handle_bio.h"
 
 #include "test/mocks/network/io_handle.h"
 
+#include "absl/flags/flag.h"
+#include "absl/flags/reflection.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "openssl/bio.h"
@@ -13,15 +17,45 @@ using testing::_;
 using testing::NiceMock;
 using testing::Return;
 
+// Declared via RUNTIME_GUARD in source/common/runtime/runtime_features.cc.
+ABSL_DECLARE_FLAG(bool, envoy_reloadable_features_tls_staged_write_batching);
+
 namespace Envoy {
 namespace Extensions {
 namespace TransportSockets {
 namespace Tls {
 
+namespace {
+// The pre-batching write tests below exercise the direct-write path; staged batching has its own
+// tests in IoHandleBioBatchTest.
+class ScopedDirectWriteMode {
+public:
+  ScopedDirectWriteMode() {
+    absl::SetFlag(&FLAGS_envoy_reloadable_features_tls_staged_write_batching, false);
+  }
+  ~ScopedDirectWriteMode() {
+    absl::SetFlag(&FLAGS_envoy_reloadable_features_tls_staged_write_batching, true);
+  }
+};
+} // namespace
+
 class IoHandleBioTest : public testing::Test {
 public:
   IoHandleBioTest() { bio_ = BIO_new_io_handle(&io_handle_); }
   ~IoHandleBioTest() override { BIO_free(bio_); }
+  void SetUp() override { direct_write_.emplace(); }
+  void TearDown() override { direct_write_.reset(); }
+
+  BIO* bio_;
+  NiceMock<Network::MockIoHandle> io_handle_;
+  std::optional<ScopedDirectWriteMode> direct_write_;
+};
+
+// Tests for the staged-write batching mode (envoy.reloadable_features.tls_staged_write_batching).
+class IoHandleBioBatchTest : public testing::Test {
+public:
+  IoHandleBioBatchTest() { bio_ = BIO_new_io_handle(&io_handle_); }
+  ~IoHandleBioBatchTest() override { BIO_free(bio_); }
 
   BIO* bio_;
   NiceMock<Network::MockIoHandle> io_handle_;
@@ -464,3 +498,50 @@ TEST(IoHandleBioIndependentTest, TwoBiosAreIndependent) {
 } // namespace TransportSockets
 } // namespace Extensions
 } // namespace Envoy
+
+
+TEST_F(IoHandleBioBatchTest, WriteStagesUntilFlush) {
+  EXPECT_CALL(io_handle_, writev(_, 1)).WillOnce(Return(testing::ByMove(makeSuccessResult(10))));
+  EXPECT_EQ(5, BIO_write(bio_, "hello", 5));
+  EXPECT_EQ(5, BIO_write(bio_, "world", 5));
+  EXPECT_EQ(10, BIO_io_handle_pending_bytes(bio_));
+  EXPECT_EQ(0, BIO_io_handle_flush_pending(bio_));
+  EXPECT_EQ(0, BIO_io_handle_pending_bytes(bio_));
+  EXPECT_FALSE(BIO_io_handle_take_flush_error(bio_));
+}
+
+TEST_F(IoHandleBioBatchTest, FlushPartialStaysPending) {
+  EXPECT_CALL(io_handle_, writev(_, 1)).WillOnce(Return(testing::ByMove(makeSuccessResult(3))));
+  EXPECT_EQ(5, BIO_write(bio_, "hello", 5));
+  EXPECT_EQ(2, BIO_io_handle_flush_pending(bio_));
+  EXPECT_EQ(2, BIO_io_handle_pending_bytes(bio_));
+  EXPECT_CALL(io_handle_, writev(_, 1)).WillOnce(Return(testing::ByMove(makeSuccessResult(2))));
+  EXPECT_EQ(0, BIO_io_handle_flush_pending(bio_));
+}
+
+TEST_F(IoHandleBioBatchTest, FlushAgainKeepsPendingWithoutError) {
+  EXPECT_CALL(io_handle_, writev(_, 1)).WillRepeatedly(Return(testing::ByMove(makeAgainResult())));
+  EXPECT_EQ(5, BIO_write(bio_, "hello", 5));
+  EXPECT_EQ(5, BIO_io_handle_flush_pending(bio_));
+  EXPECT_EQ(5, BIO_io_handle_pending_bytes(bio_));
+  EXPECT_FALSE(BIO_io_handle_take_flush_error(bio_));
+}
+
+TEST_F(IoHandleBioBatchTest, FlushHardErrorIsStickyOnce) {
+  EXPECT_CALL(io_handle_, writev(_, 1)).WillOnce(Return(testing::ByMove(makeErrorResult(100))));
+  EXPECT_EQ(5, BIO_write(bio_, "hello", 5));
+  BIO_io_handle_flush_pending(bio_);
+  EXPECT_TRUE(BIO_io_handle_take_flush_error(bio_));
+  EXPECT_FALSE(BIO_io_handle_take_flush_error(bio_));
+}
+
+TEST_F(IoHandleBioBatchTest, ForeignBioIsNullSafe) {
+  BIO* pair_a = nullptr;
+  BIO* pair_b = nullptr;
+  ASSERT_EQ(1, BIO_new_bio_pair(&pair_a, 1024, &pair_b, 1024));
+  EXPECT_EQ(0, BIO_io_handle_pending_bytes(pair_a));
+  EXPECT_EQ(0, BIO_io_handle_flush_pending(pair_a));
+  EXPECT_FALSE(BIO_io_handle_take_flush_error(pair_a));
+  BIO_free(pair_a);
+  BIO_free(pair_b);
+}
