@@ -56,6 +56,12 @@ class IoHandleBioBatchTest : public testing::Test {
 public:
   IoHandleBioBatchTest() { bio_ = BIO_new_io_handle(&io_handle_); }
   ~IoHandleBioBatchTest() override { BIO_free(bio_); }
+  void SetUp() override {
+    absl::SetFlag(&FLAGS_envoy_reloadable_features_tls_staged_write_batching, true);
+  }
+  void TearDown() override {
+    absl::SetFlag(&FLAGS_envoy_reloadable_features_tls_staged_write_batching, false);
+  }
 
   BIO* bio_;
   NiceMock<Network::MockIoHandle> io_handle_;

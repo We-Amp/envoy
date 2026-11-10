@@ -189,10 +189,14 @@ RUNTIME_GUARD(envoy_reloadable_features_tap_honor_tap_enabled);
 RUNTIME_GUARD(envoy_reloadable_features_tcp_tunnel_allow_upstream_half_close);
 RUNTIME_GUARD(envoy_reloadable_features_test_feature_true);
 RUNTIME_GUARD(envoy_reloadable_features_tls_inspector_enforce_client_tls_version);
-// When enabled, which is the default, TLS ciphertext produced by SSL_write is staged in a
-// per-socket pending buffer and flushed with one writev per write batch, instead of one writev
-// per 16 KB record. See source/common/tls/io_handle_bio.cc and SslSocket::doWrite().
-RUNTIME_GUARD(envoy_reloadable_features_tls_staged_write_batching);
+// When enabled, TLS ciphertext produced by SSL_write is staged in a per-socket pending buffer
+// and flushed with one writev per write batch, instead of one writev per 16 KB record. See
+// source/common/tls/io_handle_bio.cc and SslSocket::doWrite().
+//
+// DEFAULT OFF: with staging enabled, SslSocketTest's client/server handshake tests stall
+// (all shards time out) in a way that survives handshake-completion gating changes, and the
+// mechanism stays measurement-only until that integration-level interaction is root-caused.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_tls_staged_write_batching);
 RUNTIME_GUARD(envoy_reloadable_features_udp_hot_restart_session_handoff);
 RUNTIME_GUARD(envoy_reloadable_features_udp_send_zero_length_datagrams);
 RUNTIME_GUARD(envoy_reloadable_features_udp_set_do_not_fragment);
