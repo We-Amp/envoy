@@ -4,8 +4,10 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <new>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 #include "envoy/common/optref.h"
 #include "envoy/config/core/v3/base.pb.h"
@@ -43,6 +45,112 @@ public:                                                                         
 #define DEFINE_INLINE_HEADER_NUMERIC_FUNCS(name)                                                   \
   DEFINE_INLINE_HEADER_FUNCS(name)                                                                 \
   void set##name(uint64_t value) override { setInline(HeaderHandles::get().name, value); }
+
+namespace Detail {
+
+/**
+ * Chunked node pool backing the header list's std::list. Nodes are carved out of chunks of 8,
+ * 16 then 32 nodes; erased nodes are pushed onto an intra-map free list and reused before new
+ * chunk memory is bumped; chunks are released wholesale when the pool (and with it the owning
+ * header map) is destroyed. The pool is owned by the HeaderList that created it and shared only
+ * through the allocator copies std::list holds, so there is no cross-request state. The first
+ * chunk is allocated lazily on the first node allocation, so empty header maps (and maps that
+ * never grow past their inline headers) allocate nothing for the list itself.
+ */
+class HeaderNodePool {
+public:
+  HeaderNodePool() = default;
+  HeaderNodePool(const HeaderNodePool&) = delete;
+  HeaderNodePool& operator=(const HeaderNodePool&) = delete;
+  ~HeaderNodePool() {
+    for (uint8_t* chunk : chunks_) {
+      ::operator delete(chunk);
+    }
+  }
+
+  void* allocate(size_t size) {
+    if (!free_nodes_.empty()) {
+      // std::list only ever allocates fixed-size nodes; reuse an erased node.
+      ASSERT(size == node_size_);
+      void* node = free_nodes_.back();
+      free_nodes_.pop_back();
+      return node;
+    }
+    if (node_size_ == 0) {
+      node_size_ = size;
+    } else {
+      ASSERT(size == node_size_);
+    }
+    if (remaining_ < size) {
+      addChunk();
+    }
+    void* node = next_;
+    next_ = static_cast<uint8_t*>(next_) + size;
+    remaining_ -= size;
+    return node;
+  }
+
+  void deallocate(void* node, size_t size) noexcept {
+    ASSERT(size == node_size_);
+    free_nodes_.push_back(node);
+  }
+
+private:
+  void addChunk() {
+    static constexpr size_t kChunkNodeCounts[] = {8, 16, 32};
+    const size_t count =
+        chunk_index_ < std::size(kChunkNodeCounts) ? kChunkNodeCounts[chunk_index_++] : 32;
+    const size_t bytes = count * node_size_;
+    uint8_t* chunk = static_cast<uint8_t*>(::operator new(bytes));
+    chunks_.push_back(chunk);
+    next_ = chunk;
+    remaining_ = bytes;
+  }
+
+  std::vector<uint8_t*> chunks_;
+  std::vector<void*> free_nodes_;
+  void* next_{nullptr};
+  size_t remaining_{0};
+  size_t node_size_{0};
+  size_t chunk_index_{0};
+};
+
+/**
+ * std::allocator-compatible node allocator over HeaderNodePool. All copies of an allocator
+ * instance (as held by std::list and its rebinder) share the same pool.
+ */
+template <class T> class HeaderNodePoolAllocator {
+public:
+  using value_type = T;
+
+  HeaderNodePoolAllocator() = default;
+  explicit HeaderNodePoolAllocator(std::shared_ptr<HeaderNodePool> pool)
+      : pool_(std::move(pool)) {}
+  template <class U>
+  HeaderNodePoolAllocator(const HeaderNodePoolAllocator<U>& other) noexcept
+      : pool_(other.pool()) {}
+
+  T* allocate(size_t n) {
+    ASSERT(pool_ != nullptr);
+    return static_cast<T*>(pool_->allocate(n * sizeof(T)));
+  }
+  void deallocate(T* p, size_t n) noexcept { pool_->deallocate(p, n * sizeof(T)); }
+
+  const std::shared_ptr<HeaderNodePool>& pool() const { return pool_; }
+
+  template <class U> bool operator==(const HeaderNodePoolAllocator<U>& other) const {
+    return pool_ == other.pool();
+  }
+  template <class U> bool operator!=(const HeaderNodePoolAllocator<U>& other) const {
+    return pool_ != other.pool();
+  }
+
+private:
+  template <class U> friend class HeaderNodePoolAllocator;
+  std::shared_ptr<HeaderNodePool> pool_;
+};
+
+} // namespace Detail
 
 /**
  * Implementation of Http::HeaderMap. This is heavily optimized for performance. Roughly, when
@@ -113,6 +221,10 @@ public:
   StatefulHeaderKeyFormatterOptRef formatter() { return makeOptRefFromPtr(formatter_.get()); }
 
 protected:
+  // The header list's underlying std::list over a chunked node pool (no per-node operator new).
+  using HeaderListType =
+      std::list<HeaderEntryImpl, Detail::HeaderNodePoolAllocator<HeaderEntryImpl>>;
+
   struct HeaderEntryImpl : public HeaderEntry, NonCopyable {
     HeaderEntryImpl(const LowerCaseString& key);
     HeaderEntryImpl(const LowerCaseString& key, HeaderString&& value);
@@ -128,9 +240,9 @@ protected:
 
     HeaderString key_;
     HeaderString value_;
-    std::list<HeaderEntryImpl>::iterator entry_;
+    typename HeaderListType::iterator entry_;
   };
-  using HeaderNode = std::list<HeaderEntryImpl>::iterator;
+  using HeaderNode = HeaderListType::iterator;
 
   /**
    * This is the static lookup table that is used to determine whether a header is one of the O(1)
@@ -209,7 +321,9 @@ protected:
     using HeaderNodeVector = absl::InlinedVector<HeaderNode, 1>;
     using HeaderLazyMap = absl::flat_hash_map<absl::string_view, HeaderNodeVector>;
 
-    HeaderList() : pseudo_headers_end_(headers_.end()) {}
+    HeaderList()
+        : node_pool_(std::make_shared<Detail::HeaderNodePool>()), headers_(node_pool_),
+          pseudo_headers_end_(headers_.end()) {}
 
     template <class Key> bool isPseudoHeader(const Key& key) {
       return !key.getStringView().empty() && key.getStringView()[0] == ':';
@@ -295,12 +409,12 @@ protected:
      */
     size_t remove(absl::string_view key);
 
-    std::list<HeaderEntryImpl>::iterator begin() { return headers_.begin(); }
-    std::list<HeaderEntryImpl>::iterator end() { return headers_.end(); }
-    std::list<HeaderEntryImpl>::const_iterator begin() const { return headers_.begin(); }
-    std::list<HeaderEntryImpl>::const_iterator end() const { return headers_.end(); }
-    std::list<HeaderEntryImpl>::const_reverse_iterator rbegin() const { return headers_.rbegin(); }
-    std::list<HeaderEntryImpl>::const_reverse_iterator rend() const { return headers_.rend(); }
+    HeaderListType::iterator begin() { return headers_.begin(); }
+    HeaderListType::iterator end() { return headers_.end(); }
+    HeaderListType::const_iterator begin() const { return headers_.begin(); }
+    HeaderListType::const_iterator end() const { return headers_.end(); }
+    HeaderListType::const_reverse_iterator rbegin() const { return headers_.rbegin(); }
+    HeaderListType::const_reverse_iterator rend() const { return headers_.rend(); }
     HeaderLazyMap::iterator mapFind(absl::string_view key) { return lazy_map_.find(key); }
     HeaderLazyMap::iterator mapEnd() { return lazy_map_.end(); }
     size_t size() const { return headers_.size(); }
@@ -312,7 +426,9 @@ protected:
     }
 
   private:
-    std::list<HeaderEntryImpl> headers_;
+    // Declared before headers_ so the pool outlives the list that uses its allocator.
+    std::shared_ptr<Detail::HeaderNodePool> node_pool_;
+    HeaderListType headers_;
     HeaderNode pseudo_headers_end_;
     HeaderLazyMap lazy_map_;
   };
