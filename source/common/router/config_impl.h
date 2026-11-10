@@ -981,6 +981,13 @@ protected:
 
   bool case_sensitive() const { return case_sensitive_; }
 
+public:
+  // The case sensitivity of this route's path match, exposed for the config-time route index
+  // (see VirtualHostImpl::RouteCandidateIndex).
+  bool pathMatchCaseSensitive() const { return case_sensitive_; }
+
+protected:
+
   // Common logic for rewritePathHeader() of DirectResponseEntry.
   void finalizePathHeaderForRedirect(Http::RequestHeaderMap& headers,
                                      absl::string_view matched_path, bool keep_old_path) const;

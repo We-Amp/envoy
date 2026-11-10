@@ -1960,14 +1960,14 @@ void VirtualHostImpl::buildRouteCandidateIndex() {
     const RouteEntryImplBaseConstSharedPtr& route = routes_[i];
     switch (route->matchType()) {
     case PathMatchType::Exact: {
-      std::string key = route->case_sensitive() ? route->matcher()
+      std::string key = route->pathMatchCaseSensitive() ? route->matcher()
                                                 : absl::AsciiStrToLower(route->matcher());
       route_index_.exact_routes[std::move(key)].push_back(i);
       break;
     }
     case PathMatchType::Prefix:
     case PathMatchType::PathSeparatedPrefix: {
-      const std::string path = route->case_sensitive() ? route->matcher()
+      const std::string path = route->pathMatchCaseSensitive() ? route->matcher()
                                                        : absl::AsciiStrToLower(route->matcher());
       RouteCandidateIndex::PrefixTrieNode* node = &route_index_.prefix_root;
       for (const char c : path) {
