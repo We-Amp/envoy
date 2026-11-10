@@ -220,16 +220,13 @@ Network::PostIoAction SslHandshakerImpl::doHandshake() {
   ASSERT(state_ != Ssl::SocketState::HandshakeComplete && state_ != Ssl::SocketState::ShutdownSent);
 
   if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tls_staged_write_batching")) {
-    // Push any staged handshake flight out before (re-)entering the state machine; on
-    // backpressure retry on the next write-ready event.
+    // Push any staged handshake flight out before (re-)entering the state machine. On
+    // backpressure the remainder stays staged; the next write-ready event retries the flush.
     BIO* wbio = SSL_get_wbio(ssl());
     BIO_io_handle_flush_pending(wbio);
     if (BIO_io_handle_take_flush_error(wbio)) {
       handshake_callbacks_->onFailure();
       return PostIoAction::Close;
-    }
-    if (BIO_io_handle_pending_bytes(wbio) > 0) {
-      return PostIoAction::KeepOpen;
     }
   }
 
@@ -244,19 +241,15 @@ Network::PostIoAction SslHandshakerImpl::doHandshake() {
 
   if (rc == 1) {
     // With staged-write batching the handshake's final flight may still be in the BIO's pending
-    // buffer. Do not complete the handshake until it reached the socket, so the peer's next
-    // flight is always requested only after ours is on the wire. doHandshake() is re-entered on
-    // the next write-ready event to finish the flush.
+    // buffer: flush it here. Completion does not depend on the flush succeeding — the entry
+    // flush below and SslSocket::doWrite's flush resume on the next write-ready event, and
+    // write events stay armed (level trigger), so the flight always reaches the socket.
     if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.tls_staged_write_batching")) {
       BIO* wbio = SSL_get_wbio(ssl());
       BIO_io_handle_flush_pending(wbio);
       if (BIO_io_handle_take_flush_error(wbio)) {
         handshake_callbacks_->onFailure();
         return PostIoAction::Close;
-      }
-      if (BIO_io_handle_pending_bytes(wbio) > 0) {
-        state_ = Ssl::SocketState::HandshakeWaitingForConnectionData;
-        return PostIoAction::KeepOpen;
       }
     }
     state_ = Ssl::SocketState::HandshakeComplete;
