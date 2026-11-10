@@ -444,7 +444,7 @@ void ResponseEncoderImpl::encodeHeaders(const ResponseHeaderMap& headers, bool e
   // Defer the header write for at most the rest of the current dispatcher turn so that a
   // response whose body follows in the same turn leaves in ONE write (one network-filter pass,
   // one write activation, one writev). Tunneling/upgrade responses must go out immediately.
-  if (!end_stream && !connection_.handling_upgrade_) {
+  if (!end_stream && !connection_.handlingUpgrade()) {
     connection_.armDeferredFlush();
   }
 

@@ -278,6 +278,21 @@ public:
   OptRef<const StreamInfo::StreamInfo> trackedStream() const override;
   void dumpState(std::ostream& os, int indent_level) const override;
 
+  /**
+   * Defer the write of the encoded response headers to (at latest) the end of the current
+   * dispatcher turn: the headers stay in output_buffer_ and are flushed together with the first
+   * following body/trailers encode (one network-filter pass, one write activation, one writev),
+   * or by the scheduled end-of-turn callback if no body encode follows. Used by
+   * ResponseEncoderImpl for non-end-stream response headers; see s7-design.md. Public: called
+   * from StreamEncoderImpl subclasses holding a base ConnectionImpl reference.
+   */
+  void armDeferredFlush();
+  // Flushes output_buffer_ if a deferred header flush is still pending. Ordering guard for a
+  // second encodeHeaders and the end-of-turn safety flush.
+  void flushDeferredOutput();
+  bool deferredFlushPending() const { return deferred_flush_pending_; }
+  bool handlingUpgrade() const { return handling_upgrade_; }
+
 protected:
   ConnectionImpl(Network::Connection& connection, CodecStats& stats, const Http1Settings& settings,
                  MessageType type, uint32_t max_headers_kb, const uint32_t max_headers_count);
@@ -300,19 +315,6 @@ protected:
    * @return A codecProtocolError status if headers exceed the size limit.
    */
   Status checkMaxHeadersSize();
-
-  /**
-   * Defer the write of the encoded response headers to (at latest) the end of the current
-   * dispatcher turn: the headers stay in output_buffer_ and are flushed together with the first
-   * following body/trailers encode (one network-filter pass, one write activation, one writev),
-   * or by the scheduled end-of-turn callback if no body encode follows. Used by
-   * ResponseEncoderImpl for non-end-stream response headers; see s7-design.md.
-   */
-  void armDeferredFlush();
-  // Flushes output_buffer_ if a deferred header flush is still pending. Ordering guard for a
-  // second encodeHeaders and the end-of-turn safety flush.
-  void flushDeferredOutput();
-  bool deferredFlushPending() const { return deferred_flush_pending_; }
 
   Network::Connection& connection_;
   CodecStats& stats_;
