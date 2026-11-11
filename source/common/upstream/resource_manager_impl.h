@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -26,14 +27,15 @@ struct ManagedResourceImpl : public BasicResourceLimitImpl {
                       Stats::Gauge& open_gauge, Stats::Gauge& remaining)
       : BasicResourceLimitImpl(max, runtime, runtime_key), open_gauge_(open_gauge),
         remaining_(remaining) {
-    remaining_.set(max);
+    updateRemaining();
+    updateOpenGauge();
   }
 
   // BasicResourceLimitImpl
   void inc() override {
     BasicResourceLimitImpl::inc();
     updateRemaining();
-    open_gauge_.set(BasicResourceLimitImpl::canCreate() ? 0 : 1);
+    updateOpenGauge();
     if (on_inc_cb_) {
       on_inc_cb_();
     }
@@ -41,7 +43,7 @@ struct ManagedResourceImpl : public BasicResourceLimitImpl {
   void decBy(uint64_t amount) override {
     BasicResourceLimitImpl::decBy(amount);
     updateRemaining();
-    open_gauge_.set(BasicResourceLimitImpl::canCreate() ? 0 : 1);
+    updateOpenGauge();
   }
 
   // Optional callback function used for counting new requests in retry budget.
@@ -58,8 +60,32 @@ struct ManagedResourceImpl : public BasicResourceLimitImpl {
      * unsigned and subtracting them may overflow.
      */
     const uint64_t current_copy = current_;
-    remaining_.set(max() > current_copy ? max() - current_copy : 0);
+    const uint64_t remaining = max() > current_copy ? max() - current_copy : 0;
+    if (remaining_used_ && remaining == last_remaining_) {
+      // The gauge already shows this value; skip the write.
+      return;
+    }
+    last_remaining_ = remaining;
+    remaining_used_ = true;
+    remaining_.set(remaining);
   }
+
+  // Sets the open gauge only when the breaker state changes; the Used flag is still set once on
+  // the first write so stats sinks see the gauge as live.
+  void updateOpenGauge() {
+    const uint64_t open = BasicResourceLimitImpl::canCreate() ? 0 : 1;
+    if (open == last_open_ && open_gauge_used_) {
+      return;
+    }
+    last_open_ = open;
+    open_gauge_used_ = true;
+    open_gauge_.set(open);
+  }
+
+  uint64_t last_remaining_{std::numeric_limits<uint64_t>::max()};
+  bool remaining_used_{false};
+  uint64_t last_open_{std::numeric_limits<uint64_t>::max()};
+  bool open_gauge_used_{false};
 
   /**
    * A gauge to notify the live circuit breaker state. The gauge is set to 0
@@ -225,6 +251,9 @@ private:
     void clearRemainingGauge() {
       if (useRetryBudget()) {
         remaining_.set(0);
+        // Keep the skip-write bookkeeping consistent with the forced value.
+        last_remaining_ = 0;
+        remaining_used_ = true;
       }
     }
 
