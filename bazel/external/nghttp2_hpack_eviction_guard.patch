@@ -1,30 +1,8 @@
---- a/lib/nghttp2_hd.h
-+++ b/lib/nghttp2_hd.h
-@@ -145,6 +145,10 @@
-   uint32_t seq;
-   /* The hash value for header name (nv.name). */
-   uint32_t hash;
-+  /* Deflater only: the value of nghttp2_hd_deflater.block_gen when
-+     this entry was last inserted or referenced by an exact match.
-+     Always 0 in the inflater. */
-+  uint32_t last_used;
- };
- 
- /* The entry used for static header table. */
-@@ -229,6 +233,10 @@
-   uint8_t notify_table_size_change;
-   /* Whether the deflater should not huffman encode header */
-   uint8_t disable_huffman;
-+  /* Header block generation.  Incremented once per header block
-+     encoded.  Used to avoid evicting entries which were used by the
-+     current or the previous header block. */
-+  uint32_t block_gen;
- };
- 
- struct nghttp2_hd_inflater {
+diff --git a/lib/nghttp2_hd.c b/lib/nghttp2_hd.c
+index 189ae46..d2fcebe 100644
 --- a/lib/nghttp2_hd.c
 +++ b/lib/nghttp2_hd.c
-@@ -494,6 +494,7 @@
+@@ -494,6 +494,7 @@ void nghttp2_hd_entry_init(nghttp2_hd_entry *ent, nghttp2_hd_nv *nv) {
    ent->cnv.flags = nv->flags;
    ent->next = NULL;
    ent->hash = 0;
@@ -32,7 +10,7 @@
  
    nghttp2_rcbuf_incref(ent->nv.name);
    nghttp2_rcbuf_incref(ent->nv.value);
-@@ -731,6 +732,7 @@
+@@ -731,6 +732,7 @@ int nghttp2_hd_deflate_init2(nghttp2_hd_deflater *deflater,
    deflater->deflate_hd_table_bufsize_max = max_deflate_dynamic_table_size;
    deflater->min_hd_table_bufsize_max = UINT32_MAX;
    deflater->disable_huffman = 0;
@@ -40,7 +18,7 @@
  
    return 0;
  }
-@@ -1242,7 +1244,7 @@
+@@ -1242,7 +1244,7 @@ static int emit_newname_block_nohuffman(nghttp2_bufs *bufs,
  
  static int add_hd_table_incremental(nghttp2_hd_context *context,
                                      nghttp2_hd_nv *nv, nghttp2_hd_map *map,
@@ -49,7 +27,7 @@
    int rv;
    nghttp2_hd_entry *new_ent;
    size_t room;
-@@ -1295,6 +1297,7 @@
+@@ -1295,6 +1297,7 @@ static int add_hd_table_incremental(nghttp2_hd_context *context,
  
    new_ent->seq = context->next_seq++;
    new_ent->hash = hash;
@@ -57,7 +35,7 @@
  
    if (map) {
      hd_map_insert(map, new_ent);
-@@ -1338,9 +1341,9 @@
+@@ -1338,9 +1341,9 @@ static search_result search_static_table(const nghttp2_nv *nv, int32_t token,
  static search_result search_hd_table(nghttp2_hd_context *context,
                                       const nghttp2_nv *nv, int32_t token,
                                       int indexing_mode, nghttp2_hd_map *map,
@@ -69,7 +47,7 @@
    int exact_match;
    int name_only = indexing_mode == NGHTTP2_HD_NEVER_INDEXING;
  
-@@ -1355,6 +1358,10 @@
+@@ -1355,6 +1358,10 @@ static search_result search_hd_table(nghttp2_hd_context *context,
      return res;
    }
  
@@ -80,7 +58,7 @@
    res.index = (nghttp2_ssize)(context->next_seq - 1 - ent->seq +
                                NGHTTP2_STATIC_TABLE_LENGTH);
    res.name_value_match = exact_match;
-@@ -1481,6 +1488,34 @@
+@@ -1481,6 +1488,34 @@ static int hd_deflate_decide_indexing(nghttp2_hd_deflater *deflater,
    return NGHTTP2_HD_WITH_INDEXING;
  }
  
@@ -115,7 +93,7 @@
  static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
                        const nghttp2_nv *nv) {
    int rv;
-@@ -1514,7 +1549,7 @@
+@@ -1514,7 +1549,7 @@ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
                      : hd_deflate_decide_indexing(deflater, nv, token);
  
    res = search_hd_table(&deflater->ctx, nv, token, indexing_mode,
@@ -124,7 +102,7 @@
  
    idx = res.index;
  
-@@ -1533,6 +1568,13 @@
+@@ -1533,6 +1568,13 @@ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
      DEBUGF("deflatehd: name match index=%td\n", res.index);
    }
  
@@ -138,7 +116,7 @@
    if (indexing_mode == NGHTTP2_HD_WITH_INDEXING) {
      nghttp2_hd_nv hd_nv;
  
-@@ -1556,7 +1598,8 @@
+@@ -1556,7 +1598,8 @@ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
      hd_nv.token = token;
      hd_nv.flags = NGHTTP2_NV_FLAG_NONE;
  
@@ -148,7 +126,7 @@
  
      nghttp2_rcbuf_decref(hd_nv.value);
      nghttp2_rcbuf_decref(hd_nv.name);
-@@ -1596,6 +1639,8 @@
+@@ -1596,6 +1639,8 @@ int nghttp2_hd_deflate_hd_bufs(nghttp2_hd_deflater *deflater,
      return NGHTTP2_ERR_HEADER_COMP;
    }
  
@@ -157,7 +135,7 @@
    if (deflater->notify_table_size_change) {
      size_t min_hd_table_bufsize_max;
  
-@@ -1931,7 +1976,7 @@
+@@ -1931,7 +1976,7 @@ static int hd_inflate_commit_newname(nghttp2_hd_inflater *inflater,
    nv.token = lookup_token(inflater->namercbuf->base, inflater->namercbuf->len);
  
    if (inflater->index_required) {
@@ -166,7 +144,7 @@
  
      if (rv != 0) {
        return rv;
-@@ -1978,7 +2023,7 @@
+@@ -1978,7 +2023,7 @@ static int hd_inflate_commit_indname(nghttp2_hd_inflater *inflater,
    nv.value = inflater->valuercbuf;
  
    if (inflater->index_required) {
@@ -175,3 +153,29 @@
      if (rv != 0) {
        nghttp2_rcbuf_decref(nv.name);
        return NGHTTP2_ERR_NOMEM;
+diff --git a/lib/nghttp2_hd.h b/lib/nghttp2_hd.h
+index 817a04d..89a1cd0 100644
+--- a/lib/nghttp2_hd.h
++++ b/lib/nghttp2_hd.h
+@@ -145,6 +145,10 @@ struct nghttp2_hd_entry {
+   uint32_t seq;
+   /* The hash value for header name (nv.name). */
+   uint32_t hash;
++  /* Deflater only: the value of nghttp2_hd_deflater.block_gen when
++     this entry was last inserted or referenced by an exact match.
++     Always 0 in the inflater. */
++  uint32_t last_used;
+ };
+ 
+ /* The entry used for static header table. */
+@@ -229,6 +233,10 @@ struct nghttp2_hd_deflater {
+   uint8_t notify_table_size_change;
+   /* Whether the deflater should not huffman encode header */
+   uint8_t disable_huffman;
++  /* Header block generation.  Incremented once per header block
++     encoded.  Used to avoid evicting entries which were used by the
++     current or the previous header block. */
++  uint32_t block_gen;
+ };
+ 
+ struct nghttp2_hd_inflater {
