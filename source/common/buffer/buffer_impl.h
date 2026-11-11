@@ -1,5 +1,23 @@
 #pragma once
 
+// Poison recycled slice storage so that ASan catches use-after-free of a block sitting in the
+// thread-local free list. No-ops without ASan (the review scope is ASan; MSan coverage would
+// need a separate mechanism).
+#if defined(__SANITIZE_ADDRESS__)
+#define ENVOY_BUFFER_SLICE_POISON(addr, size) ASAN_POISON_MEMORY_REGION((addr), (size))
+#define ENVOY_BUFFER_SLICE_UNPOISON(addr, size) ASAN_UNPOISON_MEMORY_REGION((addr), (size))
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#include <sanitizer/asan_interface.h>
+#define ENVOY_BUFFER_SLICE_POISON(addr, size) ASAN_POISON_MEMORY_REGION((addr), (size))
+#define ENVOY_BUFFER_SLICE_UNPOISON(addr, size) ASAN_UNPOISON_MEMORY_REGION((addr), (size))
+#endif
+#endif
+#ifndef ENVOY_BUFFER_SLICE_POISON
+#define ENVOY_BUFFER_SLICE_POISON(addr, size)
+#define ENVOY_BUFFER_SLICE_UNPOISON(addr, size)
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <deque>
@@ -357,6 +375,11 @@ public:
    * @return this thread's free list of default-size storage.
    */
   static StorageFreeList& storageFreeList();
+
+  // Moves a default-size reservation storage block into the calling thread's free list, with the
+  // same thread-exit guard, capacity bound, and poisoning as Slice recycling. No-op (the block is
+  // freed by its owner) when the thread's list is destroyed or full.
+  static void recycleReservationStorage(StoragePtr& storage);
 
 public:
   /**
@@ -813,9 +836,7 @@ private:
       for (auto r = owned_storages_.rbegin(); r != owned_storages_.rend(); r++) {
         if (r->mem_ != nullptr) {
           ASSERT(r->len_ == Slice::default_slice_size_);
-          if (free_list_ref_.size() < Slice::free_list_max_) {
-            free_list_ref_.push_back(std::move(r->mem_));
-          }
+          Slice::recycleReservationStorage(r->mem_);
         }
       }
     }
@@ -825,6 +846,7 @@ private:
 
       Slice::SizedStorage storage{nullptr, Slice::default_slice_size_};
       if (!free_list_ref_.empty()) {
+        ENVOY_BUFFER_SLICE_UNPOISON(free_list_ref_.back().get(), Slice::default_slice_size_);
         storage.mem_ = std::move(free_list_ref_.back());
         free_list_ref_.pop_back();
       } else {

@@ -1,5 +1,6 @@
 #include <memory>
 #include <string>
+#include <thread>
 
 #include "envoy/api/io_error.h"
 
@@ -1038,6 +1039,84 @@ TEST_F(OwnedImplTest, SliceFreeListRecyclesDrainedSlice) {
   ASSERT_EQ(1, free_list.size());
   EXPECT_EQ(storage, free_list.back().get());
   free_list.clear();
+}
+
+// A slice freed on another thread lands in that thread's free list, not the allocating
+// thread's list.
+TEST_F(OwnedImplTest, SliceFreeListCrossThreadRecycle) {
+  Buffer::OwnedImpl buffer;
+  {
+    auto r = buffer.reserveForReadWithLengthForTest(Slice::default_slice_size_);
+    ASSERT_EQ(1, r.numSlices());
+    r.commit(Slice::default_slice_size_);
+  }
+  void* storage = buffer.getRawSlices()[0].mem_;
+
+  std::thread other([&buffer, storage]() {
+    Buffer::OwnedImpl local;
+    // Give this thread a used free list, then take ownership of the main-thread slice and free
+    // it here: the block must land in THIS thread's list.
+    {
+      auto r = local.reserveForReadWithLengthForTest(Slice::default_slice_size_);
+      r.commit(Slice::default_slice_size_);
+      local.drain(Slice::default_slice_size_);
+    }
+    local.move(buffer);
+    local.drain(Slice::default_slice_size_);
+    EXPECT_EQ(storage, Slice::storageFreeList().back().get());
+  });
+  other.join();
+
+  // The allocating thread's list does not hold the block.
+  const auto& main_list = Slice::storageFreeList();
+  EXPECT_EQ(std::find_if(main_list.begin(), main_list.end(),
+                         [storage](const auto& s) { return s.get() == storage; }),
+            main_list.end());
+}
+
+// add/linearize produce capacity-16384 slices that are recycled correctly. This test does not
+// clear the free list first: it runs after earlier tests have used it and only asserts relative
+// growth, so it also covers order dependence on what earlier tests left behind.
+TEST_F(OwnedImplTest, SliceFreeListRecyclesLinearizedSlices) {
+  Slice::StorageFreeList& free_list = Slice::storageFreeList();
+  const size_t size_before = free_list.size();
+
+  Buffer::OwnedImpl buffer;
+  // 12289..16384 bytes round up to a 16384-capacity slice.
+  buffer.add(std::string(13000, 'x'));
+  const auto slices = buffer.describeSlicesForTest();
+  ASSERT_GE(slices.size(), 1);
+  EXPECT_EQ(16384, slices.back().capacity);
+
+  // Draining the buffer recycles the storage into the thread's free list.
+  const size_t free_before = free_list.size();
+  buffer.drain(buffer.length());
+  EXPECT_EQ(free_before + 1, free_list.size());
+
+  // The recycled block backs the next default-size reservation.
+  {
+    auto r = buffer.reserveForReadWithLengthForTest(Slice::default_slice_size_);
+    ASSERT_EQ(1, r.numSlices());
+    EXPECT_EQ(16384, Slice::sliceSize(Slice::default_slice_size_));
+    r.commit(Slice::default_slice_size_);
+    buffer.drain(buffer.length());
+    EXPECT_EQ(free_before + 2, free_list.size());
+  }
+}
+
+// Destroying the result of extractMutableFrontSlice recycles its storage.
+TEST_F(OwnedImplTest, SliceFreeListRecyclesExtractedMutableFrontSlice) {
+  Slice::StorageFreeList& free_list = Slice::storageFreeList();
+  const size_t size_before = free_list.size();
+
+  Buffer::OwnedImpl buffer;
+  buffer.add(std::string(13000, 'x'));
+  {
+    auto slice = buffer.extractMutableFrontSlice();
+    EXPECT_EQ(13000, slice->getMutableData().size());
+    // Destroyed here: the storage moves into the thread's free list.
+  }
+  EXPECT_EQ(size_before + 1, free_list.size());
 }
 
 // The free list never holds more than `Slice::free_list_max_` blocks.

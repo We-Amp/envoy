@@ -31,18 +31,29 @@ thread_local ThreadStorageFreeList thread_storage_free_list;
 
 Slice::StorageFreeList& Slice::storageFreeList() { return thread_storage_free_list.storages_; }
 
-void Slice::recycleStorage(StoragePtr& storage) {
+void Slice::recycleReservationStorage(StoragePtr& storage) {
   // The free list is thread local, so no locking is needed. Storage allocated on one thread may be
   // recycled into another thread's list; that is fine because it is a plain new[] block. The
   // caller has already released the slice's account charge, and accounts are charged per slice,
-  // not per block, so recycled storage never carries a charge.
+  // not per block, so recycled storage never carries a charge. Poisoning the block while it sits
+  // in the list lets ASan catch any access to storage that is owned by the free list rather than
+  // by a live slice.
   if (storage_free_list_destroyed) {
     return;
   }
   StorageFreeList& free_list = storageFreeList();
   if (free_list.size() < free_list_max_) {
+    ENVOY_BUFFER_SLICE_POISON(storage.get(), Slice::default_slice_size_);
     free_list.push_back(std::move(storage));
   }
+}
+
+void Slice::recycleStorage(StoragePtr& storage) {
+  if (capacity_ != default_slice_size_ || storage_ == nullptr) {
+    return;
+  }
+  ENVOY_BUFFER_SLICE_UNPOISON(storage.get(), default_slice_size_);
+  recycleReservationStorage(storage);
 }
 
 uint64_t Slice::prepend(const void* data, uint64_t size) {
