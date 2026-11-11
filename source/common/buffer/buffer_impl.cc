@@ -49,9 +49,8 @@ void Slice::recycleReservationStorage(StoragePtr& storage) {
 }
 
 void Slice::recycleStorage(StoragePtr& storage) {
-  if (capacity_ != default_slice_size_ || storage_ == nullptr) {
-    return;
-  }
+  // The caller (maybeRecycleStorage) has already checked that this is an owned default-size
+  // block. Unpoison before handing it to the free list.
   ENVOY_BUFFER_SLICE_UNPOISON(storage.get(), default_slice_size_);
   recycleReservationStorage(storage);
 }

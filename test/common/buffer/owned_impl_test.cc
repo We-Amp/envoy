@@ -1079,7 +1079,6 @@ TEST_F(OwnedImplTest, SliceFreeListCrossThreadRecycle) {
 // growth, so it also covers order dependence on what earlier tests left behind.
 TEST_F(OwnedImplTest, SliceFreeListRecyclesLinearizedSlices) {
   Slice::StorageFreeList& free_list = Slice::storageFreeList();
-  const size_t size_before = free_list.size();
 
   Buffer::OwnedImpl buffer;
   // 12289..16384 bytes round up to a 16384-capacity slice.
@@ -1087,20 +1086,24 @@ TEST_F(OwnedImplTest, SliceFreeListRecyclesLinearizedSlices) {
   const auto slices = buffer.describeSlicesForTest();
   ASSERT_GE(slices.size(), 1);
   EXPECT_EQ(16384, slices.back().capacity);
+  void* added_storage = buffer.getRawSlices()[0].mem_;
 
   // Draining the buffer recycles the storage into the thread's free list.
   const size_t free_before = free_list.size();
   buffer.drain(buffer.length());
   EXPECT_EQ(free_before + 1, free_list.size());
+  EXPECT_EQ(added_storage, free_list.back().get());
 
-  // The recycled block backs the next default-size reservation.
+  // The recycled block backs the next default-size reservation, and draining it returns it to
+  // the list again (net zero on the list size).
   {
     auto r = buffer.reserveForReadWithLengthForTest(Slice::default_slice_size_);
     ASSERT_EQ(1, r.numSlices());
-    EXPECT_EQ(16384, Slice::sliceSize(Slice::default_slice_size_));
+    EXPECT_EQ(added_storage, r.slices()[0].mem_);
     r.commit(Slice::default_slice_size_);
     buffer.drain(buffer.length());
-    EXPECT_EQ(free_before + 2, free_list.size());
+    EXPECT_EQ(free_before + 1, free_list.size());
+    EXPECT_EQ(added_storage, free_list.back().get());
   }
 }
 

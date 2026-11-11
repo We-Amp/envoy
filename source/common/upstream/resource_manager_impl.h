@@ -61,12 +61,14 @@ struct ManagedResourceImpl : public BasicResourceLimitImpl {
      */
     const uint64_t current_copy = current_;
     const uint64_t remaining = max() > current_copy ? max() - current_copy : 0;
-    if (remaining_used_ && remaining == last_remaining_) {
-      // The gauge already shows this value; skip the write.
+    if (remaining_used_.load(std::memory_order_relaxed) &&
+        remaining == last_remaining_.load(std::memory_order_relaxed)) {
+      // The gauge already shows this value; skip the write. Under a race this may
+      // redundantly write, which is semantically identical.
       return;
     }
-    last_remaining_ = remaining;
-    remaining_used_ = true;
+    last_remaining_.store(remaining, std::memory_order_relaxed);
+    remaining_used_.store(true, std::memory_order_relaxed);
     remaining_.set(remaining);
   }
 
@@ -74,18 +76,19 @@ struct ManagedResourceImpl : public BasicResourceLimitImpl {
   // the first write so stats sinks see the gauge as live.
   void updateOpenGauge() {
     const uint64_t open = BasicResourceLimitImpl::canCreate() ? 0 : 1;
-    if (open == last_open_ && open_gauge_used_) {
+    if (open_gauge_used_.load(std::memory_order_relaxed) &&
+        open == last_open_.load(std::memory_order_relaxed)) {
       return;
     }
-    last_open_ = open;
-    open_gauge_used_ = true;
+    last_open_.store(open, std::memory_order_relaxed);
+    open_gauge_used_.store(true, std::memory_order_relaxed);
     open_gauge_.set(open);
   }
 
-  uint64_t last_remaining_{std::numeric_limits<uint64_t>::max()};
-  bool remaining_used_{false};
-  uint64_t last_open_{std::numeric_limits<uint64_t>::max()};
-  bool open_gauge_used_{false};
+  std::atomic<uint64_t> last_remaining_{std::numeric_limits<uint64_t>::max()};
+  std::atomic<bool> remaining_used_{false};
+  std::atomic<uint64_t> last_open_{std::numeric_limits<uint64_t>::max()};
+  std::atomic<bool> open_gauge_used_{false};
 
   /**
    * A gauge to notify the live circuit breaker state. The gauge is set to 0
@@ -251,9 +254,6 @@ private:
     void clearRemainingGauge() {
       if (useRetryBudget()) {
         remaining_.set(0);
-        // Keep the skip-write bookkeeping consistent with the forced value.
-        last_remaining_ = 0;
-        remaining_used_ = true;
       }
     }
 
