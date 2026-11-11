@@ -63,9 +63,21 @@
 #include "absl/container/inlined_vector.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
+#include "re2/re2.h"
 
 namespace Envoy {
 namespace Router {
+
+namespace {
+// Maximum length of the required literal prefix derived from a safe_regex pattern for the
+// config-time route index (see VirtualHostImpl::RouteCandidateIndex). PossibleMatchRange
+// truncates the reported range endpoints to this length; a TRUNCATED max is still a valid
+// lexicographic upper bound for every match, so the longest common prefix of the truncated
+// endpoints remains a required prefix of every match -- truncation can only shorten the
+// derived prefix, never invalidate it.
+constexpr size_t kMaxIndexedPrefixLen = 256;
+} // namespace
+
 class RouteCreator {
 public:
   static absl::StatusOr<RouteEntryImplBaseConstSharedPtr>
@@ -1482,8 +1494,8 @@ std::string UriTemplateMatcherRouteEntryImpl::currentUrlPathAfterRewrite(
 bool UriTemplateMatcherRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                                const StreamInfo::StreamInfo& stream_info,
                                                uint64_t random_value) const {
-  if (RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value) &&
-      path_matcher_->match(route_match_context.path())) {
+  if (path_matcher_->match(route_match_context.path()) &&
+      RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
     return true;
   }
   return false;
@@ -1516,8 +1528,10 @@ PrefixRouteEntryImpl::currentUrlPathAfterRewrite(const Http::RequestHeaderMap& h
 bool PrefixRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                    const StreamInfo::StreamInfo& stream_info,
                                    uint64_t random_value) const {
-  if (RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value) &&
-      path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery())) {
+  // Check the path first: it is the cheapest discriminator and most routes fail here when many
+  // routes are configured. matchRoute() is only evaluated for path-matching candidates.
+  if (path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery()) &&
+      RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
     return true;
   }
   return false;
@@ -1550,8 +1564,10 @@ PathRouteEntryImpl::currentUrlPathAfterRewrite(const Http::RequestHeaderMap& hea
 bool PathRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                  const StreamInfo::StreamInfo& stream_info,
                                  uint64_t random_value) const {
-  if (RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value) &&
-      path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery())) {
+  // Check the path first: it is the cheapest discriminator and most routes fail here when many
+  // routes are configured. matchRoute() is only evaluated for path-matching candidates.
+  if (path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery()) &&
+      RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
     return true;
   }
 
@@ -1592,8 +1608,10 @@ RegexRouteEntryImpl::currentUrlPathAfterRewrite(const Http::RequestHeaderMap& he
 bool RegexRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                   const StreamInfo::StreamInfo& stream_info,
                                   uint64_t random_value) const {
-  if (RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
-    if (path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery())) {
+  // Check the path first: it is the cheapest discriminator and most routes fail here when many
+  // routes are configured. matchRoute() is only evaluated for path-matching candidates.
+  if (path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery())) {
+    if (RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
       return true;
     }
   }
@@ -1625,6 +1643,8 @@ bool ConnectRouteEntryImpl::matches(const RouteMatchContext& route_match_context
                                     const StreamInfo::StreamInfo& stream_info,
                                     uint64_t random_value) const {
   const Http::RequestHeaderMap& headers = route_match_context.headers();
+  // Check the cheap connect-request condition first; matchRoute() is only evaluated for
+  // connect-shaped requests.
   if ((Http::HeaderUtility::isConnect(headers) ||
        Http::HeaderUtility::isConnectUdpRequest(headers)) &&
       RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
@@ -1659,17 +1679,16 @@ std::string PathSeparatedPrefixRouteEntryImpl::currentUrlPathAfterRewrite(
 bool PathSeparatedPrefixRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                                 const StreamInfo::StreamInfo& stream_info,
                                                 uint64_t random_value) const {
-  if (!RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
-    return false;
-  }
+  // Check the path first: it is the cheapest discriminator and most routes fail here when many
+  // routes are configured. matchRoute() is only evaluated for path-matching candidates.
   const absl::string_view sanitized_path = route_match_context.sanitizedPathWithoutQuery();
   const size_t sanitized_size = sanitized_path.size();
   const size_t matcher_size = matcher().size();
-  if (sanitized_size >= matcher_size && path_matcher_->matchPathWithoutQuery(sanitized_path) &&
-      (sanitized_size == matcher_size || sanitized_path[matcher_size] == '/')) {
-    return true;
+  if (!(sanitized_size >= matcher_size && path_matcher_->matchPathWithoutQuery(sanitized_path) &&
+        (sanitized_size == matcher_size || sanitized_path[matcher_size] == '/'))) {
+    return false;
   }
-  return false;
+  return RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value);
 }
 
 CommonVirtualHostImpl::CommonVirtualHostImpl(
@@ -1921,37 +1940,218 @@ VirtualHostImpl::VirtualHostImpl(const envoy::config::route::v3::VirtualHost& vi
       createRouteSpecifiers(virtual_host.route_specifiers(), specifier_context);
   SET_AND_RETURN_IF_NOT_OK(route_specifiers_or_error.status(), creation_status);
   route_specifiers_ = std::move(route_specifiers_or_error.value());
+
+  buildRouteCandidateIndex(virtual_host, factory_context);
+}
+
+void VirtualHostImpl::RouteCandidateIndex::collectCandidates(
+    absl::string_view sanitized_path, absl::InlinedVector<uint32_t, 8>& candidates) const {
+  ASSERT(enabled);
+  const bool needs_folded_lookup = has_case_insensitive_routes;
+  const std::string lowered =
+      needs_folded_lookup ? std::string(absl::AsciiStrToLower(sanitized_path)) : std::string();
+
+  auto add_exact = [&](absl::string_view key) {
+    const auto it = exact_routes.find(key);
+    if (it != exact_routes.end()) {
+      candidates.insert(candidates.end(), it->second.begin(), it->second.end());
+    }
+  };
+  add_exact(sanitized_path);
+  if (needs_folded_lookup && lowered != sanitized_path) {
+    add_exact(lowered);
+  }
+
+  auto walk_trie = [&](absl::string_view path) {
+    const PrefixTrieNode* node = &prefix_root;
+    candidates.insert(candidates.end(), node->route_indices.begin(), node->route_indices.end());
+    for (const char c : path) {
+      const auto it = node->children.find(c);
+      if (it == node->children.end()) {
+        break;
+      }
+      node = it->second.get();
+      candidates.insert(candidates.end(), node->route_indices.begin(), node->route_indices.end());
+    }
+  };
+  walk_trie(sanitized_path);
+  if (needs_folded_lookup && lowered != sanitized_path) {
+    walk_trie(lowered);
+  }
+
+  candidates.insert(candidates.end(), side_list.begin(), side_list.end());
+
+  std::sort(candidates.begin(), candidates.end());
+  candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+}
+
+void VirtualHostImpl::buildRouteCandidateIndex(
+    const envoy::config::route::v3::VirtualHost& virtual_host,
+    Server::Configuration::ServerFactoryContext& factory_context) {
+  if (routes_.size() < 2) {
+    // With a single route (or none) the linear scan is already minimal; nothing to index.
+    return;
+  }
+
+  route_index_.enabled = true;
+  for (uint32_t i = 0; i < routes_.size(); ++i) {
+    const RouteEntryImplBaseConstSharedPtr& route = routes_[i];
+    switch (route->matchType()) {
+    case PathMatchType::Exact: {
+      if (!route->pathMatchCaseSensitive()) {
+        route_index_.has_case_insensitive_routes = true;
+      }
+      std::string key = route->pathMatchCaseSensitive() ? route->matcher()
+                                                        : absl::AsciiStrToLower(route->matcher());
+      route_index_.exact_routes[std::move(key)].push_back(i);
+      break;
+    }
+    case PathMatchType::Prefix:
+    case PathMatchType::PathSeparatedPrefix: {
+      if (!route->pathMatchCaseSensitive()) {
+        route_index_.has_case_insensitive_routes = true;
+      }
+      const std::string path = route->pathMatchCaseSensitive()
+                                   ? route->matcher()
+                                   : absl::AsciiStrToLower(route->matcher());
+      RouteCandidateIndex::PrefixTrieNode* node = &route_index_.prefix_root;
+      for (const char c : path) {
+        auto& child = node->children[c];
+        if (child == nullptr) {
+          child = std::make_unique<RouteCandidateIndex::PrefixTrieNode>();
+        }
+        node = child.get();
+      }
+      node->route_indices.push_back(i);
+      break;
+    }
+    case PathMatchType::Regex: {
+      // All Regex-kind routes reach this branch; a route is indexed only when its effective
+      // engine is google_re2 -- either the RouteMatch config names it explicitly, or no engine
+      // is named and the server's default regex engine IS the google_re2 engine (any other
+      // default engine's pattern syntax and match semantics differ, so indexing it here would
+      // be unsound -- such routes land in the side list BY DESIGN) -- AND RE2's own prefix
+      // analysis establishes a required
+      // case-sensitive literal prefix for the pattern. The analysis RE2 is compiled with the
+      // same options as the route's own matcher (Quiet, Latin-1 encoding under
+      // envoy.reloadable_features.re2_use_latin1_mode) so a raw high-byte in the pattern yields
+      // a raw-byte prefix that matches the raw-byte path. RE2 computes the range against an
+      // anchored-at-start match while Envoy evaluates FullMatch -- a subset of anchored matches
+      // -- so the required-prefix bound holds a fortiori, and it holds for unanchored patterns
+      // too (a full match is also an anchored-at-start match). The longest common prefix of the
+      // reported range endpoints is required of every match, so the trie entry can never
+      // over-reject (a truncated max remains a valid upper bound). Fold-case prefixes and
+      // patterns RE2 cannot compile stay in the ordered side list, which is scanned for every
+      // request. The extraction can only MISS (a route evaluated more often than strictly
+      // necessary), never over-reject, because every candidate is still fully re-validated by
+      // the route's own regex match.
+      const bool explicit_re2 = virtual_host.routes(i).match().safe_regex().has_google_re2();
+      const bool default_engine_is_re2 =
+          dynamic_cast<const Regex::GoogleReEngine*>(&factory_context.regexEngine()) != nullptr;
+      if (!explicit_re2 && !default_engine_is_re2) {
+        route_index_.side_list.push_back(i);
+        break;
+      }
+      re2::RE2::Options options(re2::RE2::CannedOptions::Quiet);
+      if (Runtime::runtimeFeatureEnabled("envoy.reloadable_features.re2_use_latin1_mode")) {
+        options.set_encoding(re2::RE2::Options::EncodingLatin1);
+      }
+      const re2::RE2 compiled(route->matcher(), options);
+      std::string range_min;
+      std::string range_max;
+      if (!compiled.ok() ||
+          !compiled.PossibleMatchRange(&range_min, &range_max, kMaxIndexedPrefixLen)) {
+        route_index_.side_list.push_back(i);
+        break;
+      }
+      // Any anchored match of the pattern lies within [range_min, range_max]; the longest common
+      // prefix of the range endpoints is therefore a prefix of every match. Fold-case patterns
+      // yield a short (often empty) common prefix and fall back to the side list naturally. An
+      // empty common prefix must NEVER enter the trie (that would make every request a
+      // candidate), hence the side list.
+      size_t common = 0;
+      while (common < range_min.size() && common < range_max.size() &&
+             range_min[common] == range_max[common]) {
+        ++common;
+      }
+      if (common == 0) {
+        route_index_.side_list.push_back(i);
+        break;
+      }
+      const absl::string_view prefix = absl::string_view(range_min).substr(0, common);
+      RouteCandidateIndex::PrefixTrieNode* node = &route_index_.prefix_root;
+      for (const char c : prefix) {
+        auto& child = node->children[c];
+        if (child == nullptr) {
+          child = std::make_unique<RouteCandidateIndex::PrefixTrieNode>();
+        }
+        node = child.get();
+      }
+      node->route_indices.push_back(i);
+      break;
+    }
+    default:
+      // URI-template, connect and any other match kind stay in the ordered side list, which is
+      // scanned for every request so the candidate set remains a superset. (All Regex-kind
+      // routes are handled above; this branch is for genuinely unrepresentable kinds.)
+      route_index_.side_list.push_back(i);
+      break;
+    }
+  }
 }
 
 VirtualHostMatchResult VirtualHostImpl::getRouteFromRoutes(
     const RouteCallback& cb, const RouteMatchContext& route_match_context,
     const StreamInfo::StreamInfo& stream_info, uint64_t random_value,
     absl::Span<const RouteEntryImplBaseConstSharedPtr> routes) const {
+  // Linear path: no candidate selection, every configured route is visited in order.
+  return getRouteFromRoutesWithCandidates(cb, route_match_context, stream_info, random_value,
+                                          routes, absl::nullopt);
+}
+
+VirtualHostMatchResult VirtualHostImpl::getRouteFromRoutesWithCandidates(
+    const RouteCallback& cb, const RouteMatchContext& route_match_context,
+    const StreamInfo::StreamInfo& stream_info, uint64_t random_value,
+    absl::Span<const RouteEntryImplBaseConstSharedPtr> routes,
+    const std::optional<absl::Span<const uint32_t>>& candidates) const {
   const Http::RequestHeaderMap& headers = route_match_context.headers();
   const RouteSpecifierSpan config_specifiers =
       shared_virtual_host_->globalRouteConfig().routeSpecifiers();
 
-  for (auto route = routes.begin(); route != routes.end(); ++route) {
-    if (!headers.Path() && !(*route)->supportsPathlessHeaders()) {
+  // nullopt visits every route in order (linear path). A present candidate set holds route
+  // positions in ascending order -- INCLUDING the empty set, which means the index established
+  // that no configured route can match, so the scan is skipped entirely (every configured route
+  // is either index-represented or carried by the side list, and the side list is part of the
+  // candidate set). A candidate's "no more routes" status is a property of its position in the
+  // configured route list, exactly as in the linear scan.
+  const size_t route_count = routes.size();
+  const bool use_candidates = candidates.has_value();
+  const size_t visit_count = use_candidates ? candidates->size() : route_count;
+  for (size_t position = 0; position < visit_count; ++position) {
+    const uint32_t route_index =
+        use_candidates ? (*candidates)[position] : static_cast<uint32_t>(position);
+    const bool is_last_route = (route_index == route_count - 1);
+    const RouteEntryImplBaseConstSharedPtr& route = routes[route_index];
+
+    if (!headers.Path() && !route->supportsPathlessHeaders()) {
       continue;
     }
 
-    if (!(*route)->matches(route_match_context, stream_info, random_value)) {
+    if (!route->matches(route_match_context, stream_info, random_value)) {
       continue;
     }
 
-    RouteConstSharedPtr route_entry = (*route)->clusterEntry(headers, stream_info, random_value);
+    RouteConstSharedPtr route_entry = route->clusterEntry(headers, stream_info, random_value);
     if (route_entry == nullptr) {
       continue;
     }
 
-    const RouteSpecifierSpan route_specifiers = (*route)->routeSpecifiers();
+    const RouteSpecifierSpan route_specifiers = route->routeSpecifiers();
     const bool has_route_specifiers =
         !config_specifiers.empty() || !route_specifiers_.empty() || !route_specifiers.empty();
     if (has_route_specifiers) {
-      const OnRouteInputStatus input_status = (std::next(route) == routes.end())
-                                                  ? OnRouteInputStatus::NoMoreRoutes
-                                                  : OnRouteInputStatus::HasMoreRoutes;
+      const OnRouteInputStatus input_status =
+          is_last_route ? OnRouteInputStatus::NoMoreRoutes : OnRouteInputStatus::HasMoreRoutes;
       OnRouteResult result =
           applyRouteSpecifiers(std::move(route_entry), config_specifiers, route_specifiers_,
                                route_specifiers, headers, stream_info, random_value, input_status);
@@ -1972,9 +2172,8 @@ VirtualHostMatchResult VirtualHostImpl::getRouteFromRoutes(
       return {std::move(route_entry), true};
     }
 
-    RouteEvalStatus eval_status = (std::next(route) == routes.end())
-                                      ? RouteEvalStatus::NoMoreRoutes
-                                      : RouteEvalStatus::HasMoreRoutes;
+    const RouteEvalStatus eval_status =
+        is_last_route ? RouteEvalStatus::NoMoreRoutes : RouteEvalStatus::HasMoreRoutes;
     RouteMatchStatus match_status = cb(route_entry, eval_status);
     if (match_status == RouteMatchStatus::Accept) {
       return {std::move(route_entry), true};
@@ -2046,7 +2245,22 @@ VirtualHostImpl::getRouteFromEntries(const RouteCallback& cb, const Http::Reques
     return {};
   }
 
-  // Check for a route that matches the request.
+  // Check for a route that matches the request. With the config-time route index enabled, only
+  // the candidate routes it selects are visited, still in configured route order, and an empty
+  // candidate set is a genuine no-match returned without evaluating any route: every configured
+  // route is either represented in the index or carried by the side list (which contributes its
+  // positions to the candidate set), so nothing can match. Without the index every route is
+  // visited in order.
+  if (route_index_.enabled) {
+    absl::InlinedVector<uint32_t, 8> candidates;
+    route_index_.collectCandidates(route_match_context.sanitizedPathWithoutQuery(), candidates);
+    if (candidates.empty()) {
+      ENVOY_LOG(debug, "route index produced no candidates; no route matches");
+      return {};
+    }
+    return getRouteFromRoutesWithCandidates(cb, route_match_context, stream_info, random_value,
+                                            routes_, absl::MakeSpan(candidates));
+  }
   return getRouteFromRoutes(cb, route_match_context, stream_info, random_value, routes_);
 }
 
