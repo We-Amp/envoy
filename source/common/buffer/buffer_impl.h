@@ -114,6 +114,7 @@ public:
   Slice& operator=(Slice&& rhs) noexcept {
     if (this != &rhs) {
       callAndClearDrainTrackersAndCharges();
+      maybeRecycleStorage();
 
       capacity_ = rhs.capacity_;
       storage_ = std::move(rhs.storage_);
@@ -142,6 +143,7 @@ public:
     if (releasor_) {
       releasor_();
     }
+    maybeRecycleStorage();
   }
 
   /**
@@ -344,6 +346,18 @@ public:
 
   static constexpr uint32_t default_slice_size_ = 16384;
 
+  static constexpr uint32_t free_list_max_ = Buffer::Reservation::MAX_SLICES_;
+  using StorageFreeList = absl::InlinedVector<StoragePtr, free_list_max_>;
+
+  /**
+   * Simple thread local cache of default-size storage, used to reduce memory allocation and release
+   * for reservations and for slices built from them. It holds at most `free_list_max_` blocks.
+   * Thread local resolving introduces additional overhead, so callers on hot paths should resolve
+   * the reference once.
+   * @return this thread's free list of default-size storage.
+   */
+  static StorageFreeList& storageFreeList();
+
 public:
   /**
    * Compute a slice size big enough to hold a specified amount of data.
@@ -396,6 +410,25 @@ protected:
 
   /** The releasor for the BufferFragment */
   std::function<void()> releasor_;
+
+private:
+  /**
+   * Called when this slice drops its storage, after its charges have been released. Owned storage
+   * of exactly the default size goes to the thread-local free list instead of being freed, so that
+   * reservations reuse it. All owned storage is a `new uint8_t[capacity_]` block, so such a block
+   * is interchangeable with one that the free list would allocate.
+   */
+  void maybeRecycleStorage() {
+    if (capacity_ == default_slice_size_ && storage_ != nullptr) {
+      recycleStorage(storage_);
+    }
+  }
+
+  /**
+   * Moves `storage` into this thread's free list if there is room. Otherwise `storage` is left
+   * untouched and its owner frees it as usual.
+   */
+  static void recycleStorage(StoragePtr& storage);
 };
 
 class OwnedImpl;
@@ -775,14 +808,12 @@ private:
 
   struct OwnedImplReservationSlicesOwnerMultiple : public OwnedImplReservationSlicesOwner {
   public:
-    static constexpr uint32_t free_list_max_ = Buffer::Reservation::MAX_SLICES_;
-
-    OwnedImplReservationSlicesOwnerMultiple() : free_list_ref_(free_list_) {}
+    OwnedImplReservationSlicesOwnerMultiple() : free_list_ref_(Slice::storageFreeList()) {}
     ~OwnedImplReservationSlicesOwnerMultiple() override {
       for (auto r = owned_storages_.rbegin(); r != owned_storages_.rend(); r++) {
         if (r->mem_ != nullptr) {
           ASSERT(r->len_ == Slice::default_slice_size_);
-          if (free_list_ref_.size() < free_list_max_) {
+          if (free_list_ref_.size() < Slice::free_list_max_) {
             free_list_ref_.push_back(std::move(r->mem_));
           }
         }
@@ -812,12 +843,7 @@ private:
   private:
     // Thread local resolving introduces additional overhead. Initialize this reference once when
     // constructing the owner to reduce thread local resolving to improve performance.
-    absl::InlinedVector<Slice::StoragePtr, free_list_max_>& free_list_ref_;
-
-    // Simple thread local cache to reduce unnecessary memory allocation and release. This cache
-    // is currently only used for multiple slices reservation because of the additional overhead
-    // that thread local resolving would introduce.
-    static thread_local absl::InlinedVector<Slice::StoragePtr, free_list_max_> free_list_;
+    Slice::StorageFreeList& free_list_ref_;
   };
 
   struct OwnedImplReservationSlicesOwnerSingle : public OwnedImplReservationSlicesOwner {

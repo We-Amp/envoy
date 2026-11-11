@@ -969,16 +969,18 @@ TEST_F(OwnedImplTest, SliceFreeList) {
     EXPECT_EQ(slices[1], b2.getRawSlices()[0].mem_);
   }
 
+  // Draining the committed slice returns its default-size storage to the free list.
   b1.drain(1);
   EXPECT_EQ(0, b1.getRawSlices().size());
   {
     auto r = b2.reserveForRead();
     // slices()[0] is the partially used slice that is already part of this buffer.
-    EXPECT_EQ(slices[2], r.slices()[1].mem_);
+    EXPECT_EQ(slices[0], r.slices()[1].mem_);
+    EXPECT_EQ(slices[2], r.slices()[2].mem_);
   }
   {
     auto r = b1.reserveForRead();
-    EXPECT_EQ(slices[2], r.slices()[0].mem_);
+    EXPECT_EQ(slices[0], r.slices()[0].mem_);
   }
   {
     // This causes an underflow in the `freelist` on creation, and overflows it on deletion.
@@ -993,6 +995,96 @@ TEST_F(OwnedImplTest, SliceFreeList) {
       }
     }
   }
+}
+
+// Storage of a committed default-size slice is recycled when the slice is drained.
+TEST_F(OwnedImplTest, SliceFreeListRecyclesDrainedSlice) {
+  Slice::StorageFreeList& free_list = Slice::storageFreeList();
+  free_list.clear();
+
+  Buffer::OwnedImpl buffer;
+  void* storage = nullptr;
+  {
+    auto r = buffer.reserveForReadWithLengthForTest(Slice::default_slice_size_);
+    ASSERT_EQ(1, r.numSlices());
+    storage = r.slices()[0].mem_;
+    r.commit(100);
+  }
+  EXPECT_EQ(0, free_list.size());
+
+  // Partially draining keeps the slice and its storage in the buffer.
+  buffer.drain(50);
+  EXPECT_EQ(0, free_list.size());
+
+  buffer.drain(50);
+  ASSERT_EQ(1, free_list.size());
+  EXPECT_EQ(storage, free_list.back().get());
+
+  // The next read reservation reuses the recycled storage.
+  {
+    auto r = buffer.reserveForReadWithLengthForTest(Slice::default_slice_size_);
+    ASSERT_EQ(1, r.numSlices());
+    EXPECT_EQ(storage, r.slices()[0].mem_);
+    EXPECT_EQ(0, free_list.size());
+    r.commit(Slice::default_slice_size_);
+  }
+
+  // Destroying a buffer recycles its default-size slices too.
+  {
+    Buffer::OwnedImpl other;
+    other.move(buffer);
+    EXPECT_EQ(0, free_list.size());
+  }
+  ASSERT_EQ(1, free_list.size());
+  EXPECT_EQ(storage, free_list.back().get());
+  free_list.clear();
+}
+
+// The free list never holds more than `Slice::free_list_max_` blocks.
+TEST_F(OwnedImplTest, SliceFreeListBound) {
+  Slice::StorageFreeList& free_list = Slice::storageFreeList();
+  free_list.clear();
+
+  Buffer::OwnedImpl buffer;
+  const uint32_t num_slices = Slice::free_list_max_ + 2;
+  for (uint32_t i = 0; i < num_slices; i++) {
+    auto r = buffer.reserveForReadWithLengthForTest(Slice::default_slice_size_);
+    ASSERT_EQ(1, r.numSlices());
+    r.commit(Slice::default_slice_size_);
+  }
+  EXPECT_EQ(num_slices, buffer.describeSlicesForTest().size());
+  EXPECT_EQ(0, free_list.size());
+
+  buffer.drain(buffer.length());
+  EXPECT_EQ(Slice::free_list_max_, free_list.size());
+  free_list.clear();
+}
+
+// Slices whose storage is not exactly default-size, or not owned, are not recycled.
+TEST_F(OwnedImplTest, SliceFreeListIgnoresOtherSlices) {
+  Slice::StorageFreeList& free_list = Slice::storageFreeList();
+  free_list.clear();
+
+  Buffer::OwnedImpl buffer;
+  // A small owned slice.
+  buffer.add(std::string(100, 'a'));
+  // A larger than default owned slice.
+  {
+    auto r = buffer.reserveSingleSlice(Slice::default_slice_size_ + 1, true);
+    r.commit(Slice::default_slice_size_ + 1);
+  }
+  // An unowned slice.
+  const std::string input = "Hello, world";
+  bool fragment_released = false;
+  BufferFragmentImpl fragment(
+      input.c_str(), input.size(),
+      [&](const void*, size_t, const BufferFragmentImpl*) { fragment_released = true; });
+  buffer.addBufferFragment(fragment);
+  expectSlices({{100, 3996, 4096}, {16385, 4095, 20480}, {12, 0, 12}}, buffer);
+
+  buffer.drain(buffer.length());
+  EXPECT_TRUE(fragment_released);
+  EXPECT_EQ(0, free_list.size());
 }
 
 TEST_F(OwnedImplTest, Search) {

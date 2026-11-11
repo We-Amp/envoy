@@ -91,6 +91,52 @@ TEST_F(BufferMemoryAccountTest, ManagesAccountBalance) {
   account->clearDownstream();
 }
 
+// A charged default-size slice is credited before its storage goes to the free list, and the
+// recycled storage is charged only to the account of the buffer that reuses it.
+TEST_F(BufferMemoryAccountTest, RecycledSliceStorageCarriesNoCharge) {
+  Slice::StorageFreeList& free_list = Slice::storageFreeList();
+  free_list.clear();
+
+  auto account = factory_.createAccount(mock_reset_handler_);
+  Buffer::OwnedImpl accounted_buffer(account);
+  void* storage = nullptr;
+  {
+    auto r = accounted_buffer.reserveForReadWithLengthForTest(Slice::default_slice_size_);
+    storage = r.slices()[0].mem_;
+    r.commit(10);
+  }
+  EXPECT_EQ(getBalance(account), Slice::default_slice_size_);
+
+  accounted_buffer.drain(10);
+  EXPECT_EQ(getBalance(account), 0);
+  ASSERT_EQ(1, free_list.size());
+  EXPECT_EQ(storage, free_list.back().get());
+
+  // Reused by a buffer without an account: the original account stays at zero.
+  Buffer::OwnedImpl unaccounted_buffer;
+  {
+    auto r = unaccounted_buffer.reserveForReadWithLengthForTest(Slice::default_slice_size_);
+    EXPECT_EQ(storage, r.slices()[0].mem_);
+    r.commit(10);
+  }
+  EXPECT_EQ(getBalance(account), 0);
+  unaccounted_buffer.drain(10);
+  EXPECT_EQ(getBalance(account), 0);
+
+  // Reused by the accounted buffer again: charged exactly once more, credited once on drain.
+  {
+    auto r = accounted_buffer.reserveForReadWithLengthForTest(Slice::default_slice_size_);
+    EXPECT_EQ(storage, r.slices()[0].mem_);
+    r.commit(10);
+  }
+  EXPECT_EQ(getBalance(account), Slice::default_slice_size_);
+  accounted_buffer.drain(10);
+  EXPECT_EQ(getBalance(account), 0);
+
+  free_list.clear();
+  account->clearDownstream();
+}
+
 TEST_F(BufferMemoryAccountTest, BufferAccountsForUnownedSliceMovedInto) {
   auto account = factory_.createAccount(mock_reset_handler_);
   Buffer::OwnedImpl accounted_buffer(account);

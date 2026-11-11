@@ -17,11 +17,33 @@ namespace {
 // TODO(yanavlasov): This may not be optimal for all hardware configurations or traffic patterns and
 // may need to be configurable in the future.
 constexpr uint64_t CopyThreshold = 512;
+
+// Set once this thread's storage free list has been destroyed at thread exit. It is trivially
+// destructible, so slices destroyed later in thread or process teardown can still read it.
+thread_local bool storage_free_list_destroyed = false;
+
+struct ThreadStorageFreeList {
+  ~ThreadStorageFreeList() { storage_free_list_destroyed = true; }
+  Slice::StorageFreeList storages_;
+};
+thread_local ThreadStorageFreeList thread_storage_free_list;
 } // namespace
 
-thread_local absl::InlinedVector<Slice::StoragePtr,
-                                 OwnedImpl::OwnedImplReservationSlicesOwnerMultiple::free_list_max_>
-    OwnedImpl::OwnedImplReservationSlicesOwnerMultiple::free_list_;
+Slice::StorageFreeList& Slice::storageFreeList() { return thread_storage_free_list.storages_; }
+
+void Slice::recycleStorage(StoragePtr& storage) {
+  // The free list is thread local, so no locking is needed. Storage allocated on one thread may be
+  // recycled into another thread's list; that is fine because it is a plain new[] block. The
+  // caller has already released the slice's account charge, and accounts are charged per slice,
+  // not per block, so recycled storage never carries a charge.
+  if (storage_free_list_destroyed) {
+    return;
+  }
+  StorageFreeList& free_list = storageFreeList();
+  if (free_list.size() < free_list_max_) {
+    free_list.push_back(std::move(storage));
+  }
+}
 
 uint64_t Slice::prepend(const void* data, uint64_t size) {
   const uint8_t* src = static_cast<const uint8_t*>(data);
