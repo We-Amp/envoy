@@ -4,9 +4,12 @@
 // When a header block is larger than the HPACK dynamic table, the unpatched deflater inserts every
 // field and evicts the fields the previous identical block inserted, so no field is ever found in
 // the table. With the guard, the part of the block that fits stays resident and is sent as 1 byte
-// index representations on every later block.
+// index representations on every later block. The guard is enabled only for a header block whose
+// own indexable fields need more room than the table has; every other block is encoded exactly as
+// by unpatched nghttp2.
 
 #include <cstdint>
+#include <deque>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,6 +46,55 @@ HeaderList makeHeaders(char set, size_t n) {
   }
   return headers;
 }
+
+// A date-like field whose value changes per block. Table room: 32 + 4 + 29 = 65 bytes.
+std::pair<std::string, std::string> dateField(size_t n) {
+  std::string value = "Wed, 11 Nov 2026 00:00:00 GMT";
+  value[17] = static_cast<char>('0' + (n / 1000) % 10);
+  value[18] = static_cast<char>('0' + (n / 100) % 10);
+  value[20] = static_cast<char>('0' + (n / 10) % 10);
+  value[21] = static_cast<char>('0' + n % 10);
+  return {"date", value};
+}
+
+// Model of the dynamic table of the UNPATCHED nghttp2 deflater: every field that is not an exact
+// match and is not larger than 3/4 of the table is inserted at the front, and the oldest entries
+// are evicted until the table fits. Only valid for the header names used in these tests (none of
+// them is in nghttp2's never-index list, and no field is an exact static table match).
+class UnpatchedTableModel {
+public:
+  explicit UnpatchedTableModel(size_t max) : max_(max) {}
+
+  void encode(const HeaderList& headers) {
+    for (const auto& field : headers) {
+      bool found = false;
+      for (const auto& entry : entries_) {
+        if (entry == field) {
+          found = true;
+          break;
+        }
+      }
+      const size_t room = kEntryOverhead + field.first.size() + field.second.size();
+      if (found || room > max_ * 3 / 4) {
+        continue;
+      }
+      while (size_ + room > max_ && !entries_.empty()) {
+        const auto& oldest = entries_.back();
+        size_ -= kEntryOverhead + oldest.first.size() + oldest.second.size();
+        entries_.pop_back();
+      }
+      entries_.push_front(field);
+      size_ += room;
+    }
+  }
+
+  HeaderList entries() const { return {entries_.begin(), entries_.end()}; }
+
+private:
+  const size_t max_;
+  size_t size_{0};
+  std::deque<std::pair<std::string, std::string>> entries_;
+};
 
 class HpackEvictionGuardTest : public testing::Test {
 protected:
@@ -110,6 +162,23 @@ protected:
     return nghttp2_hd_deflate_get_num_table_entries(deflater_) - kStaticTableLength;
   }
 
+  // The deflater's dynamic table, newest entry first.
+  HeaderList dynamicTable() {
+    HeaderList table;
+    const size_t n = dynamicEntries();
+    for (size_t i = 0; i < n; ++i) {
+      const nghttp2_nv* nv =
+          nghttp2_hd_deflate_get_table_entry(deflater_, kStaticTableLength + 1 + i);
+      if (nv == nullptr) {
+        ADD_FAILURE() << "missing dynamic table entry " << i;
+        break;
+      }
+      table.emplace_back(std::string(reinterpret_cast<const char*>(nv->name), nv->namelen),
+                         std::string(reinterpret_cast<const char*>(nv->value), nv->valuelen));
+    }
+    return table;
+  }
+
   nghttp2_hd_deflater* deflater_{};
   nghttp2_hd_inflater* inflater_{};
 };
@@ -150,19 +219,85 @@ TEST_F(HpackEvictionGuardTest, FittingHeaderSetFullyIndexed) {
   EXPECT_EQ(30U, roundTrip(headers));
 }
 
-// Two disjoint header sets alternating on one connection, each fitting alone but not together:
-// one set stays resident instead of both thrashing.
-TEST_F(HpackEvictionGuardTest, AlternatingHeaderSetsKeepOneResident) {
+// Two disjoint header sets alternating on one connection, each larger than the table: the leading
+// part of the first set stays resident and keeps hitting instead of both sets thrashing.
+TEST_F(HpackEvictionGuardTest, AlternatingOversizedHeaderSetsKeepOneResident) {
+  const HeaderList a = makeHeaders('c', 45);
+  const HeaderList b = makeHeaders('d', 45);
+
+  const size_t a_first = roundTrip(a);
+  const size_t b_first = roundTrip(b);
+  const size_t a_steady = roundTrip(a);
+  // 39 one-byte indexes plus 6 literals.
+  EXPECT_LT(a_steady * 3, a_first);
+  for (int i = 0; i < 4; ++i) {
+    // b would evict entries a used in the previous block, so it is sent without indexing.
+    EXPECT_EQ(b_first, roundTrip(b));
+    EXPECT_EQ(a_steady, roundTrip(a));
+  }
+  EXPECT_EQ(kFit, dynamicEntries());
+}
+
+// Header blocks that fit the table are encoded exactly as by unpatched nghttp2, also on a
+// long-lived connection where the table is full and churning: after every block the deflater's
+// dynamic table equals the unpatched FIFO model. Identical tables after every block mean every
+// field got the same representation, so the output is byte-for-byte the unpatched output.
+TEST_F(HpackEvictionGuardTest, FittingBlocksMatchUnpatchedTable) {
+  UnpatchedTableModel model(kTableSize);
+  const HeaderList stable = makeHeaders('s', 20);
   const HeaderList a = makeHeaders('c', 30);
   const HeaderList b = makeHeaders('d', 30);
 
-  roundTrip(a);
-  const size_t b_first = roundTrip(b);
-  for (int i = 0; i < 4; ++i) {
-    EXPECT_EQ(30U, roundTrip(a));
-    EXPECT_LT(roundTrip(b), b_first);
+  for (size_t n = 0; n < 150; ++n) {
+    HeaderList block;
+    switch (n % 3) {
+    case 0:
+      block = stable;
+      block.push_back(dateField(n));
+      break;
+    case 1:
+      // Fits alone, but not together with the other blocks: plain FIFO churn.
+      block = a;
+      break;
+    default:
+      block = b;
+      block.push_back(dateField(n));
+      break;
+    }
+    roundTrip(block);
+    model.encode(block);
+    ASSERT_EQ(model.entries(), dynamicTable()) << "block " << n;
   }
-  EXPECT_EQ(kFit, dynamicEntries());
+}
+
+// A stable header set that fits, plus a date-like field that changes on every block, over more
+// than two table fills. The table must not freeze: a new value is still indexed once the table is
+// full, so a value that repeats is sent as a 1 byte index.
+TEST_F(HpackEvictionGuardTest, ChangingFieldDoesNotFreezeTable) {
+  UnpatchedTableModel model(kTableSize);
+  const HeaderList stable = makeHeaders('s', 20);
+
+  // 20 * 104 = 2080 bytes stable; each date is 65 bytes, so about 31 dates fill the rest. 120
+  // blocks is close to four fills of that remainder.
+  for (size_t n = 0; n < 120; ++n) {
+    HeaderList block = stable;
+    block.push_back(dateField(n));
+    roundTrip(block);
+    model.encode(block);
+    ASSERT_EQ(model.entries(), dynamicTable()) << "block " << n;
+  }
+
+  // A new value after many fills is still inserted: it is the newest entry.
+  HeaderList block = stable;
+  block.push_back(dateField(9999));
+  roundTrip(block);
+  const HeaderList table = dynamicTable();
+  ASSERT_FALSE(table.empty());
+  EXPECT_EQ(dateField(9999), table.front());
+
+  // Sent again, the repeated value is a 1 byte index. A value never sent before is a literal.
+  EXPECT_EQ(1U, roundTrip({dateField(9999)}));
+  EXPECT_GT(roundTrip({dateField(8888)}), 10U);
 }
 
 // A permanent change of header set is adopted after one block.

@@ -1,5 +1,5 @@
 diff --git a/lib/nghttp2_hd.c b/lib/nghttp2_hd.c
-index 189ae46..d2fcebe 100644
+index 189ae46..30d25a7 100644
 --- a/lib/nghttp2_hd.c
 +++ b/lib/nghttp2_hd.c
 @@ -494,6 +494,7 @@ void nghttp2_hd_entry_init(nghttp2_hd_entry *ent, nghttp2_hd_nv *nv) {
@@ -10,15 +10,16 @@ index 189ae46..d2fcebe 100644
  
    nghttp2_rcbuf_incref(ent->nv.name);
    nghttp2_rcbuf_incref(ent->nv.value);
-@@ -731,6 +732,7 @@ int nghttp2_hd_deflate_init2(nghttp2_hd_deflater *deflater,
+@@ -731,6 +732,8 @@ int nghttp2_hd_deflate_init2(nghttp2_hd_deflater *deflater,
    deflater->deflate_hd_table_bufsize_max = max_deflate_dynamic_table_size;
    deflater->min_hd_table_bufsize_max = UINT32_MAX;
    deflater->disable_huffman = 0;
 +  deflater->block_gen = 0;
++  deflater->guard_eviction = 0;
  
    return 0;
  }
-@@ -1242,7 +1244,7 @@ static int emit_newname_block_nohuffman(nghttp2_bufs *bufs,
+@@ -1242,7 +1245,7 @@ static int emit_newname_block_nohuffman(nghttp2_bufs *bufs,
  
  static int add_hd_table_incremental(nghttp2_hd_context *context,
                                      nghttp2_hd_nv *nv, nghttp2_hd_map *map,
@@ -27,7 +28,7 @@ index 189ae46..d2fcebe 100644
    int rv;
    nghttp2_hd_entry *new_ent;
    size_t room;
-@@ -1295,6 +1297,7 @@ static int add_hd_table_incremental(nghttp2_hd_context *context,
+@@ -1295,6 +1298,7 @@ static int add_hd_table_incremental(nghttp2_hd_context *context,
  
    new_ent->seq = context->next_seq++;
    new_ent->hash = hash;
@@ -35,7 +36,7 @@ index 189ae46..d2fcebe 100644
  
    if (map) {
      hd_map_insert(map, new_ent);
-@@ -1338,9 +1341,9 @@ static search_result search_static_table(const nghttp2_nv *nv, int32_t token,
+@@ -1338,9 +1342,9 @@ static search_result search_static_table(const nghttp2_nv *nv, int32_t token,
  static search_result search_hd_table(nghttp2_hd_context *context,
                                       const nghttp2_nv *nv, int32_t token,
                                       int indexing_mode, nghttp2_hd_map *map,
@@ -47,7 +48,7 @@ index 189ae46..d2fcebe 100644
    int exact_match;
    int name_only = indexing_mode == NGHTTP2_HD_NEVER_INDEXING;
  
-@@ -1355,6 +1358,10 @@ static search_result search_hd_table(nghttp2_hd_context *context,
+@@ -1355,6 +1359,10 @@ static search_result search_hd_table(nghttp2_hd_context *context,
      return res;
    }
  
@@ -58,10 +59,68 @@ index 189ae46..d2fcebe 100644
    res.index = (nghttp2_ssize)(context->next_seq - 1 - ent->seq +
                                NGHTTP2_STATIC_TABLE_LENGTH);
    res.name_value_match = exact_match;
-@@ -1481,6 +1488,34 @@ static int hd_deflate_decide_indexing(nghttp2_hd_deflater *deflater,
+@@ -1481,6 +1489,92 @@ static int hd_deflate_decide_indexing(nghttp2_hd_deflater *deflater,
    return NGHTTP2_HD_WITH_INDEXING;
  }
  
++static int hd_deflate_indexing_mode(nghttp2_hd_deflater *deflater,
++                                    const nghttp2_nv *nv, int32_t token) {
++  /* Don't index authorization header field since it may contain low
++     entropy secret data (e.g., id/password).  Also cookie header
++     field with less than 20 bytes value is also never indexed.  This
++     is the same criteria used in Firefox codebase. */
++  if (token == NGHTTP2_TOKEN_AUTHORIZATION ||
++      (token == NGHTTP2_TOKEN_COOKIE && nv->valuelen < 20) ||
++      (nv->flags & NGHTTP2_NV_FLAG_NO_INDEX)) {
++    return NGHTTP2_HD_NEVER_INDEXING;
++  }
++
++  return hd_deflate_decide_indexing(deflater, nv, token);
++}
++
++/*
++ * Returns nonzero if the header fields in |nva| which would be
++ * indexed need more room than the dynamic table has.  Only such a
++ * header block thrashes the table: each field evicts one the previous
++ * block inserted, and nothing is ever found in the table.
++ */
++static int hd_deflate_block_overflows(nghttp2_hd_deflater *deflater,
++                                      const nghttp2_nv *nva, size_t nvlen) {
++  size_t max = deflater->ctx.hd_table_bufsize_max;
++  size_t demand = 0;
++  size_t i;
++  const nghttp2_nv *nv;
++
++  /* Fast path: the block fits even if every field were indexed. */
++  for (i = 0; i < nvlen && demand <= max; ++i) {
++    demand += entry_room(nva[i].namelen, nva[i].valuelen);
++  }
++
++  if (demand <= max) {
++    return 0;
++  }
++
++  demand = 0;
++
++  for (i = 0; i < nvlen; ++i) {
++    nv = &nva[i];
++
++    if (hd_deflate_indexing_mode(deflater, nv,
++                                 lookup_token(nv->name, nv->namelen)) !=
++        NGHTTP2_HD_WITH_INDEXING) {
++      continue;
++    }
++
++    demand += entry_room(nv->namelen, nv->valuelen);
++
++    if (demand > max) {
++      return 1;
++    }
++  }
++
++  return 0;
++}
++
 +/*
 + * Returns nonzero if making room for a new entry of |room| bytes in
 + * the dynamic table would evict an entry which was inserted or
@@ -93,8 +152,20 @@ index 189ae46..d2fcebe 100644
  static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
                        const nghttp2_nv *nv) {
    int rv;
-@@ -1514,7 +1549,7 @@ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
-                     : hd_deflate_decide_indexing(deflater, nv, token);
+@@ -1503,18 +1597,10 @@ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
+     hash = static_table[token].hash;
+   }
+ 
+-  /* Don't index authorization header field since it may contain low
+-     entropy secret data (e.g., id/password).  Also cookie header
+-     field with less than 20 bytes value is also never indexed.  This
+-     is the same criteria used in Firefox codebase. */
+-  indexing_mode = token == NGHTTP2_TOKEN_AUTHORIZATION ||
+-                      (token == NGHTTP2_TOKEN_COOKIE && nv->valuelen < 20) ||
+-                      (nv->flags & NGHTTP2_NV_FLAG_NO_INDEX)
+-                    ? NGHTTP2_HD_NEVER_INDEXING
+-                    : hd_deflate_decide_indexing(deflater, nv, token);
++  indexing_mode = hd_deflate_indexing_mode(deflater, nv, token);
  
    res = search_hd_table(&deflater->ctx, nv, token, indexing_mode,
 -                        &deflater->map, hash);
@@ -102,11 +173,11 @@ index 189ae46..d2fcebe 100644
  
    idx = res.index;
  
-@@ -1533,6 +1568,13 @@ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
+@@ -1533,6 +1619,13 @@ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
      DEBUGF("deflatehd: name match index=%td\n", res.index);
    }
  
-+  if (indexing_mode == NGHTTP2_HD_WITH_INDEXING &&
++  if (indexing_mode == NGHTTP2_HD_WITH_INDEXING && deflater->guard_eviction &&
 +      hd_deflate_would_evict_live(deflater,
 +                                  entry_room(nv->namelen, nv->valuelen))) {
 +    DEBUGF("deflatehd: not indexing to keep live entries\n");
@@ -116,7 +187,7 @@ index 189ae46..d2fcebe 100644
    if (indexing_mode == NGHTTP2_HD_WITH_INDEXING) {
      nghttp2_hd_nv hd_nv;
  
-@@ -1556,7 +1598,8 @@ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
+@@ -1556,7 +1649,8 @@ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
      hd_nv.token = token;
      hd_nv.flags = NGHTTP2_NV_FLAG_NONE;
  
@@ -126,7 +197,7 @@ index 189ae46..d2fcebe 100644
  
      nghttp2_rcbuf_decref(hd_nv.value);
      nghttp2_rcbuf_decref(hd_nv.name);
-@@ -1596,6 +1639,8 @@ int nghttp2_hd_deflate_hd_bufs(nghttp2_hd_deflater *deflater,
+@@ -1596,6 +1690,8 @@ int nghttp2_hd_deflate_hd_bufs(nghttp2_hd_deflater *deflater,
      return NGHTTP2_ERR_HEADER_COMP;
    }
  
@@ -135,7 +206,17 @@ index 189ae46..d2fcebe 100644
    if (deflater->notify_table_size_change) {
      size_t min_hd_table_bufsize_max;
  
-@@ -1931,7 +1976,7 @@ static int hd_inflate_commit_newname(nghttp2_hd_inflater *inflater,
+@@ -1619,6 +1715,9 @@ int nghttp2_hd_deflate_hd_bufs(nghttp2_hd_deflater *deflater,
+     }
+   }
+ 
++  deflater->guard_eviction =
++    (uint8_t)hd_deflate_block_overflows(deflater, nv, nvlen);
++
+   for (i = 0; i < nvlen; ++i) {
+     rv = deflate_nv(deflater, bufs, &nv[i]);
+     if (rv != 0) {
+@@ -1931,7 +2030,7 @@ static int hd_inflate_commit_newname(nghttp2_hd_inflater *inflater,
    nv.token = lookup_token(inflater->namercbuf->base, inflater->namercbuf->len);
  
    if (inflater->index_required) {
@@ -144,7 +225,7 @@ index 189ae46..d2fcebe 100644
  
      if (rv != 0) {
        return rv;
-@@ -1978,7 +2023,7 @@ static int hd_inflate_commit_indname(nghttp2_hd_inflater *inflater,
+@@ -1978,7 +2077,7 @@ static int hd_inflate_commit_indname(nghttp2_hd_inflater *inflater,
    nv.value = inflater->valuercbuf;
  
    if (inflater->index_required) {
@@ -154,7 +235,7 @@ index 189ae46..d2fcebe 100644
        nghttp2_rcbuf_decref(nv.name);
        return NGHTTP2_ERR_NOMEM;
 diff --git a/lib/nghttp2_hd.h b/lib/nghttp2_hd.h
-index 817a04d..89a1cd0 100644
+index 817a04d..e68257b 100644
 --- a/lib/nghttp2_hd.h
 +++ b/lib/nghttp2_hd.h
 @@ -145,6 +145,10 @@ struct nghttp2_hd_entry {
@@ -168,14 +249,18 @@ index 817a04d..89a1cd0 100644
  };
  
  /* The entry used for static header table. */
-@@ -229,6 +233,10 @@ struct nghttp2_hd_deflater {
+@@ -229,6 +233,14 @@ struct nghttp2_hd_deflater {
    uint8_t notify_table_size_change;
    /* Whether the deflater should not huffman encode header */
    uint8_t disable_huffman;
 +  /* Header block generation.  Incremented once per header block
-+     encoded.  Used to avoid evicting entries which were used by the
-+     current or the previous header block. */
++     encoded. */
 +  uint32_t block_gen;
++  /* Nonzero if the fields of the current header block which would be
++     indexed need more room than the dynamic table has.  Only then,
++     entries used by the current or the previous header block are not
++     evicted to make room for a new entry. */
++  uint8_t guard_eviction;
  };
  
  struct nghttp2_hd_inflater {
