@@ -1,0 +1,385 @@
+--- a/lib/nghttp2_hd.h
++++ b/lib/nghttp2_hd.h
+@@ -145,6 +145,10 @@
+   uint32_t seq;
+   /* The hash value for header name (nv.name). */
+   uint32_t hash;
++  /* Deflater only: the value of nghttp2_hd_deflater.block_gen when
++     this entry was last inserted or referenced by an exact match.
++     Always 0 in the inflater. */
++  uint32_t last_used;
+ };
+ 
+ /* The entry used for static header table. */
+@@ -229,6 +233,10 @@
+   uint8_t notify_table_size_change;
+   /* Whether the deflater should not huffman encode header */
+   uint8_t disable_huffman;
++  /* Header block generation.  Incremented once per header block
++     encoded.  Used to avoid evicting entries which were used by the
++     current or the previous header block. */
++  uint32_t block_gen;
+ };
+ 
+ struct nghttp2_hd_inflater {
+--- a/lib/nghttp2_hd.c
++++ b/lib/nghttp2_hd.c
+@@ -494,6 +494,7 @@
+   ent->cnv.flags = nv->flags;
+   ent->next = NULL;
+   ent->hash = 0;
++  ent->last_used = 0;
+ 
+   nghttp2_rcbuf_incref(ent->nv.name);
+   nghttp2_rcbuf_incref(ent->nv.value);
+@@ -731,6 +732,7 @@
+   deflater->deflate_hd_table_bufsize_max = max_deflate_dynamic_table_size;
+   deflater->min_hd_table_bufsize_max = UINT32_MAX;
+   deflater->disable_huffman = 0;
++  deflater->block_gen = 0;
+ 
+   return 0;
+ }
+@@ -1242,7 +1244,7 @@
+ 
+ static int add_hd_table_incremental(nghttp2_hd_context *context,
+                                     nghttp2_hd_nv *nv, nghttp2_hd_map *map,
+-                                    uint32_t hash) {
++                                    uint32_t hash, uint32_t gen) {
+   int rv;
+   nghttp2_hd_entry *new_ent;
+   size_t room;
+@@ -1295,6 +1297,7 @@
+ 
+   new_ent->seq = context->next_seq++;
+   new_ent->hash = hash;
++  new_ent->last_used = gen;
+ 
+   if (map) {
+     hd_map_insert(map, new_ent);
+@@ -1338,9 +1341,9 @@
+ static search_result search_hd_table(nghttp2_hd_context *context,
+                                      const nghttp2_nv *nv, int32_t token,
+                                      int indexing_mode, nghttp2_hd_map *map,
+-                                     uint32_t hash) {
++                                     uint32_t hash, uint32_t gen) {
+   search_result res = {-1, 0};
+-  const nghttp2_hd_entry *ent;
++  nghttp2_hd_entry *ent;
+   int exact_match;
+   int name_only = indexing_mode == NGHTTP2_HD_NEVER_INDEXING;
+ 
+@@ -1355,6 +1358,10 @@
+     return res;
+   }
+ 
++  if (exact_match) {
++    ent->last_used = gen;
++  }
++
+   res.index = (nghttp2_ssize)(context->next_seq - 1 - ent->seq +
+                               NGHTTP2_STATIC_TABLE_LENGTH);
+   res.name_value_match = exact_match;
+@@ -1481,6 +1488,34 @@
+   return NGHTTP2_HD_WITH_INDEXING;
+ }
+ 
++/*
++ * Returns nonzero if making room for a new entry of |room| bytes in
++ * the dynamic table would evict an entry which was inserted or
++ * referenced while encoding the current or the previous header
++ * block.  Evicting such an entry is likely to cost more than
++ * indexing the new one gains: when a header block is larger than the
++ * dynamic table, inserting every field evicts the fields the
++ * previous block inserted, and no field is ever found in the table.
++ */
++static int hd_deflate_would_evict_live(nghttp2_hd_deflater *deflater,
++                                       size_t room) {
++  nghttp2_hd_context *ctx = &deflater->ctx;
++  size_t bufsize = ctx->hd_table_bufsize;
++  size_t i;
++  nghttp2_hd_entry *ent;
++
++  for (i = ctx->hd_table.len;
++       i > 0 && bufsize + room > ctx->hd_table_bufsize_max; --i) {
++    ent = hd_ringbuf_get(&ctx->hd_table, i - 1);
++    if ((uint32_t)(deflater->block_gen - ent->last_used) <= 1) {
++      return 1;
++    }
++    bufsize -= entry_room(ent->nv.name->len, ent->nv.value->len);
++  }
++
++  return 0;
++}
++
+ static int deflate_nv(nghttp2_hd_deflater *deflater, nghttp2_bufs *bufs,
+                       const nghttp2_nv *nv) {
+   int rv;
+@@ -1514,7 +1549,7 @@
+                     : hd_deflate_decide_indexing(deflater, nv, token);
+ 
+   res = search_hd_table(&deflater->ctx, nv, token, indexing_mode,
+-                        &deflater->map, hash);
++                        &deflater->map, hash, deflater->block_gen);
+ 
+   idx = res.index;
+ 
+@@ -1533,6 +1568,13 @@
+     DEBUGF("deflatehd: name match index=%td\n", res.index);
+   }
+ 
++  if (indexing_mode == NGHTTP2_HD_WITH_INDEXING &&
++      hd_deflate_would_evict_live(deflater,
++                                  entry_room(nv->namelen, nv->valuelen))) {
++    DEBUGF("deflatehd: not indexing to keep live entries\n");
++    indexing_mode = NGHTTP2_HD_WITHOUT_INDEXING;
++  }
++
+   if (indexing_mode == NGHTTP2_HD_WITH_INDEXING) {
+     nghttp2_hd_nv hd_nv;
+ 
+@@ -1556,7 +1598,8 @@
+     hd_nv.token = token;
+     hd_nv.flags = NGHTTP2_NV_FLAG_NONE;
+ 
+-    rv = add_hd_table_incremental(&deflater->ctx, &hd_nv, &deflater->map, hash);
++    rv = add_hd_table_incremental(&deflater->ctx, &hd_nv, &deflater->map, hash,
++                                  deflater->block_gen);
+ 
+     nghttp2_rcbuf_decref(hd_nv.value);
+     nghttp2_rcbuf_decref(hd_nv.name);
+@@ -1596,6 +1639,8 @@
+     return NGHTTP2_ERR_HEADER_COMP;
+   }
+ 
++  ++deflater->block_gen;
++
+   if (deflater->notify_table_size_change) {
+     size_t min_hd_table_bufsize_max;
+ 
+@@ -1931,7 +1976,7 @@
+   nv.token = lookup_token(inflater->namercbuf->base, inflater->namercbuf->len);
+ 
+   if (inflater->index_required) {
+-    rv = add_hd_table_incremental(&inflater->ctx, &nv, NULL, 0);
++    rv = add_hd_table_incremental(&inflater->ctx, &nv, NULL, 0, 0);
+ 
+     if (rv != 0) {
+       return rv;
+@@ -1978,7 +2023,7 @@
+   nv.value = inflater->valuercbuf;
+ 
+   if (inflater->index_required) {
+-    rv = add_hd_table_incremental(&inflater->ctx, &nv, NULL, 0);
++    rv = add_hd_table_incremental(&inflater->ctx, &nv, NULL, 0, 0);
+     if (rv != 0) {
+       nghttp2_rcbuf_decref(nv.name);
+       return NGHTTP2_ERR_NOMEM;
+--- a/tests/nghttp2_hd_test.h
++++ b/tests/nghttp2_hd_test.h
+@@ -51,6 +51,7 @@
+ munit_void_test_decl(test_nghttp2_hd_change_table_size)
+ munit_void_test_decl(test_nghttp2_hd_deflate_inflate)
+ munit_void_test_decl(test_nghttp2_hd_no_index)
++munit_void_test_decl(test_nghttp2_hd_deflate_self_eviction_guard)
+ munit_void_test_decl(test_nghttp2_hd_deflate_bound)
+ munit_void_test_decl(test_nghttp2_hd_public_api)
+ munit_void_test_decl(test_nghttp2_hd_deflate_hd_vec)
+--- a/tests/nghttp2_hd_test.c
++++ b/tests/nghttp2_hd_test.c
+@@ -51,6 +51,7 @@
+   munit_void_test(test_nghttp2_hd_change_table_size),
+   munit_void_test(test_nghttp2_hd_deflate_inflate),
+   munit_void_test(test_nghttp2_hd_no_index),
++  munit_void_test(test_nghttp2_hd_deflate_self_eviction_guard),
+   munit_void_test(test_nghttp2_hd_deflate_bound),
+   munit_void_test(test_nghttp2_hd_public_api),
+   munit_void_test(test_nghttp2_hd_deflate_hd_vec),
+@@ -1246,8 +1247,187 @@
+   }
+ 
+   nva_out_reset(&out, mem);
++
++  nghttp2_bufs_free(&bufs);
++  nghttp2_hd_inflate_free(&inflater);
++  nghttp2_hd_deflate_free(&deflater);
++}
++
++#define GUARD_NAMELEN 10
++#define GUARD_VALUELEN 62
++/* entry_room() of one guard header field */
++#define GUARD_ROOM (NGHTTP2_HD_ENTRY_OVERHEAD + GUARD_NAMELEN + GUARD_VALUELEN)
++#define GUARD_MAX_NV 52
++
++typedef struct {
++  nghttp2_nv nva[GUARD_MAX_NV];
++  uint8_t names[GUARD_MAX_NV][GUARD_NAMELEN + 1];
++  uint8_t values[GUARD_MAX_NV][GUARD_VALUELEN];
++  size_t nvlen;
++} guard_nva;
++
++/* Makes |n| distinct header fields "x-<set>-hdr-NN" whose table entry
++   size is GUARD_ROOM each. */
++static void guard_nva_init(guard_nva *g, char set, size_t n) {
++  size_t i;
++
++  assert(n <= GUARD_MAX_NV);
++
++  for (i = 0; i < n; ++i) {
++    snprintf((char *)g->names[i], sizeof(g->names[i]), "x-%c-hdr-%02u", set,
++             (unsigned int)i);
++    memset(g->values[i], 'a' + (int)(i % 26), GUARD_VALUELEN);
++
++    g->nva[i].name = g->names[i];
++    g->nva[i].namelen = GUARD_NAMELEN;
++    g->nva[i].value = g->values[i];
++    g->nva[i].valuelen = GUARD_VALUELEN;
++    g->nva[i].flags = NGHTTP2_NV_FLAG_NONE;
++  }
++
++  g->nvlen = n;
++}
++
++/* Deflates |g| as one header block, checks that |inflater| decodes
++   it back, and returns the length of the block. */
++static nghttp2_ssize guard_round_trip(nghttp2_hd_deflater *deflater,
++                                      nghttp2_hd_inflater *inflater,
++                                      guard_nva *g, nghttp2_mem *mem) {
++  nghttp2_bufs bufs;
++  nghttp2_ssize blocklen;
++  nva_out out;
++  int rv;
+ 
++  frame_pack_bufs_init(&bufs);
++  nva_out_init(&out);
++
++  rv = nghttp2_hd_deflate_hd_bufs(deflater, &bufs, g->nva, g->nvlen);
++  blocklen = (nghttp2_ssize)nghttp2_bufs_len(&bufs);
++
++  assert_int(0, ==, rv);
++  assert_ptrdiff(0, <, blocklen);
++  assert_ptrdiff(blocklen, ==, inflate_hd(inflater, &out, &bufs, 0, mem));
++
++  assert_size(g->nvlen, ==, out.nvlen);
++  assert_nv_equal(g->nva, out.nva, g->nvlen, mem);
++
++  nva_out_reset(&out, mem);
+   nghttp2_bufs_free(&bufs);
++
++  return blocklen;
++}
++
++void test_nghttp2_hd_deflate_self_eviction_guard(void) {
++  nghttp2_hd_deflater deflater;
++  nghttp2_hd_inflater inflater;
++  guard_nva big, other, a, b;
++  nghttp2_ssize len1, len2, len3, len4;
++  const nghttp2_nv *ent;
++  size_t fit;
++  size_t i;
++  nghttp2_mem *mem;
++
++  mem = nghttp2_mem_default();
++
++  /* The number of guard entries a 4096 byte table holds: 39 */
++  fit = 4096 / GUARD_ROOM;
++  assert_size(39, ==, fit);
++
++  /* A constant header block larger than the dynamic table.  Without
++     the guard, every field evicts a field the previous block
++     inserted and nothing is ever found in the table. */
++  guard_nva_init(&big, 'a', GUARD_MAX_NV);
++
++  nghttp2_hd_deflate_init(&deflater, mem);
++  nghttp2_hd_inflate_init(&inflater, mem);
++
++  len1 = guard_round_trip(&deflater, &inflater, &big, mem);
++
++  /* The first 39 fields are indexed; the rest would evict them and
++     are sent as literal without indexing. */
++  assert_size(fit, ==, deflater.ctx.hd_table.len);
++  ent = nghttp2_hd_deflate_get_table_entry(&deflater,
++                                           NGHTTP2_STATIC_TABLE_LENGTH + 1);
++  assert_not_null(ent);
++  assert_memory_equal(GUARD_NAMELEN, big.nva[fit - 1].name, ent->name);
++
++  len2 = guard_round_trip(&deflater, &inflater, &big, mem);
++  len3 = guard_round_trip(&deflater, &inflater, &big, mem);
++
++  /* The 39 resident fields are 1 byte index representations now. */
++  assert_ptrdiff(len2 * 2, <, len1);
++  assert_ptrdiff(len2, ==, len3);
++  assert_size(fit, ==, deflater.ctx.hd_table.len);
++  assert_size(fit, ==, inflater.ctx.hd_table.len);
++
++  /* Shrink the table mid-stream.  The deflater emits a table size
++     update, the decoder follows, and the guard works against the new
++     size. */
++  assert_int(0, ==, nghttp2_hd_inflate_change_table_size(&inflater, 2048));
++  assert_int(0, ==, nghttp2_hd_deflate_change_table_size(&deflater, 2048));
++
++  len1 = guard_round_trip(&deflater, &inflater, &big, mem);
++  assert_size(2048 / GUARD_ROOM, ==, deflater.ctx.hd_table.len);
++  len2 = guard_round_trip(&deflater, &inflater, &big, mem);
++  len3 = guard_round_trip(&deflater, &inflater, &big, mem);
++  assert_ptrdiff(len2, ==, len3);
++  assert_size(2048 / GUARD_ROOM, ==, deflater.ctx.hd_table.len);
++  assert_size(2048 / GUARD_ROOM, ==, inflater.ctx.hd_table.len);
++
++  /* Grow it back.  The free room is filled again. */
++  assert_int(0, ==, nghttp2_hd_inflate_change_table_size(&inflater, 4096));
++  assert_int(0, ==, nghttp2_hd_deflate_change_table_size(&deflater, 4096));
++
++  guard_round_trip(&deflater, &inflater, &big, mem);
++  assert_size(fit, ==, deflater.ctx.hd_table.len);
++  assert_size(fit, ==, inflater.ctx.hd_table.len);
++
++  /* The header set changes for good.  The old entries were used by
++     the previous block, so the first block of the new set is sent
++     without indexing.  After that the old entries are evicted and the
++     new set reaches the same steady state. */
++  guard_nva_init(&other, 'b', GUARD_MAX_NV);
++
++  len1 = guard_round_trip(&deflater, &inflater, &other, mem);
++  len2 = guard_round_trip(&deflater, &inflater, &other, mem);
++  len3 = guard_round_trip(&deflater, &inflater, &other, mem);
++  len4 = guard_round_trip(&deflater, &inflater, &other, mem);
++
++  assert_ptrdiff(len3 * 2, <, len1);
++  assert_ptrdiff(len3, ==, len4);
++  for (i = 0; i < fit; ++i) {
++    ent = nghttp2_hd_deflate_get_table_entry(
++      &deflater, NGHTTP2_STATIC_TABLE_LENGTH + 1 + i);
++    assert_not_null(ent);
++    assert_memory_equal(GUARD_NAMELEN, other.nva[fit - 1 - i].name,
++                        ent->name);
++  }
++
++  nghttp2_hd_inflate_free(&inflater);
++  nghttp2_hd_deflate_free(&deflater);
++
++  /* Two disjoint header sets alternating on one connection.  Each
++     fits in the table alone, but not both.  One set stays resident
++     and is fully indexed. */
++  guard_nva_init(&a, 'c', 30);
++  guard_nva_init(&b, 'd', 30);
++
++  nghttp2_hd_deflate_init(&deflater, mem);
++  nghttp2_hd_inflate_init(&inflater, mem);
++
++  guard_round_trip(&deflater, &inflater, &a, mem);
++  len1 = guard_round_trip(&deflater, &inflater, &b, mem);
++
++  for (i = 0; i < 4; ++i) {
++    /* Every field of a is a 1 byte index representation. */
++    assert_ptrdiff(30, ==, guard_round_trip(&deflater, &inflater, &a, mem));
++    len2 = guard_round_trip(&deflater, &inflater, &b, mem);
++    /* The part of b which fitted the first time is still indexed. */
++    assert_ptrdiff(len2, <, len1);
++  }
++
++  assert_size(fit, ==, deflater.ctx.hd_table.len);
++
+   nghttp2_hd_inflate_free(&inflater);
+   nghttp2_hd_deflate_free(&deflater);
+ }

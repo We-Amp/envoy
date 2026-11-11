@@ -151,6 +151,17 @@ single_version_override(
     version = "3.5.9.envoy",
 )
 
+# HPACK deflater self-eviction guard: do not index a header field when making
+# room for it would evict an entry used by the current or the previous header
+# block. Applied on top of the registry patches of this version.
+# TODO: move into the registry as 1.66.0.envoy.2 and propose upstream.
+single_version_override(
+    module_name = "nghttp2",
+    patch_strip = 1,
+    patches = ["//bazel/external:nghttp2_hpack_eviction_guard.patch"],
+    version = "1.66.0.envoy.1",
+)
+
 # testing/debugging
 # local_path_override(
 #     module_name = "envoy_toolshed",

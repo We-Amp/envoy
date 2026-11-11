@@ -198,6 +198,13 @@ envoy_cc_fuzz_test(
     ],
 )
 
+envoy_cc_test(
+    name = "hpack_eviction_guard_test",
+    srcs = ["hpack_eviction_guard_test.cc"],
+    external_deps = ["nghttp2"],
+    rbe_pool = "linux_x64_small",
+)
+
 envoy_proto_library(
     name = "hpack_fuzz_proto",
     srcs = ["hpack_fuzz.proto"],
