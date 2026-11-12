@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
-#include <limits>
 #include <memory>
 #include <string>
 
@@ -27,8 +26,7 @@ struct ManagedResourceImpl : public BasicResourceLimitImpl {
                       Stats::Gauge& open_gauge, Stats::Gauge& remaining)
       : BasicResourceLimitImpl(max, runtime, runtime_key), open_gauge_(open_gauge),
         remaining_(remaining) {
-    updateRemaining();
-    updateOpenGauge();
+    remaining_.set(max);
   }
 
   // BasicResourceLimitImpl
@@ -60,35 +58,18 @@ struct ManagedResourceImpl : public BasicResourceLimitImpl {
      * unsigned and subtracting them may overflow.
      */
     const uint64_t current_copy = current_;
-    const uint64_t remaining = max() > current_copy ? max() - current_copy : 0;
-    if (remaining_used_.load(std::memory_order_relaxed) &&
-        remaining == last_remaining_.load(std::memory_order_relaxed)) {
-      // The gauge already shows this value; skip the write. Under a race this may
-      // redundantly write, which is semantically identical.
-      return;
-    }
-    last_remaining_.store(remaining, std::memory_order_relaxed);
-    remaining_used_.store(true, std::memory_order_relaxed);
-    remaining_.set(remaining);
+    remaining_.set(max() > current_copy ? max() - current_copy : 0);
   }
 
-  // Sets the open gauge only when the breaker state changes; the Used flag is still set once on
-  // the first write so stats sinks see the gauge as live.
+  // Writes the open gauge only when its value changes (or it is not yet marked used). Reading the
+  // gauge itself keeps no shadow state, so a racing writer can at worst cause a redundant write,
+  // and a stale value is corrected on the next inc/dec exactly as before.
   void updateOpenGauge() {
     const uint64_t open = BasicResourceLimitImpl::canCreate() ? 0 : 1;
-    if (open_gauge_used_.load(std::memory_order_relaxed) &&
-        open == last_open_.load(std::memory_order_relaxed)) {
-      return;
+    if (!open_gauge_.used() || open_gauge_.value() != open) {
+      open_gauge_.set(open);
     }
-    last_open_.store(open, std::memory_order_relaxed);
-    open_gauge_used_.store(true, std::memory_order_relaxed);
-    open_gauge_.set(open);
   }
-
-  std::atomic<uint64_t> last_remaining_{std::numeric_limits<uint64_t>::max()};
-  std::atomic<bool> remaining_used_{false};
-  std::atomic<uint64_t> last_open_{std::numeric_limits<uint64_t>::max()};
-  std::atomic<bool> open_gauge_used_{false};
 
   /**
    * A gauge to notify the live circuit breaker state. The gauge is set to 0
