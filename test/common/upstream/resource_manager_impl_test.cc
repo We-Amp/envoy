@@ -88,6 +88,51 @@ TEST(ResourceManagerImplTest, RuntimeResourceManager) {
   EXPECT_TRUE(resource_manager.retries().canCreate());
 }
 
+// The gauges skip redundant writes: unchanged values are not written again, and the Used flag
+// is set exactly once on the first write.
+TEST(ResourceManagerImplTest, GaugeSkipsUnchangedWritesButSetsUsedOnce) {
+  NiceMock<Runtime::MockLoader> runtime;
+  Stats::IsolatedStoreImpl store;
+  NiceMock<Event::MockDispatcher> dispatcher;
+
+  auto stats = clusterCircuitBreakersStats(store);
+  ResourceManagerImpl resource_manager(
+      runtime, "circuit_breakers.runtime_resource_manager_test.default.", 1, 2, 1, 0, 3, 100, stats,
+      std::nullopt, std::nullopt, std::nullopt, dispatcher);
+
+  auto& cx_open_gauge = stats.cx_open_;
+  auto& cx_remaining_gauge = stats.remaining_cx_;
+
+  // Construction wrote both gauges once: the Used flags are set.
+  EXPECT_EQ(1U, cx_open_gauge.used());
+  EXPECT_EQ(1U, cx_remaining_gauge.used());
+
+  // inc(): current goes 0 -> 1, remaining 1 -> 0, open 0 -> 1 (the breaker is now open at
+  // max=1).
+  resource_manager.connections().inc();
+  EXPECT_EQ(1U, resource_manager.connections().count());
+  EXPECT_EQ(0U, cx_remaining_gauge.value());
+  EXPECT_EQ(1U, cx_open_gauge.value());
+  EXPECT_TRUE(cx_remaining_gauge.used());
+  EXPECT_TRUE(cx_open_gauge.used());
+
+  // dec(): current back to 0, remaining 1, open 0.
+  resource_manager.connections().dec();
+  EXPECT_EQ(1U, cx_remaining_gauge.value());
+  EXPECT_EQ(0U, cx_open_gauge.value());
+
+  // A zero-amount dec() changes nothing: values stay exactly as they were.
+  resource_manager.connections().decBy(0);
+  EXPECT_EQ(1U, cx_remaining_gauge.value());
+  EXPECT_EQ(0U, cx_open_gauge.value());
+
+  // inc() again: remaining stays 0, the open gauge flips to 1.
+  resource_manager.connections().inc();
+  EXPECT_EQ(1U, resource_manager.connections().count());
+  EXPECT_EQ(0U, cx_remaining_gauge.value());
+  EXPECT_EQ(1U, cx_open_gauge.value());
+}
+
 TEST(ResourceManagerImplTest, RemainingResourceGauges) {
   NiceMock<Runtime::MockLoader> runtime;
   Stats::IsolatedStoreImpl store;
