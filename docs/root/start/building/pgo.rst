@@ -7,13 +7,15 @@ Envoy can be built with clang profile-guided optimization (PGO) plus ThinLTO. No
 changes are needed. The compiler uses a profile recorded from a real run to lay out hot code
 together, move cold paths out of the way and guide inlining across translation units.
 
-On the HTTP/1 and HTTP/2 proxy workloads we measured, this reduced CPU time per request by
-roughly a quarter to a third compared with a regular ``-c opt`` build, and improved p99 latency
-slightly. How much you gain depends on your traffic and on how well the training traffic
-matches it, so measure with your own configuration before relying on a number.
+In our measurements, this reduced CPU time per request by roughly a quarter to a third on
+HTTP/1 and HTTP/2 proxy workloads, compared with a regular ``-c opt`` build of the same commit.
+The setup was a dual-socket x86-64 server at a fixed clock, with Envoy on one socket at 4 to 16
+workers and an open-loop Nighthawk client and the origin on the other. How much you gain depends
+on your traffic and on how well the training traffic matches it, so measure with your own
+configuration before relying on a number.
 
-The build uses Bazel's native ``--fdo_optimize`` flag, so the profile is a tracked build input
-and remote and disk caches stay correct when the profile changes.
+The profile is passed with Bazel's native ``--fdo_optimize`` flag, so it is a tracked build
+input: a changed profile rebuilds everything that depends on it.
 
 Requirements
 ------------
@@ -35,9 +37,15 @@ Copy the binary out of ``bazel-bin``, because the optimized build in step 4 repl
 **Step 2: Train**
 
 Run the instrumented binary under representative traffic. :repo:`tools/pgo/train.sh` runs a
-fixed mix of nine one-minute legs at 4 workers: HTTP/1 small, medium and large proxied bodies,
-a many-headers direct response, HTTP/2 and HTTP/3 small and many-headers, and HTTP/1 while
-routes and clusters are updated through file-based xDS. It takes about ten minutes.
+fixed mix of nine one-minute legs at 4 workers, each sending a browser-like set of about 20
+request headers:
+
+* HTTP/1 requests proxied to an origin that returns 4 KiB, 16 KiB and 64 KiB bodies.
+* HTTP/1 requests answered by a direct response that adds 60 response headers.
+* HTTP/2 and HTTP/3 versions of the 4 KiB proxied request and of the direct response.
+* HTTP/1 4 KiB proxied requests while routes and clusters are replaced through file-based xDS.
+
+It takes about ten minutes.
 
 .. code-block:: console
 
@@ -64,11 +72,12 @@ The profile must be merged with ``llvm-profdata`` from the same LLVM version as 
 
 .. code-block:: console
 
-  $ bazel build --config=pgo --fdo_optimize=/tmp/envoy.profdata //source/exe:envoy-static
+  $ bazel build --config=thinlto --fdo_optimize=/tmp/envoy.profdata //source/exe:envoy-static
 
-``--fdo_optimize`` needs an absolute path. ``--config=pgo`` adds ThinLTO
-(``-flto=thin``) and ``--fission=no``. Using ``--fdo_optimize`` without ThinLTO gives about
-two thirds of the gain.
+``--fdo_optimize`` applies the profile and needs an absolute path. ``--config=thinlto`` adds
+ThinLTO (``-flto=thin``) and ``--fission=no``. Without ``--fdo_optimize`` you get a ThinLTO
+build only, with no profile applied. In the same measurements, ``--fdo_optimize`` without
+ThinLTO gave about two thirds of the gain.
 
 Caveats
 -------
@@ -78,8 +87,9 @@ Caveats
   for running out of memory, lower ``--jobs`` or limit Bazel with, for example,
   ``--local_resources=memory=HOST_RAM*.6``.
 * **Binary size.** With ``--fission=no`` the debug information stays in the binary, which can
-  then be several gigabytes. Strip it, or keep the debug information separately, before
-  shipping it. A large unstripped binary is also slow to start from a cold page cache.
+  then be several gigabytes. Build ``//source/exe:envoy-static.stripped``, or keep the debug
+  information separately, before shipping it. A large unstripped binary is also slow to start
+  from a cold page cache.
 * **Profile staleness.** A profile describes the code it was recorded from. Retrain when the
   code changes substantially, or when your traffic changes. Functions that changed since the
   profile was recorded fall back to normal optimization; they are not miscompiled, but they
