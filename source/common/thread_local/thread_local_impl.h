@@ -44,6 +44,7 @@ private:
 
     // ThreadLocal::Slot
     ThreadLocalObjectSharedPtr get() override;
+    ThreadLocalObject* getRaw() override;
     void runOnAllThreads(const UpdateCb& cb) override;
     void runOnAllThreads(const UpdateCb& cb, const std::function<void()>& complete_cb) override;
     bool currentThreadRegistered() override;

@@ -94,6 +94,11 @@ ThreadLocalObjectSharedPtr InstanceImpl::SlotImpl::getWorker(uint32_t index) {
 
 ThreadLocalObjectSharedPtr InstanceImpl::SlotImpl::get() { return getWorker(index_); }
 
+ThreadLocalObject* InstanceImpl::SlotImpl::getRaw() {
+  ASSERT(currentThreadRegisteredWorker(index_));
+  return thread_local_data_.data_[index_].get();
+}
+
 std::function<void()> InstanceImpl::SlotImpl::dataCallback(const UpdateCb& cb) {
   return [weak_slot = weak_from_this(), cb = std::move(cb), index = index_]() mutable {
     if (auto slot = weak_slot.lock()) {

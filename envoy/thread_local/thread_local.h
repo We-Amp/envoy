@@ -38,14 +38,22 @@ public:
   virtual ThreadLocalObjectSharedPtr get() PURE;
 
   /**
+   * @return ThreadLocalObject* the thread local object stored in the slot, without taking a
+   * reference. The slot keeps ownership; the pointer is valid until the slot's data is replaced
+   * or the slot is destroyed. The default implementation goes through get().
+   */
+  virtual ThreadLocalObject* getRaw() { return get().get(); }
+
+  /**
    * This is a helper on top of get() that casts the object stored in the slot to the specified
    * type. Since the slot only stores pointers to the base interface, the static_cast operates
    * in production for performance, and the dynamic_cast validates correctness in tests and debug
    * builds.
    */
   template <class T> T& getTyped() {
-    ASSERT(std::dynamic_pointer_cast<T>(get()) != nullptr);
-    return *static_cast<T*>(get().get());
+    ThreadLocalObject* obj = getRaw();
+    ASSERT(dynamic_cast<T*>(obj) != nullptr);
+    return *static_cast<T*>(obj);
   }
 
   /**
@@ -153,8 +161,8 @@ public:
   /**
    * @return an optional reference to the thread local object.
    */
-  OptRef<T> get() { return getOpt(slot_->get()); }
-  const OptRef<T> get() const { return getOpt(slot_->get()); }
+  OptRef<T> get() { return getOpt(slot_->getRaw()); }
+  const OptRef<T> get() const { return getOpt(slot_->getRaw()); }
 
   /**
    * Helper function to call methods on T. The caller is responsible
@@ -197,8 +205,9 @@ public:
   bool isShutdown() const { return slot_->isShutdown(); };
 
 private:
-  static OptRef<T> getOpt(ThreadLocalObjectSharedPtr obj) {
-    if (obj) {
+  static OptRef<T> getOpt(ThreadLocalObjectSharedPtr obj) { return getOpt(obj.get()); }
+  static OptRef<T> getOpt(ThreadLocalObject* obj) {
+    if (obj != nullptr) {
       return OptRef<T>(obj->asType<T>());
     }
     return OptRef<T>();
