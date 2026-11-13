@@ -309,6 +309,10 @@ bazel build --config=thinlto --fdo_optimize=/abs/path/envoy.profdata //source/ex
 ```
 
 `--config=thinlto` without `--fdo_optimize` is a ThinLTO build only, with no profile applied.
+The config also turns off the profile mismatch warnings, so a profile recorded on another commit
+builds under `-Werror`. An `--fdo_optimize` build without `--config=thinlto` needs those flags
+too (`--copt=-Wno-profile-instr-unprofiled --copt=-Wno-profile-instr-out-of-date
+--copt=-Wno-backend-plugin`), or a profile from another commit fails the build.
 See [Building with profile-guided optimization](../docs/root/start/building/pgo.rst) for the
 details and caveats (ThinLTO backend actions and profile staleness).
 
