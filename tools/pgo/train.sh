@@ -28,12 +28,37 @@ Environment (optional):
   CHURN_HZ      xDS route + cluster updates per second in the xds leg (default: 2)
   ENVOY_CPUS, ORIGIN_CPUS, CLIENT_CPUS
                 CPU lists for taskset, e.g. "0-3". Unset means no pinning.
-  ADMIN_PORT, HTTP_PORT, H3_PORT, ORIGIN_PORT, ORIGIN_ADMIN_PORT
-                loopback ports (defaults: 19901, 19080, 19443, 19081, 19902)
+  HTTP_PORT, H3_PORT, ORIGIN_PORT
+                loopback listener ports (defaults: 19080, 19443 (UDP), 19081). They must be
+                free. Admin interfaces always use a port picked by the kernel.
 EOF
 }
 
 ALL_LEGS="h1-s,h1-fh,h1-m,h1-l,h2-s,h2-fh,h3-s,h3-fh,xds-s"
+
+# A browser-like request header set, sent by the client on every leg.
+REQUEST_HEADERS=(
+  "user-agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  "accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+  "accept-language: en-US,en;q=0.9,de;q=0.8,fr;q=0.7"
+  "accept-encoding: gzip, deflate, br"
+  "cache-control: max-age=0"
+  "referer: https://www.example.com/catalog/items?page=2&sort=price"
+  "cookie: session=6f1c0d2e9b8a4c3f8e7d6c5b4a392817; prefs=lang%3Den%26theme%3Ddark; _ga=GA1.2.1234567890.1700000000"
+  "sec-ch-ua: \"Chromium\";v=\"124\", \"Not-A.Brand\";v=\"99\""
+  "sec-ch-ua-mobile: ?0"
+  "sec-ch-ua-platform: \"Linux\""
+  "sec-fetch-dest: document"
+  "sec-fetch-mode: navigate"
+  "sec-fetch-site: same-origin"
+  "sec-fetch-user: ?1"
+  "upgrade-insecure-requests: 1"
+  "dnt: 1"
+  "priority: u=0, i"
+  "x-forwarded-for: 198.51.100.23"
+  "x-forwarded-proto: https"
+  "x-request-id: 0b6c1f0e-4d1a-4f61-9a43-2d6f7b9c8e15"
+)
 
 ENVOY=""
 NIGHTHAWK=""
@@ -59,11 +84,9 @@ CONCURRENCY="${CONCURRENCY:-4}"
 RPS="${RPS:-500}"
 CONNECTIONS="${CONNECTIONS:-4}"
 CHURN_HZ="${CHURN_HZ:-2}"
-ADMIN_PORT="${ADMIN_PORT:-19901}"
 HTTP_PORT="${HTTP_PORT:-19080}"
 H3_PORT="${H3_PORT:-19443}"
 ORIGIN_PORT="${ORIGIN_PORT:-19081}"
-ORIGIN_ADMIN_PORT="${ORIGIN_ADMIN_PORT:-19902}"
 
 die() {
   echo "ERROR: $*" >&2
@@ -77,6 +100,24 @@ ORIGIN_ENVOY="${ORIGIN_ENVOY:-${ENVOY}}"
 for tool in curl openssl python3; do
   command -v "${tool}" >/dev/null || die "${tool} not found"
 done
+
+# Fails if something already uses the loopback port. TCP is probed with a connect; UDP needs
+# `ss` and is otherwise left to Envoy's own bind failure, which the liveness check catches.
+check_port_free() {
+  local proto="$1" port="$2" in_use=""
+  if [[ "${proto}" == tcp ]]; then
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+      in_use=1
+    fi
+  elif command -v ss >/dev/null && [[ -n "$(ss -H -lun "sport = :${port}")" ]]; then
+    in_use=1
+  fi
+  [[ -z "${in_use}" ]] ||
+    die "${proto} port ${port} is already in use; stop that process or pick another port"
+}
+check_port_free tcp "${HTTP_PORT}"
+check_port_free tcp "${ORIGIN_PORT}"
+check_port_free udp "${H3_PORT}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "${OUT}"
@@ -118,6 +159,10 @@ forget_pid() {
   STARTED_PIDS=("${kept[@]}")
 }
 
+is_running() {
+  jobs -pr | grep -qx "$1"
+}
+
 # Command prefixes for CPU pinning. taskset execs the command, so $! stays the process itself.
 pin_prefix() {
   if [[ -n "$1" ]]; then
@@ -128,28 +173,46 @@ read -r -a ENVOY_PIN <<<"$(pin_prefix "${ENVOY_CPUS:-}")"
 read -r -a ORIGIN_PIN <<<"$(pin_prefix "${ORIGIN_CPUS:-}")"
 read -r -a CLIENT_PIN <<<"$(pin_prefix "${CLIENT_CPUS:-}")"
 
+# Every Envoy binds its admin interface to a kernel-picked port and writes the address to a file
+# of its own (--admin-address-path). The admin address is only ever read from that file, so
+# readiness checks, stats and /quitquitquit can never reach a process this script did not start.
+ADMIN_ADDRESS=""
+
+# wait_ready PID ADDRESS_FILE: waits until PID wrote its admin address and reports ready, then
+# makes sure PID is still alive (a listener that failed to bind makes Envoy exit).
 wait_ready() {
-  local port="$1" pid="$2" i
+  local pid="$1" address_file="$2" i
+  ADMIN_ADDRESS=""
   for ((i = 0; i < 120; i++)); do
-    kill -0 "${pid}" 2>/dev/null || return 1
-    curl -sf "http://127.0.0.1:${port}/ready" >/dev/null && return 0
+    is_running "${pid}" || return 1
+    if [[ -z "${ADMIN_ADDRESS}" && -s "${address_file}" ]]; then
+      ADMIN_ADDRESS="$(<"${address_file}")"
+    fi
+    if [[ -n "${ADMIN_ADDRESS}" ]] && curl -sf "http://${ADMIN_ADDRESS}/ready" >/dev/null; then
+      sleep 1
+      is_running "${pid}" || return 1
+      return 0
+    fi
     sleep 0.5
   done
   return 1
 }
 
 stat_value() {
-  local port="$1" name="$2"
-  curl -sf --get "http://127.0.0.1:${port}/stats" --data-urlencode "filter=^${name}\$" |
+  local address="$1" name="$2"
+  curl -sf --get "http://${address}/stats" --data-urlencode "filter=^${name}\$" |
     awk -F': ' -v n="${name}" '$1 == n { print $2 }'
 }
 
-# Graceful stop through the admin API, so the instrumented binary writes its profile at exit.
+# Graceful stop through the admin API of our own process, so the instrumented binary writes its
+# profile at exit.
 quit_envoy() {
-  local port="$1" pid="$2" i
-  curl -sf -X POST "http://127.0.0.1:${port}/quitquitquit" >/dev/null || true
+  local address="$1" pid="$2" i
+  if is_running "${pid}"; then
+    curl -sf -X POST "http://${address}/quitquitquit" >/dev/null || true
+  fi
   for ((i = 0; i < 120; i++)); do
-    jobs -pr | grep -qx "${pid}" || break
+    is_running "${pid}" || break
     sleep 0.5
   done
   stop_pid "${pid}"
@@ -166,64 +229,79 @@ H3_TRANSPORT_SOCKET="$(printf '{"name":"envoy.transport_sockets.quic","typed_con
 
 echo "== writing Envoy configurations to ${OUT}"
 python3 "${SCRIPT_DIR}/gen_config.py" --out "${OUT}" --tls-dir "${TLS_DIR}" \
-  --admin-port "${ADMIN_PORT}" --http-port "${HTTP_PORT}" --h3-port "${H3_PORT}" \
-  --origin-port "${ORIGIN_PORT}" --origin-admin-port "${ORIGIN_ADMIN_PORT}"
+  --http-port "${HTTP_PORT}" --h3-port "${H3_PORT}" --origin-port "${ORIGIN_PORT}"
 
 echo "== starting the origin"
+ORIGIN_ADDRESS_FILE="${LOG_DIR}/origin.admin"
+rm -f "${ORIGIN_ADDRESS_FILE}"
 LLVM_PROFILE_FILE="${OUT}/origin-profile/origin-%p.profraw" \
   "${ORIGIN_PIN[@]}" "${ORIGIN_ENVOY}" -c "${OUT}/origin.json" \
+  --admin-address-path "${ORIGIN_ADDRESS_FILE}" \
   --concurrency "${CONCURRENCY}" --disable-hot-restart -l error \
   >"${LOG_DIR}/origin.log" 2>&1 &
 ORIGIN_PID=$!
 STARTED_PIDS+=("${ORIGIN_PID}")
-wait_ready "${ORIGIN_ADMIN_PORT}" "${ORIGIN_PID}" || {
+wait_ready "${ORIGIN_PID}" "${ORIGIN_ADDRESS_FILE}" || {
   tail -20 "${LOG_DIR}/origin.log" >&2
   die "origin did not become ready"
 }
+ORIGIN_ADMIN="${ADMIN_ADDRESS}"
 for path in /s /m /l; do
   curl -sf -o /dev/null "http://127.0.0.1:${ORIGIN_PORT}${path}" || die "origin does not serve ${path}"
 done
 
 SUMMARY="${OUT}/legs.txt"
 : >"${SUMMARY}"
+EXPECTED=$((RPS * CONCURRENCY * DURATION))
 
 run_leg() {
-  local leg="$1" config url churn_pid="" envoy_pid
+  local leg="$1" config url churn_pid="" envoy_pid address_file admin header
   local -a client_args=()
   case "${leg}" in
     h1-s | h1-fh | h1-m | h1-l)
       config=proxy.json
       url="http://127.0.0.1:${HTTP_PORT}/${leg#h1-}"
+      check_port_free tcp "${HTTP_PORT}"
       ;;
     h2-s | h2-fh)
       config=proxy.json
       url="http://127.0.0.1:${HTTP_PORT}/${leg#h2-}"
-      client_args=(-p http2)
+      client_args=(--protocol http2)
+      check_port_free tcp "${HTTP_PORT}"
       ;;
     h3-s | h3-fh)
       config=proxy-h3.json
       url="https://127.0.0.1:${H3_PORT}/${leg#h3-}"
-      client_args=(-p http3 --transport-socket "${H3_TRANSPORT_SOCKET}")
+      client_args=(--protocol http3 --transport-socket "${H3_TRANSPORT_SOCKET}")
+      check_port_free udp "${H3_PORT}"
       ;;
     xds-s)
       config=proxy-xds.json
       url="http://127.0.0.1:${HTTP_PORT}/s"
+      check_port_free tcp "${HTTP_PORT}"
       python3 "${SCRIPT_DIR}/xds_churn.py" "${OUT}/xds" 0
       ;;
     *) die "unknown leg ${leg} (known: ${ALL_LEGS})" ;;
   esac
+  for header in "${REQUEST_HEADERS[@]}"; do
+    client_args+=(--request-header "${header}")
+  done
 
   echo "== leg ${leg}: ${DURATION}s, ${CONCURRENCY} workers x ${RPS} rps, ${url}"
+  address_file="${LOG_DIR}/envoy-${leg}.admin"
+  rm -f "${address_file}"
   LLVM_PROFILE_FILE="${PROFILE_DIR}/envoy-%p-%m.profraw" \
     "${ENVOY_PIN[@]}" "${ENVOY}" -c "${OUT}/${config}" \
+    --admin-address-path "${address_file}" \
     --concurrency "${CONCURRENCY}" --disable-hot-restart -l error \
     >"${LOG_DIR}/envoy-${leg}.log" 2>&1 &
   envoy_pid=$!
   STARTED_PIDS+=("${envoy_pid}")
-  wait_ready "${ADMIN_PORT}" "${envoy_pid}" || {
+  wait_ready "${envoy_pid}" "${address_file}" || {
     tail -20 "${LOG_DIR}/envoy-${leg}.log" >&2
     die "instrumented Envoy did not become ready for leg ${leg}"
   }
+  admin="${ADMIN_ADDRESS}"
 
   if [[ "${leg}" == xds-s ]]; then
     python3 "${SCRIPT_DIR}/xds_churn.py" "${OUT}/xds" "${CHURN_HZ}" &
@@ -246,15 +324,20 @@ run_leg() {
   if [[ -n "${churn_pid}" ]]; then
     stop_pid "${churn_pid}"
     forget_pid "${churn_pid}"
-    extra=" rds_updates=$(stat_value "${ADMIN_PORT}" http.ingress_http.rds.local.update_success)"
-    extra+=" cds_updates=$(stat_value "${ADMIN_PORT}" cluster_manager.cds.update_success)"
+    extra=" rds_reloads=$(stat_value "${admin}" http.ingress_http.rds.local.update_success)"
+    extra+=" cds_reloads=$(stat_value "${admin}" cluster_manager.cds.update_success)"
   fi
   local ok completed
-  ok="$(stat_value "${ADMIN_PORT}" http.ingress_http.downstream_rq_2xx)"
-  completed="$(stat_value "${ADMIN_PORT}" http.ingress_http.downstream_rq_completed)"
-  quit_envoy "${ADMIN_PORT}" "${envoy_pid}"
-  echo "${leg} rq_2xx=${ok:-0} rq_completed=${completed:-0}${extra}" | tee -a "${SUMMARY}"
-  [[ "${ok:-0}" -gt 0 ]] || die "leg ${leg} served no successful requests"
+  ok="$(stat_value "${admin}" http.ingress_http.downstream_rq_2xx)"
+  completed="$(stat_value "${admin}" http.ingress_http.downstream_rq_completed)"
+  ok="${ok:-0}"
+  completed="${completed:-0}"
+  quit_envoy "${admin}" "${envoy_pid}"
+  echo "${leg} rq_2xx=${ok} rq_completed=${completed} expected=${EXPECTED}${extra}" |
+    tee -a "${SUMMARY}"
+  [[ $((completed - ok)) -eq 0 ]] || die "leg ${leg} had $((completed - ok)) non-2xx responses"
+  [[ $((ok * 10)) -ge $((EXPECTED * 9)) ]] ||
+    die "leg ${leg} served ${ok} of ${EXPECTED} expected requests (below 90%)"
 }
 
 IFS=',' read -r -a SELECTED <<<"${LEGS}"
@@ -262,7 +345,7 @@ for leg in "${SELECTED[@]}"; do
   run_leg "${leg}"
 done
 
-quit_envoy "${ORIGIN_ADMIN_PORT}" "${ORIGIN_PID}"
+quit_envoy "${ORIGIN_ADMIN}" "${ORIGIN_PID}"
 
 PROFILES=("${PROFILE_DIR}"/*.profraw)
 [[ -e "${PROFILES[0]}" ]] || die "no .profraw files were written; is --envoy instrumented?"

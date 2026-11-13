@@ -18,8 +18,8 @@ import os
 # Body sizes served by the origin for the proxied paths.
 BODY_SIZES = {"/s": 4096, "/m": 16384, "/l": 65536}
 
-# The many-headers path (/fh) is a direct response on the proxy itself.
-FH_REQUEST_HEADERS = 57
+# The many-headers path (/fh) is a direct response on the proxy itself, with many response
+# headers added. Request headers come from the client (see REQUEST_HEADERS in train.sh).
 FH_RESPONSE_HEADERS = 52
 FH_BODY_SIZE = 128
 VHOST_RESPONSE_HEADERS = 8
@@ -43,16 +43,9 @@ def headers(prefix, count, value):
     } for i in range(count)]
 
 
-def admin(port):
-    return {
-        "access_log_path": "/dev/null",
-        "address": {
-            "socket_address": {
-                "address": "127.0.0.1",
-                "port_value": port
-            }
-        },
-    }
+def admin():
+    # Port 0: the kernel picks a free port, which Envoy writes to --admin-address-path.
+    return {"address": {"socket_address": {"address": "127.0.0.1", "port_value": 0}}}
 
 
 def tcp_address(port):
@@ -83,7 +76,6 @@ def proxy_route_config():
         "match": {
             "prefix": "/fh"
         },
-        "request_headers_to_add": headers("x-edge", FH_REQUEST_HEADERS, lambda i: "v" * 54),
         "response_headers_to_add": headers("x-origin", FH_RESPONSE_HEADERS, lambda i: "v" * 62),
         "direct_response": {
             "status": 200,
@@ -138,7 +130,7 @@ def origin(args):
         }],
     }
     return {
-        "admin": admin(args.origin_admin_port),
+        "admin": admin(),
         "static_resources": {
             "listeners": [{
                 "name": "origin",
@@ -153,7 +145,7 @@ def origin(args):
 
 def proxy(args):
     return {
-        "admin": admin(args.admin_port),
+        "admin": admin(),
         "static_resources": {
             "listeners": [{
                 "name": "proxy",
@@ -181,7 +173,7 @@ def proxy_h3(args):
         }
     }
     return {
-        "admin": admin(args.admin_port),
+        "admin": admin(),
         "static_resources": {
             "listeners": [{
                 "name": "proxy_h3",
@@ -233,7 +225,7 @@ def proxy_xds(args):
         }
 
     return {
-        "admin": admin(args.admin_port),
+        "admin": admin(),
         "node": {
             "id": "pgo-train",
             "cluster": "pgo-train"
@@ -270,11 +262,9 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", required=True, help="output directory (absolute)")
     parser.add_argument("--tls-dir", required=True, help="directory with server.crt/server.key")
-    parser.add_argument("--admin-port", type=int, required=True)
     parser.add_argument("--http-port", type=int, required=True)
     parser.add_argument("--h3-port", type=int, required=True)
     parser.add_argument("--origin-port", type=int, required=True)
-    parser.add_argument("--origin-admin-port", type=int, required=True)
     args = parser.parse_args()
 
     os.makedirs(os.path.join(args.out, "xds"), exist_ok=True)
