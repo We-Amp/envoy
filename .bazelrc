@@ -447,19 +447,22 @@ build:docs-ci --action_env=DOCS_RST_CHECK=1 --host_action_env=DOCS_RST_CHECK=1
 # Optimize build for binary size reduction.
 build:sizeopt -c opt --copt -Os
 
-# Profile-guided optimization (clang only). See docs/root/start/building/pgo.rst.
+# Profile-guided optimization (clang only). See "Profile-guided optimization" in bazel/README.md.
 # Step 1: build an instrumented binary and run it under representative traffic
-# (tools/pgo/train.sh) to collect a profile.
+# (tools/pgo/train.sh) to collect a profile. Raw copts are used instead of --fdo_instrument
+# because the profile location is set at run time through LLVM_PROFILE_FILE.
 build:pgo-instrument -c opt
 build:pgo-instrument --copt=-fprofile-generate
 build:pgo-instrument --linkopt=-fprofile-generate
-# Step 2: build with the merged profile plus ThinLTO. Supply the profile with
-# `--fdo_optimize=/absolute/path/to/envoy.profdata`, so Bazel tracks it as a build input.
-# ThinLTO generates code at link time, so per-object split debug info does not apply.
-build:pgo -c opt
-build:pgo --copt=-flto=thin
-build:pgo --linkopt=-flto=thin
-build:pgo --fission=no
+# Step 2: build with ThinLTO and apply the merged profile with
+# `--config=thinlto --fdo_optimize=/absolute/path/to/envoy.profdata`, so Bazel tracks the
+# profile as a build input. Without --fdo_optimize this config is ThinLTO only, with no PGO.
+# Bazel expects a .dwo file per object, which clang does not write in LTO mode, hence
+# --fission=no.
+build:thinlto -c opt
+build:thinlto --copt=-flto=thin
+build:thinlto --linkopt=-flto=thin
+build:thinlto --fission=no
 
 
 #############################################################################

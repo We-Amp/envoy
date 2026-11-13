@@ -293,6 +293,25 @@ target from [`cc_binary`](https://docs.bazel.build/versions/master/be/c-cpp.html
 or pass [`--strip=always`](https://docs.bazel.build/versions/master/command-line-reference.html#flag--strip)
 instead.
 
+## Profile-guided optimization
+
+Envoy can be built with clang profile-guided optimization (PGO) and ThinLTO in four steps:
+
+```
+# 1. Instrumented build; copy the binary out of bazel-bin.
+bazel build --config=pgo-instrument //source/exe:envoy-static
+# 2. Run it under representative traffic with LLVM_PROFILE_FILE=/dir/envoy-%p-%m.profraw and
+#    stop it with POST /quitquitquit, or use the reference trainer tools/pgo/train.sh.
+# 3. Merge the profiles with the toolchain's own llvm-profdata.
+tools/pgo/merge.sh /dir /abs/path/envoy.profdata
+# 4. Optimized build.
+bazel build --config=thinlto --fdo_optimize=/abs/path/envoy.profdata //source/exe:envoy-static
+```
+
+`--config=thinlto` without `--fdo_optimize` is a ThinLTO build only, with no profile applied.
+See [Building with profile-guided optimization](../docs/root/start/building/pgo.rst) for the
+details and caveats (link memory use, binary size and profile staleness).
+
 # Running the built Envoy binary on the host system
 
 After Envoy is built, it can be executed via CLI.
