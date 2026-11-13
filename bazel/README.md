@@ -310,7 +310,7 @@ bazel build --config=thinlto --fdo_optimize=/abs/path/envoy.profdata //source/ex
 
 `--config=thinlto` without `--fdo_optimize` is a ThinLTO build only, with no profile applied.
 See [Building with profile-guided optimization](../docs/root/start/building/pgo.rst) for the
-details and caveats (link memory use, binary size and profile staleness).
+details and caveats (ThinLTO backend actions and profile staleness).
 
 # Running the built Envoy binary on the host system
 

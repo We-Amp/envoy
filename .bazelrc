@@ -457,12 +457,12 @@ build:pgo-instrument --linkopt=-fprofile-generate
 # Step 2: build with ThinLTO and apply the merged profile with
 # `--config=thinlto --fdo_optimize=/absolute/path/to/envoy.profdata`, so Bazel tracks the
 # profile as a build input. Without --fdo_optimize this config is ThinLTO only, with no PGO.
-# Bazel expects a .dwo file per object, which clang does not write in LTO mode, hence
-# --fission=no.
+# The thin_lto feature runs the ThinLTO backends as separate, cacheable actions, so the link
+# stays small and split debug info (fission) keeps working.
 build:thinlto -c opt
-build:thinlto --copt=-flto=thin
-build:thinlto --linkopt=-flto=thin
-build:thinlto --fission=no
+build:thinlto --features=thin_lto
+# LTO backend actions reuse the compile flags; clang reports some of them as unused for IR input.
+build:thinlto --copt=-Wno-unused-command-line-argument
 # A profile from another commit is expected; mismatched functions fall back to normal optimization.
 build:thinlto --copt=-Wno-profile-instr-unprofiled
 build:thinlto --copt=-Wno-profile-instr-out-of-date

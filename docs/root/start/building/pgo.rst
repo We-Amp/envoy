@@ -74,22 +74,21 @@ The profile must be merged with ``llvm-profdata`` from the same LLVM version as 
 
   $ bazel build --config=thinlto --fdo_optimize=/tmp/envoy.profdata //source/exe:envoy-static
 
-``--fdo_optimize`` applies the profile and needs an absolute path. ``--config=thinlto`` adds
-ThinLTO (``-flto=thin``) and ``--fission=no``. Without ``--fdo_optimize`` you get a ThinLTO
-build only, with no profile applied. In the same measurements, ``--fdo_optimize`` without
-ThinLTO gave about two thirds of the gain.
+``--fdo_optimize`` applies the profile and needs an absolute path. ``--config=thinlto`` turns
+on Bazel's ``thin_lto`` feature. Without ``--fdo_optimize`` you get a ThinLTO build only, with
+no profile applied. In the same measurements, ``--fdo_optimize`` without ThinLTO gave about two
+thirds of the gain.
 
 Caveats
 -------
 
-* **Memory.** ThinLTO moves code generation into the link step, so linking ``envoy-static``
-  and large test binaries needs much more memory than a regular build. If links are killed
-  for running out of memory, lower ``--jobs`` or limit Bazel with, for example,
-  ``--local_resources=memory=HOST_RAM*.6``.
-* **Binary size.** With ``--fission=no`` the debug information stays in the binary, which can
-  then be several gigabytes. Build ``//source/exe:envoy-static.stripped``, or keep the debug
-  information separately, before shipping it. A large unstripped binary is also slow to start
-  from a cold page cache.
+* **ThinLTO backend actions.** With the ``thin_lto`` feature, Bazel compiles each object to
+  bitcode, runs a short indexing link, and then optimizes each object again in its own backend
+  action before the final link. There are as many backend actions as objects, several thousand
+  for ``envoy-static``, but they are cached like compiles, and the final link needs little
+  memory. Split debug info (``--fission``) works as in a regular build.
+* **Binary size.** Build ``//source/exe:envoy-static.stripped`` to ship a binary without debug
+  information.
 * **Profile staleness.** A profile describes the code it was recorded from, but it does not
   have to come from the same commit: a profile recorded on another commit builds and still
   helps. Functions that changed since the profile was recorded fall back to normal
