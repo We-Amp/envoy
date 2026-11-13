@@ -447,6 +447,20 @@ build:docs-ci --action_env=DOCS_RST_CHECK=1 --host_action_env=DOCS_RST_CHECK=1
 # Optimize build for binary size reduction.
 build:sizeopt -c opt --copt -Os
 
+# Profile-guided optimization (clang only). See docs/root/start/building/pgo.rst.
+# Step 1: build an instrumented binary and run it under representative traffic
+# (tools/pgo/train.sh) to collect a profile.
+build:pgo-instrument -c opt
+build:pgo-instrument --copt=-fprofile-generate
+build:pgo-instrument --linkopt=-fprofile-generate
+# Step 2: build with the merged profile plus ThinLTO. Supply the profile with
+# `--fdo_optimize=/absolute/path/to/envoy.profdata`, so Bazel tracks it as a build input.
+# ThinLTO generates code at link time, so per-object split debug info does not apply.
+build:pgo -c opt
+build:pgo --copt=-flto=thin
+build:pgo --linkopt=-flto=thin
+build:pgo --fission=no
+
 
 #############################################################################
 # remote: Docker workers
