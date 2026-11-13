@@ -77,7 +77,9 @@ The profile must be merged with ``llvm-profdata`` from the same LLVM version as 
 ``--fdo_optimize`` applies the profile and needs an absolute path. ``--config=thinlto`` turns
 on Bazel's ``thin_lto`` feature. Without ``--fdo_optimize`` you get a ThinLTO build only, with
 no profile applied. In the same measurements, ``--fdo_optimize`` without ThinLTO gave about two
-thirds of the gain.
+thirds of the gain. Such a build does not get the profile mismatch flags of ``--config=thinlto``
+(see *Profile staleness* below); pass them as ``--copt`` options to use a profile from another
+commit.
 
 Caveats
 -------
@@ -95,22 +97,12 @@ Caveats
   optimization; they are not miscompiled, but they lose the benefit. ``--config=thinlto``
   turns off the profile mismatch warnings (``-Wno-profile-instr-unprofiled``,
   ``-Wno-profile-instr-out-of-date`` and ``-Wno-backend-plugin``), which would otherwise fail
-  the ``-Werror`` build. In our measurements, each commit built with a profile from another
-  commit, compared with a regular ``-c opt`` build of the same commit, kept about 80 to 90% of
-  the same-commit gain:
-
-  ============================  ================================  ==============================
-  Profile recorded on           HTTP/1 small proxied, 4 workers   Many response headers,
-                                                                  16 workers
-  ============================  ================================  ==============================
-  the same commit               -39% CPU per request              -34% CPU per request
-  a commit 11 days away         -31%                              -26%
-  a commit 4 weeks away         -32%                              -31%
-  ============================  ================================  ==============================
+  the ``-Werror`` build. In the same measurements, a profile recorded 11 days or four weeks away
+  from the built commit kept roughly four fifths or more of the same-commit gain.
 
   Retrain periodically, for example once per release, and when your traffic changes.
 * **Coverage of the training mix.** Code that never ran during training is optimized as cold
-  code. Train on every protocol and feature you serve. In our measurements HTTP/3 improved
+  code. Train on every protocol and feature you serve. In the same measurements HTTP/3 improved
   much less when it was left out of the training run than when it was included.
 * **Reproducibility.** The optimized binary depends on the profile as well as the source. Keep
   the profile with the build if you need to rebuild the same binary later.
