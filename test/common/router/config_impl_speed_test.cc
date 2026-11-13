@@ -438,6 +438,52 @@ static void bmVirtualHostLookup(benchmark::State& state) {
   }
 }
 
+// N routes: routes 0..n-2 carry a distinct path prefix plus a header criterion the request
+// WOULD satisfy; only the last route's path and header both match. Before the reorder every
+// candidate ran its header matchers before being rejected by the path; after the reorder the
+// path condition rejects them first, so the benchmark isolates that saving.
+static RouteConfiguration genHeaderMatchRouteConfig(int n) {
+  RouteConfiguration route_config;
+  VirtualHost* v_host = route_config.add_virtual_hosts();
+  v_host->set_name("default");
+  v_host->add_domains("*");
+  for (int i = 0; i < n; ++i) {
+    Route* route = v_host->add_routes();
+    route->mutable_direct_response()->set_status(200);
+    RouteMatch* match = route->mutable_match();
+    if (i < n - 1) {
+      match->set_prefix(absl::StrCat("/api/v", i, "/"));
+    } else {
+      match->set_prefix("/api/");
+    }
+    auto* header = match->add_headers();
+    header->set_name("x-target");
+    header->mutable_string_match()->set_exact("target");
+  }
+  return route_config;
+}
+
+static void bmHeaderMatcherRoutes(benchmark::State& state) {
+  const int n = state.range(0);
+  Api::ApiPtr api = Api::createApiForTest();
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+  ON_CALL(factory_context, api()).WillByDefault(ReturnRef(*api));
+  std::shared_ptr<ConfigImpl> config = *ConfigImpl::create(
+      genHeaderMatchRouteConfig(n), factory_context, ProtobufMessage::getNullValidationVisitor(),
+      factory_context.initManager(), true);
+  Http::TestRequestHeaderMapImpl headers{{":authority", "www.example.com"},
+                                         {":method", "GET"},
+                                         {":path", "/api/foo"},
+                                         {"x-forwarded-proto", "http"},
+                                         {"x-target", "target"}};
+  for (auto _ : state) { // NOLINT
+    config->route(headers, stream_info, 0);
+  }
+}
+
+BENCHMARK(bmHeaderMatcherRoutes)->Arg(10)->Arg(100)->Arg(1000);
+
 BENCHMARK(bmPlainRoutes)->RangeMultiplier(2)->Ranges({{64, 2 << 10}});
 BENCHMARK(bmMixedRoutes)->RangeMultiplier(2)->Ranges({{64, 2 << 10}});
 BENCHMARK(bmVirtualHostLookup)->RangeMultiplier(2)->Ranges({{1, 2 << 9}});
