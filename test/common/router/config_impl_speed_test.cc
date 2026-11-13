@@ -438,6 +438,133 @@ static void bmVirtualHostLookup(benchmark::State& state) {
   }
 }
 
+// N routes: routes 0..n-2 carry a distinct path prefix plus a header criterion the request
+// WOULD satisfy; only the last route's path and header both match. Before the reorder every
+// candidate ran its header matchers before being rejected by the path; after the reorder the
+// path condition rejects them first, so the benchmark isolates that saving.
+static RouteConfiguration genHeaderMatchRouteConfig(int n) {
+  RouteConfiguration route_config;
+  VirtualHost* v_host = route_config.add_virtual_hosts();
+  v_host->set_name("default");
+  v_host->add_domains("*");
+  for (int i = 0; i < n; ++i) {
+    Route* route = v_host->add_routes();
+    route->mutable_direct_response()->set_status(200);
+    RouteMatch* match = route->mutable_match();
+    if (i < n - 1) {
+      match->set_prefix(absl::StrCat("/api/v", i, "/"));
+    } else {
+      match->set_prefix("/api/");
+    }
+    auto* header = match->add_headers();
+    header->set_name("x-target");
+    header->mutable_string_match()->set_exact("target");
+  }
+  return route_config;
+}
+
+static void bmHeaderMatcherRoutes(benchmark::State& state) {
+  const int n = state.range(0);
+  Api::ApiPtr api = Api::createApiForTest();
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+  ON_CALL(factory_context, api()).WillByDefault(ReturnRef(*api));
+  std::shared_ptr<ConfigImpl> config = *ConfigImpl::create(
+      genHeaderMatchRouteConfig(n), factory_context, ProtobufMessage::getNullValidationVisitor(),
+      factory_context.initManager(), true);
+  Http::TestRequestHeaderMapImpl headers{{":authority", "www.example.com"},
+                                         {":method", "GET"},
+                                         {":path", "/api/foo"},
+                                         {"x-forwarded-proto", "http"},
+                                         {"x-target", "target"}};
+  for (auto _ : state) { // NOLINT
+    config->route(headers, stream_info, 0);
+  }
+}
+
+BENCHMARK(bmHeaderMatcherRoutes)->Arg(10)->Arg(100)->Arg(1000);
+
+// N safe_regex routes of the form used by bmRouteTableSizeWithRegexMatch. Every route also
+// requires the header x-canary: 1, which the request does not send, so matchRoute() rejects each
+// of them without the regex being needed. With state.range(1) == 1 the last route carries no
+// header criterion and matches the request; with 0 no route matches. This is the case where
+// evaluating a regex path before matchRoute() would cost more than it saves.
+static RouteConfiguration genRegexHeaderRouteConfig(int n, bool last_matches) {
+  RouteConfiguration route_config;
+  VirtualHost* v_host = route_config.add_virtual_hosts();
+  v_host->set_name("default");
+  v_host->add_domains("*");
+  for (int i = 0; i < n; ++i) {
+    Route* route = v_host->add_routes();
+    route->mutable_direct_response()->set_status(200);
+    RouteMatch* match = route->mutable_match();
+    envoy::type::matcher::v3::RegexMatcher* regex = match->mutable_safe_regex();
+    regex->mutable_google_re2();
+    regex->set_regex(absl::StrCat("^/shelves/[^\\\\/]+/route_", i, "$"));
+    if (!(last_matches && i == n - 1)) {
+      auto* header = match->add_headers();
+      header->set_name("x-canary");
+      header->mutable_string_match()->set_exact("1");
+    }
+  }
+  return route_config;
+}
+
+static void bmRegexRoutesRejectedByHeader(benchmark::State& state) {
+  const int n = state.range(0);
+  Api::ApiPtr api = Api::createApiForTest();
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+  ON_CALL(factory_context, api()).WillByDefault(ReturnRef(*api));
+  std::shared_ptr<ConfigImpl> config = *ConfigImpl::create(
+      genRegexHeaderRouteConfig(n, state.range(1) != 0), factory_context,
+      ProtobufMessage::getNullValidationVisitor(), factory_context.initManager(), true);
+  const Http::TestRequestHeaderMapImpl headers = genRequestHeaders(n - 1);
+  for (auto _ : state) { // NOLINT
+    config->route(headers, stream_info, 0);
+  }
+}
+
+BENCHMARK(bmRegexRoutesRejectedByHeader)
+    ->Args({10, 0})
+    ->Args({10, 1})
+    ->Args({100, 0})
+    ->Args({100, 1})
+    ->Args({1000, 0})
+    ->Args({1000, 1});
+
+// bmRouteTableSizeWithExactPathMatch configures prefix routes (set_prefix). This variant configures
+// `path` routes, so the exact-path comparison is what is measured. The last route matches.
+static RouteConfiguration genExactPathRouteConfig(int n) {
+  RouteConfiguration route_config;
+  VirtualHost* v_host = route_config.add_virtual_hosts();
+  v_host->set_name("default");
+  v_host->add_domains("*");
+  for (int i = 0; i < n; ++i) {
+    Route* route = v_host->add_routes();
+    route->mutable_direct_response()->set_status(200);
+    route->mutable_match()->set_path(absl::StrCat("/shelves/shelf_", i, "/route_", i));
+  }
+  return route_config;
+}
+
+static void bmRouteTableSizeWithPathMatch(benchmark::State& state) {
+  const int n = state.range(0);
+  Api::ApiPtr api = Api::createApiForTest();
+  NiceMock<Server::Configuration::MockServerFactoryContext> factory_context;
+  NiceMock<Envoy::StreamInfo::MockStreamInfo> stream_info;
+  ON_CALL(factory_context, api()).WillByDefault(ReturnRef(*api));
+  std::shared_ptr<ConfigImpl> config = *ConfigImpl::create(
+      genExactPathRouteConfig(n), factory_context, ProtobufMessage::getNullValidationVisitor(),
+      factory_context.initManager(), true);
+  const Http::TestRequestHeaderMapImpl headers = genRequestHeaders(n - 1);
+  for (auto _ : state) { // NOLINT
+    config->route(headers, stream_info, 0);
+  }
+}
+
+BENCHMARK(bmRouteTableSizeWithPathMatch)->RangeMultiplier(2)->Ranges({{1, 2 << 13}});
+
 BENCHMARK(bmPlainRoutes)->RangeMultiplier(2)->Ranges({{64, 2 << 10}});
 BENCHMARK(bmMixedRoutes)->RangeMultiplier(2)->Ranges({{64, 2 << 10}});
 BENCHMARK(bmVirtualHostLookup)->RangeMultiplier(2)->Ranges({{1, 2 << 9}});

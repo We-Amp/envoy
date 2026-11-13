@@ -1482,6 +1482,7 @@ std::string UriTemplateMatcherRouteEntryImpl::currentUrlPathAfterRewrite(
 bool UriTemplateMatcherRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                                const StreamInfo::StreamInfo& stream_info,
                                                uint64_t random_value) const {
+  // matchRoute() first: see RegexRouteEntryImpl::matches().
   if (RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value) &&
       path_matcher_->match(route_match_context.path())) {
     return true;
@@ -1516,8 +1517,11 @@ PrefixRouteEntryImpl::currentUrlPathAfterRewrite(const Http::RequestHeaderMap& h
 bool PrefixRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                    const StreamInfo::StreamInfo& stream_info,
                                    uint64_t random_value) const {
-  if (RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value) &&
-      path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery())) {
+  // Check the path first: for prefix, exact and path-separated-prefix routes it is a cheap string
+  // comparison, and most routes fail here when many routes are configured. matchRoute() is only
+  // evaluated for path-matching candidates.
+  if (path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery()) &&
+      RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
     return true;
   }
   return false;
@@ -1550,8 +1554,9 @@ PathRouteEntryImpl::currentUrlPathAfterRewrite(const Http::RequestHeaderMap& hea
 bool PathRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                  const StreamInfo::StreamInfo& stream_info,
                                  uint64_t random_value) const {
-  if (RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value) &&
-      path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery())) {
+  // Path first; see PrefixRouteEntryImpl::matches().
+  if (path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery()) &&
+      RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
     return true;
   }
 
@@ -1592,6 +1597,8 @@ RegexRouteEntryImpl::currentUrlPathAfterRewrite(const Http::RequestHeaderMap& he
 bool RegexRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                   const StreamInfo::StreamInfo& stream_info,
                                   uint64_t random_value) const {
+  // matchRoute() first: a regex evaluation usually costs more than the checks matchRoute() runs,
+  // so a route rejected by its header, query parameter or runtime criteria never runs its regex.
   if (RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
     if (path_matcher_->matchPathWithoutQuery(route_match_context.sanitizedPathWithoutQuery())) {
       return true;
@@ -1625,6 +1632,7 @@ bool ConnectRouteEntryImpl::matches(const RouteMatchContext& route_match_context
                                     const StreamInfo::StreamInfo& stream_info,
                                     uint64_t random_value) const {
   const Http::RequestHeaderMap& headers = route_match_context.headers();
+  // The cheap CONNECT check runs before matchRoute(), like the path check in the other matches().
   if ((Http::HeaderUtility::isConnect(headers) ||
        Http::HeaderUtility::isConnectUdpRequest(headers)) &&
       RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
@@ -1659,17 +1667,15 @@ std::string PathSeparatedPrefixRouteEntryImpl::currentUrlPathAfterRewrite(
 bool PathSeparatedPrefixRouteEntryImpl::matches(const RouteMatchContext& route_match_context,
                                                 const StreamInfo::StreamInfo& stream_info,
                                                 uint64_t random_value) const {
-  if (!RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value)) {
-    return false;
-  }
+  // Path first; see PrefixRouteEntryImpl::matches().
   const absl::string_view sanitized_path = route_match_context.sanitizedPathWithoutQuery();
   const size_t sanitized_size = sanitized_path.size();
   const size_t matcher_size = matcher().size();
-  if (sanitized_size >= matcher_size && path_matcher_->matchPathWithoutQuery(sanitized_path) &&
-      (sanitized_size == matcher_size || sanitized_path[matcher_size] == '/')) {
-    return true;
+  if (!(sanitized_size >= matcher_size && path_matcher_->matchPathWithoutQuery(sanitized_path) &&
+        (sanitized_size == matcher_size || sanitized_path[matcher_size] == '/'))) {
+    return false;
   }
-  return false;
+  return RouteEntryImplBase::matchRoute(route_match_context, stream_info, random_value);
 }
 
 CommonVirtualHostImpl::CommonVirtualHostImpl(
