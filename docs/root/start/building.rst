@@ -64,3 +64,4 @@ Envoy binary, and putting the binary in an Ubuntu container.
     :maxdepth: 2
 
     building/local_docker_build
+    building/pgo
