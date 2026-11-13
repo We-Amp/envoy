@@ -32,6 +32,17 @@ warnings that would otherwise fail the `-Werror` build. In our measurements, a p
 11 days or four weeks away from the built commit kept about 80 to 90% of the same-commit gain.
 Retrain periodically, for example once per release.
 
+The scripts run directly from a source checkout, or through Bazel:
+
+```console
+$ bazel run //tools/pgo:train -- --envoy /tmp/envoy-instrumented \
+    --nighthawk /path/to/nighthawk_client --out /tmp/pgo-train
+$ bazel run //tools/pgo:merge -- /tmp/pgo-train/profiles /tmp/envoy.profdata
+$ bazel test //tools/pgo:gen_config_test
+```
+
+`gen_config_test` checks the generated configurations without running Envoy.
+
 ## What `train.sh` runs
 
 Each leg starts a fresh instrumented Envoy, sends open-loop traffic with

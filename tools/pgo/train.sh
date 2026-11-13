@@ -60,6 +60,20 @@ REQUEST_HEADERS=(
   "x-request-id: 0b6c1f0e-4d1a-4f61-9a43-2d6f7b9c8e15"
 )
 
+# The helper scripts sit next to this one, or in the runfiles tree under `bazel run`.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+for dir in "${SCRIPT_DIR}" "${RUNFILES_DIR:-${BASH_SOURCE[0]}.runfiles}/_main/tools/pgo" \
+  "${PWD}/tools/pgo"; do
+  if [[ -f "${dir}/gen_config.py" ]]; then
+    SCRIPT_DIR="$(cd "${dir}" && pwd)"
+    break
+  fi
+done
+# Under `bazel run`, resolve relative paths against the directory bazel was started from.
+if [[ -n "${BUILD_WORKING_DIRECTORY:-}" ]]; then
+  cd "${BUILD_WORKING_DIRECTORY}"
+fi
+
 ENVOY=""
 NIGHTHAWK=""
 ORIGIN_ENVOY=""
@@ -119,7 +133,7 @@ check_port_free tcp "${HTTP_PORT}"
 check_port_free tcp "${ORIGIN_PORT}"
 check_port_free udp "${H3_PORT}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "${SCRIPT_DIR}/gen_config.py" ]] || die "gen_config.py not found next to train.sh"
 mkdir -p "${OUT}"
 OUT="$(cd "${OUT}" && pwd)"
 PROFILE_DIR="${OUT}/profiles"

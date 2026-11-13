@@ -18,6 +18,10 @@ if [[ $# -ne 2 ]]; then
   sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 fi
+# Under `bazel run`, resolve relative paths against the directory bazel was started from.
+if [[ -n "${BUILD_WORKING_DIRECTORY:-}" ]]; then
+  cd "${BUILD_WORKING_DIRECTORY}"
+fi
 PROFILE_DIR="$1"
 OUTPUT="$2"
 
@@ -37,7 +41,7 @@ PROFILES=("${PROFILE_DIR}"/*.profraw)
 
 if [[ -z "${LLVM_PROFDATA:-}" ]]; then
   if [[ -z "${OUTPUT_BASE:-}" ]]; then
-    WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    WORKSPACE="${BUILD_WORKSPACE_DIRECTORY:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
     read -r -a STARTUP <<<"${BAZEL_STARTUP_OPTS:-}"
     OUTPUT_BASE="$(cd "${WORKSPACE}" && bazel "${STARTUP[@]}" info output_base)"
   fi
