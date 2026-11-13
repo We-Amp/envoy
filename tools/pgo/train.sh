@@ -120,7 +120,7 @@ done
 check_port_free() {
   local proto="$1" port="$2" in_use=""
   if [[ "${proto}" == tcp ]]; then
-    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+    if python3 -c 'import socket, sys; s = socket.socket(); s.settimeout(1); sys.exit(s.connect_ex(("127.0.0.1", int(sys.argv[1]))) != 0)' "${port}"; then
       in_use=1
     fi
   elif command -v ss >/dev/null && [[ -n "$(ss -H -lun "sport = :${port}")" ]]; then
