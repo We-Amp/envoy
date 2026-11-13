@@ -447,6 +447,33 @@ build:docs-ci --action_env=DOCS_RST_CHECK=1 --host_action_env=DOCS_RST_CHECK=1
 # Optimize build for binary size reduction.
 build:sizeopt -c opt --copt -Os
 
+# Profile-guided optimization (clang on Linux; other toolchains are untested). See
+# "Profile-guided optimization" in bazel/README.md.
+# Step 1: build an instrumented binary and run it under representative traffic to collect a
+# profile. Raw copts are used instead of --fdo_instrument because the profile location is set at
+# run time through LLVM_PROFILE_FILE.
+build:pgo-instrument -c opt
+build:pgo-instrument --copt=-fprofile-generate
+build:pgo-instrument --linkopt=-fprofile-generate
+# Step 2: build with ThinLTO and apply the merged profile with
+# `--config=thinlto --fdo_optimize=/absolute/path/to/envoy.profdata`, so Bazel tracks the
+# profile as a build input. Without --fdo_optimize this config is ThinLTO only, with no PGO.
+# The thin_lto feature runs the ThinLTO backends as separate, cacheable actions, so the link
+# stays small and split debug info (fission) keeps working.
+build:thinlto -c opt
+build:thinlto --features=thin_lto
+# The LTO backend actions reuse the compile command line, and clang reports `-U _FORTIFY_SOURCE`
+# and `-stdlib=libc++` from it as unused for bitcode input, which fails under -Werror. Silence
+# that for the backend actions only.
+build:thinlto --ltobackendopt=-Wno-unused-command-line-argument
+# A profile from another commit is expected; mismatched functions fall back to normal
+# optimization. Bazel's fdo_optimize feature only adds -fprofile-use, so the mismatch warnings
+# are turned off here. They come from applying the profile, not from ThinLTO: an --fdo_optimize
+# build without --config=thinlto needs the same three flags to use a profile from another commit.
+build:thinlto --copt=-Wno-profile-instr-unprofiled
+build:thinlto --copt=-Wno-profile-instr-out-of-date
+build:thinlto --copt=-Wno-backend-plugin
+
 
 #############################################################################
 # remote: Docker workers

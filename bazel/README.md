@@ -293,6 +293,33 @@ target from [`cc_binary`](https://docs.bazel.build/versions/master/be/c-cpp.html
 or pass [`--strip=always`](https://docs.bazel.build/versions/master/command-line-reference.html#flag--strip)
 instead.
 
+## Profile-guided optimization
+
+Envoy can be built with clang profile-guided optimization (PGO) and ThinLTO in four steps:
+
+```
+# 1. Instrumented build; copy the binary out of bazel-bin.
+bazel build --config=pgo-instrument //source/exe:envoy-static
+# 2. Run it under representative traffic with LLVM_PROFILE_FILE=/dir/envoy-%p-%m.profraw in its
+#    environment, and stop it with POST /quitquitquit so the profile is written.
+# 3. Merge the profiles with llvm-profdata from the same LLVM version as the compiler, for
+#    example the one in the hermetic toolchain under $(bazel info output_base)/external.
+llvm-profdata merge -output=/abs/path/envoy.profdata /dir/*.profraw
+# 4. Optimized build.
+bazel build --config=thinlto --fdo_optimize=/abs/path/envoy.profdata //source/exe:envoy-static
+```
+
+`--config=thinlto` without `--fdo_optimize` is a ThinLTO build only, with no profile applied.
+It uses Bazel's `thin_lto` feature, so the ThinLTO backends run as separate, cacheable actions
+and split debug info keeps working. A profile recorded on another commit can be used:
+functions that changed since then fall back to normal optimization. Retrain periodically, for
+example once per release.
+
+The config also turns off the profile mismatch warnings, so a profile recorded on another commit
+builds under `-Werror`. An `--fdo_optimize` build without `--config=thinlto` needs those flags
+too (`--copt=-Wno-profile-instr-unprofiled --copt=-Wno-profile-instr-out-of-date
+--copt=-Wno-backend-plugin`), or a profile from another commit fails the build.
+
 # Running the built Envoy binary on the host system
 
 After Envoy is built, it can be executed via CLI.
