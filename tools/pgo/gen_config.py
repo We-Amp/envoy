@@ -9,6 +9,9 @@ All files are JSON, so only the Python standard library is needed:
   proxy-xds.json the instrumented Envoy: HTTP/1 with routes (RDS) and clusters (CDS) read from
                  watched files, rewritten by xds_churn.py.
   xds/base.json  the route configuration and clusters that xds_churn.py starts from.
+  nighthawk-h3-transport-socket.json
+                 the client-side QUIC transport socket for Nighthawk's HTTP/3 legs, trusting
+                 the throwaway certificate in --tls-dir.
 """
 
 import argparse
@@ -210,6 +213,27 @@ def proxy_h3(args):
     }
 
 
+def nighthawk_h3_transport_socket(args):
+    # Passed to nighthawk_client --transport-socket, which takes the JSON on one line.
+    return {
+        "name": "envoy.transport_sockets.quic",
+        "typed_config": {
+            "@type": ("type.googleapis.com/envoy.extensions.transport_sockets."
+                      "quic.v3.QuicUpstreamTransport"),
+            "upstream_tls_context": {
+                "sni": "localhost",
+                "common_tls_context": {
+                    "validation_context": {
+                        "trusted_ca": {
+                            "filename": os.path.join(args.tls_dir, "server.crt")
+                        }
+                    }
+                },
+            },
+        },
+    }
+
+
 def proxy_xds(args):
     xds_dir = os.path.join(args.out, "xds")
 
@@ -272,6 +296,8 @@ def main():
     write(os.path.join(args.out, "proxy.json"), proxy(args))
     write(os.path.join(args.out, "proxy-h3.json"), proxy_h3(args))
     write(os.path.join(args.out, "proxy-xds.json"), proxy_xds(args))
+    with open(os.path.join(args.out, "nighthawk-h3-transport-socket.json"), "w") as f:
+        json.dump(nighthawk_h3_transport_socket(args), f, separators=(",", ":"))
     write(os.path.join(args.out, "xds", "base.json"), {
         "route_config": proxy_route_config(),
         "clusters": [origin_cluster(args.origin_port)],

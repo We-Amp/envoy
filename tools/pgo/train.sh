@@ -4,19 +4,27 @@
 #
 # Runs a fixed traffic mix against the instrumented Envoy, one leg at a time, and writes one
 # .profraw file per leg. A second, plain Envoy acts as the origin, so nothing else is needed
-# besides nighthawk_client, curl, openssl and python3. See tools/pgo/README.md.
+# besides nighthawk_client, curl, openssl and python3. Linux and bash 4.4 or newer only.
+# See tools/pgo/README.md.
 
 set -euo pipefail
 
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+  echo "ERROR: bash 4.4 or newer is required" >&2
+  exit 1
+fi
+
+ALL_LEGS="h1-s,h1-fh,h1-m,h1-l,h2-s,h2-fh,h3-s,h3-fh,xds-s"
+
 usage() {
   cat <<EOF
-Usage: $0 --envoy PATH --nighthawk PATH [options]
+Usage: $0 --envoy PATH --nighthawk PATH --out DIR [options]
 
   --envoy PATH         instrumented envoy-static (built with --config=pgo-instrument)
   --nighthawk PATH     nighthawk_client binary
+  --out DIR            output directory; must not hold profiles from an earlier run
   --origin-envoy PATH  Envoy binary for the origin (default: the --envoy binary). A normal,
                        non-instrumented build is preferred; its profile is never merged.
-  --out DIR            output directory (default: ./pgo-train); must not hold old profiles
   --duration SECONDS   length of each leg (default: 60)
   --legs LIST          comma-separated subset of legs (default: all)
                        ${ALL_LEGS}
@@ -34,7 +42,10 @@ Environment (optional):
 EOF
 }
 
-ALL_LEGS="h1-s,h1-fh,h1-m,h1-l,h2-s,h2-fh,h3-s,h3-fh,xds-s"
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
 
 # A browser-like request header set, sent by the client on every leg.
 REQUEST_HEADERS=(
@@ -77,20 +88,29 @@ fi
 ENVOY=""
 NIGHTHAWK=""
 ORIGIN_ENVOY=""
-OUT="pgo-train"
+OUT=""
 DURATION=60
 LEGS="${ALL_LEGS}"
 
+# need_value FLAG ARGS...: fails unless FLAG is followed by a non-empty value.
+need_value() {
+  if [[ $# -lt 2 || -z "$2" ]]; then
+    echo "ERROR: $1 needs a value" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --envoy) ENVOY="$2"; shift 2 ;;
-    --nighthawk) NIGHTHAWK="$2"; shift 2 ;;
-    --origin-envoy) ORIGIN_ENVOY="$2"; shift 2 ;;
-    --out) OUT="$2"; shift 2 ;;
-    --duration) DURATION="$2"; shift 2 ;;
-    --legs) LEGS="$2"; shift 2 ;;
+    --envoy) need_value "$@"; ENVOY="$2"; shift 2 ;;
+    --nighthawk) need_value "$@"; NIGHTHAWK="$2"; shift 2 ;;
+    --origin-envoy) need_value "$@"; ORIGIN_ENVOY="$2"; shift 2 ;;
+    --out) need_value "$@"; OUT="$2"; shift 2 ;;
+    --duration) need_value "$@"; DURATION="$2"; shift 2 ;;
+    --legs) need_value "$@"; LEGS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    *) echo "ERROR: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
@@ -102,17 +122,29 @@ HTTP_PORT="${HTTP_PORT:-19080}"
 H3_PORT="${H3_PORT:-19443}"
 ORIGIN_PORT="${ORIGIN_PORT:-19081}"
 
-die() {
-  echo "ERROR: $*" >&2
-  exit 1
-}
-
 [[ -n "${ENVOY}" && -x "${ENVOY}" ]] || { usage >&2; die "--envoy must name an executable"; }
 [[ -n "${NIGHTHAWK}" && -x "${NIGHTHAWK}" ]] || die "--nighthawk must name an executable"
+[[ -n "${OUT}" ]] || die "--out is required"
 ORIGIN_ENVOY="${ORIGIN_ENVOY:-${ENVOY}}"
 [[ -x "${ORIGIN_ENVOY}" ]] || die "--origin-envoy must name an executable"
 for tool in curl openssl python3; do
   command -v "${tool}" >/dev/null || die "${tool} not found"
+done
+
+for var in DURATION CONCURRENCY RPS CONNECTIONS; do
+  [[ "${!var}" =~ ^[1-9][0-9]*$ ]] || die "${var} must be a positive integer, got '${!var}'"
+done
+for var in HTTP_PORT H3_PORT ORIGIN_PORT; do
+  [[ "${!var}" =~ ^[1-9][0-9]*$ && "${!var}" -le 65535 ]] ||
+    die "${var} must be a port number, got '${!var}'"
+done
+[[ "${CHURN_HZ}" =~ ^[0-9]*\.?[0-9]+$ && ! "${CHURN_HZ}" =~ ^[0.]+$ ]] ||
+  die "CHURN_HZ must be a positive number, got '${CHURN_HZ}'"
+
+IFS=',' read -r -a SELECTED <<<"${LEGS}"
+[[ ${#SELECTED[@]} -gt 0 ]] || die "--legs is empty"
+for leg in "${SELECTED[@]}"; do
+  [[ ",${ALL_LEGS}," == *",${leg},"* ]] || die "unknown leg '${leg}' (known: ${ALL_LEGS})"
 done
 
 # Fails if something already uses the loopback port. TCP is probed with a connect; UDP needs
@@ -133,25 +165,43 @@ check_port_free tcp "${HTTP_PORT}"
 check_port_free tcp "${ORIGIN_PORT}"
 check_port_free udp "${H3_PORT}"
 
-[[ -f "${SCRIPT_DIR}/gen_config.py" ]] || die "gen_config.py not found next to train.sh"
+[[ -f "${SCRIPT_DIR}/gen_config.py" ]] ||
+  die "gen_config.py not found (looked next to train.sh and in the runfiles tree)"
 mkdir -p "${OUT}"
 OUT="$(cd "${OUT}" && pwd)"
 PROFILE_DIR="${OUT}/profiles"
+# Each leg writes its profile to a staging directory of its own. It is moved to PROFILE_DIR only
+# when the leg passes its checks, so PROFILE_DIR never holds the profile of a failed leg.
+STAGING_DIR="${OUT}/staging"
 LOG_DIR="${OUT}/logs"
 TLS_DIR="${OUT}/tls"
 if compgen -G "${PROFILE_DIR}/*.profraw" >/dev/null; then
   die "${PROFILE_DIR} already holds .profraw files; use a fresh --out directory"
 fi
-mkdir -p "${PROFILE_DIR}" "${LOG_DIR}" "${OUT}/origin-profile"
+rm -rf "${STAGING_DIR}"
+mkdir -p "${PROFILE_DIR}" "${STAGING_DIR}" "${LOG_DIR}" "${OUT}/origin-profile"
 
 # Only processes this script started are ever signalled.
 STARTED_PIDS=()
 
-# Signals PID only while it is still one of this shell's own running background jobs.
+is_running() {
+  jobs -pr | grep -qx "$1"
+}
+
+# Stops PID only while it is still one of this shell's own running background jobs: SIGTERM,
+# then SIGKILL if it has not exited after 30 seconds.
 stop_pid() {
-  local pid="$1"
-  if jobs -pr | grep -qx "${pid}"; then
+  local pid="$1" i
+  if is_running "${pid}"; then
     kill "${pid}" 2>/dev/null || true
+    for ((i = 0; i < 60; i++)); do
+      is_running "${pid}" || break
+      sleep 0.5
+    done
+    if is_running "${pid}"; then
+      echo "WARNING: process ${pid} did not exit after SIGTERM; sending SIGKILL" >&2
+      kill -KILL "${pid}" 2>/dev/null || true
+    fi
   fi
   wait "${pid}" 2>/dev/null || true
 }
@@ -163,7 +213,8 @@ cleanup() {
   done
 }
 trap cleanup EXIT
-trap 'exit 130' INT TERM
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 forget_pid() {
   local pid="$1" kept=() p
@@ -171,10 +222,6 @@ forget_pid() {
     [[ "${p}" == "${pid}" ]] || kept+=("${p}")
   done
   STARTED_PIDS=("${kept[@]}")
-}
-
-is_running() {
-  jobs -pr | grep -qx "$1"
 }
 
 # Command prefixes for CPU pinning. taskset execs the command, so $! stays the process itself.
@@ -202,7 +249,8 @@ wait_ready() {
     if [[ -z "${ADMIN_ADDRESS}" && -s "${address_file}" ]]; then
       ADMIN_ADDRESS="$(<"${address_file}")"
     fi
-    if [[ -n "${ADMIN_ADDRESS}" ]] && curl -sf "http://${ADMIN_ADDRESS}/ready" >/dev/null; then
+    if [[ -n "${ADMIN_ADDRESS}" ]] &&
+      curl -sf --max-time 5 "http://${ADMIN_ADDRESS}/ready" >/dev/null; then
       sleep 1
       is_running "${pid}" || return 1
       return 0
@@ -214,7 +262,7 @@ wait_ready() {
 
 stat_value() {
   local address="$1" name="$2"
-  curl -sf --get "http://${address}/stats" --data-urlencode "filter=^${name}\$" |
+  curl -sf --max-time 5 --get "http://${address}/stats" --data-urlencode "filter=^${name}\$" |
     awk -F': ' -v n="${name}" '$1 == n { print $2 }'
 }
 
@@ -223,7 +271,7 @@ stat_value() {
 quit_envoy() {
   local address="$1" pid="$2" i
   if is_running "${pid}"; then
-    curl -sf -X POST "http://${address}/quitquitquit" >/dev/null || true
+    curl -sf --max-time 5 -X POST "http://${address}/quitquitquit" >/dev/null || true
   fi
   for ((i = 0; i < 120; i++)); do
     is_running "${pid}" || break
@@ -236,14 +284,16 @@ quit_envoy() {
 echo "== generating a throwaway self-signed certificate for the HTTP/3 legs"
 mkdir -p "${TLS_DIR}"
 chmod 700 "${TLS_DIR}"
-openssl ecparam -name prime256v1 -genkey -noout -out "${TLS_DIR}/server.key" 2>/dev/null
+openssl ecparam -name prime256v1 -genkey -noout -out "${TLS_DIR}/server.key" ||
+  die "openssl could not generate the HTTP/3 key"
 openssl req -new -x509 -key "${TLS_DIR}/server.key" -out "${TLS_DIR}/server.crt" -days 2 \
-  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
-H3_TRANSPORT_SOCKET="$(printf '{"name":"envoy.transport_sockets.quic","typed_config":{"@type":"type.googleapis.com/envoy.extensions.transport_sockets.quic.v3.QuicUpstreamTransport","upstream_tls_context":{"sni":"localhost","common_tls_context":{"validation_context":{"trusted_ca":{"filename":"%s"}}}}}}' "${TLS_DIR}/server.crt")"
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" ||
+  die "openssl could not generate the HTTP/3 certificate (OpenSSL 1.1.1 or newer is needed)"
 
 echo "== writing Envoy configurations to ${OUT}"
 python3 "${SCRIPT_DIR}/gen_config.py" --out "${OUT}" --tls-dir "${TLS_DIR}" \
   --http-port "${HTTP_PORT}" --h3-port "${H3_PORT}" --origin-port "${ORIGIN_PORT}"
+H3_TRANSPORT_SOCKET="$(<"${OUT}/nighthawk-h3-transport-socket.json")"
 
 echo "== starting the origin"
 ORIGIN_ADDRESS_FILE="${LOG_DIR}/origin.admin"
@@ -261,15 +311,21 @@ wait_ready "${ORIGIN_PID}" "${ORIGIN_ADDRESS_FILE}" || {
 }
 ORIGIN_ADMIN="${ADMIN_ADDRESS}"
 for path in /s /m /l; do
-  curl -sf -o /dev/null "http://127.0.0.1:${ORIGIN_PORT}${path}" || die "origin does not serve ${path}"
+  curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:${ORIGIN_PORT}${path}" ||
+    die "origin does not serve ${path}"
 done
 
 SUMMARY="${OUT}/legs.txt"
 : >"${SUMMARY}"
 EXPECTED=$((RPS * CONCURRENCY * DURATION))
 
+# fail_leg LEG MESSAGE: stops the run. The leg's profile stays in its staging directory.
+fail_leg() {
+  die "$2; its profile was not added to ${PROFILE_DIR} (kept in ${STAGING_DIR}/$1)"
+}
+
 run_leg() {
-  local leg="$1" config url churn_pid="" envoy_pid address_file admin header
+  local leg="$1" config url churn_pid="" envoy_pid address_file admin header staging
   local -a client_args=()
   case "${leg}" in
     h1-s | h1-fh | h1-m | h1-l)
@@ -302,9 +358,11 @@ run_leg() {
   done
 
   echo "== leg ${leg}: ${DURATION}s, ${CONCURRENCY} workers x ${RPS} rps, ${url}"
+  staging="${STAGING_DIR}/${leg}"
+  mkdir -p "${staging}"
   address_file="${LOG_DIR}/envoy-${leg}.admin"
   rm -f "${address_file}"
-  LLVM_PROFILE_FILE="${PROFILE_DIR}/envoy-%p-%m.profraw" \
+  LLVM_PROFILE_FILE="${staging}/envoy-%p-%m.profraw" \
     "${ENVOY_PIN[@]}" "${ENVOY}" -c "${OUT}/${config}" \
     --admin-address-path "${address_file}" \
     --concurrency "${CONCURRENCY}" --disable-hot-restart -l error \
@@ -313,7 +371,7 @@ run_leg() {
   STARTED_PIDS+=("${envoy_pid}")
   wait_ready "${envoy_pid}" "${address_file}" || {
     tail -20 "${LOG_DIR}/envoy-${leg}.log" >&2
-    die "instrumented Envoy did not become ready for leg ${leg}"
+    fail_leg "${leg}" "instrumented Envoy did not become ready for leg ${leg}"
   }
   admin="${ADMIN_ADDRESS}"
 
@@ -332,7 +390,7 @@ run_leg() {
   wait "${client_pid}" || client_status=$?
   forget_pid "${client_pid}"
   [[ "${client_status}" -eq 0 ]] ||
-    die "nighthawk failed in leg ${leg}; see ${LOG_DIR}/nighthawk-${leg}.log"
+    fail_leg "${leg}" "nighthawk failed in leg ${leg}; see ${LOG_DIR}/nighthawk-${leg}.log"
 
   local extra=""
   if [[ -n "${churn_pid}" ]]; then
@@ -349,17 +407,23 @@ run_leg() {
   quit_envoy "${admin}" "${envoy_pid}"
   echo "${leg} rq_2xx=${ok} rq_completed=${completed} expected=${EXPECTED}${extra}" |
     tee -a "${SUMMARY}"
-  [[ $((completed - ok)) -eq 0 ]] || die "leg ${leg} had $((completed - ok)) non-2xx responses"
+  [[ $((completed - ok)) -eq 0 ]] ||
+    fail_leg "${leg}" "leg ${leg} had $((completed - ok)) non-2xx responses"
   [[ $((ok * 10)) -ge $((EXPECTED * 9)) ]] ||
-    die "leg ${leg} served ${ok} of ${EXPECTED} expected requests (below 90%)"
+    fail_leg "${leg}" "leg ${leg} served ${ok} of ${EXPECTED} expected requests (below 90%)"
+
+  compgen -G "${staging}/*.profraw" >/dev/null ||
+    fail_leg "${leg}" "leg ${leg} wrote no .profraw file; is --envoy instrumented?"
+  mv "${staging}"/*.profraw "${PROFILE_DIR}/"
+  rmdir "${staging}"
 }
 
-IFS=',' read -r -a SELECTED <<<"${LEGS}"
 for leg in "${SELECTED[@]}"; do
   run_leg "${leg}"
 done
 
 quit_envoy "${ORIGIN_ADMIN}" "${ORIGIN_PID}"
+rmdir "${STAGING_DIR}" 2>/dev/null || true
 
 PROFILES=("${PROFILE_DIR}"/*.profraw)
 [[ -e "${PROFILES[0]}" ]] || die "no .profraw files were written; is --envoy instrumented?"

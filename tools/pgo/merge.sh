@@ -2,7 +2,8 @@
 #
 # Merges the .profraw files written by train.sh into one .profdata file for
 # --fdo_optimize. Uses the llvm-profdata of Envoy's own hermetic LLVM toolchain, so the
-# profile format matches the compiler that will read it.
+# profile format matches the compiler that will read it. Under `bazel run //tools/pgo:merge`
+# that is @llvm_toolchain_llvm//:profdata; run directly, it is looked up in the output base.
 #
 # Usage: tools/pgo/merge.sh PROFILE_DIR OUTPUT.profdata
 #
@@ -15,8 +16,18 @@
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-  sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
+fi
+if ((BASH_VERSINFO[0] < 4)); then
+  echo "ERROR: bash 4 or newer is required" >&2
+  exit 1
+fi
+# Under `bazel run`, LLVM_PROFDATA_RUNFILE is the toolchain's llvm-profdata relative to the
+# runfiles directory, which is the working directory at this point.
+RUNFILE="${LLVM_PROFDATA_RUNFILE:-}"
+if [[ -z "${LLVM_PROFDATA:-}" && -n "${RUNFILE}" && -x "${RUNFILE}" ]]; then
+  LLVM_PROFDATA="$(cd "$(dirname "${RUNFILE}")" && pwd)/$(basename "${RUNFILE}")"
 fi
 # Under `bazel run`, resolve relative paths against the directory bazel was started from.
 if [[ -n "${BUILD_WORKING_DIRECTORY:-}" ]]; then

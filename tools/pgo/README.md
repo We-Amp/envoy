@@ -23,14 +23,17 @@ $ bazel build --config=thinlto --fdo_optimize=/tmp/envoy.profdata //source/exe:e
 ```
 
 Copy the instrumented binary out of `bazel-bin` before step 4, since the optimized build
-replaces it. Pass the same Bazel startup options (for example `--output_base`) to every step;
-`merge.sh` takes them in `BAZEL_STARTUP_OPTS`, or set `LLVM_PROFDATA` directly.
+replaces it. Run directly, `merge.sh` looks for `llvm-profdata` in the Bazel output base: pass the
+same Bazel startup options (for example `--output_base`) as for the build in
+`BAZEL_STARTUP_OPTS`, or set `LLVM_PROFDATA`. Under `bazel run //tools/pgo:merge` it uses the
+toolchain's `@llvm_toolchain_llvm//:profdata` instead.
 
 The profile does not have to come from the commit you build. Functions that changed since it
 was recorded fall back to normal optimization, and `--config=thinlto` silences the mismatch
-warnings that would otherwise fail the `-Werror` build. In our measurements, a profile recorded
-11 days or four weeks away from the built commit kept about 80 to 90% of the same-commit gain.
-Retrain periodically, for example once per release.
+warnings that would otherwise fail the `-Werror` build (an `--fdo_optimize` build without
+`--config=thinlto` needs those flags on its own command line). In our measurements, a profile
+recorded 11 days or four weeks away from the built commit kept roughly four fifths or more of the
+same-commit gain. Retrain periodically, for example once per release.
 
 The scripts run directly from a source checkout, or through Bazel:
 
@@ -39,9 +42,21 @@ $ bazel run //tools/pgo:train -- --envoy /tmp/envoy-instrumented \
     --nighthawk /path/to/nighthawk_client --out /tmp/pgo-train
 $ bazel run //tools/pgo:merge -- /tmp/pgo-train/profiles /tmp/envoy.profdata
 $ bazel test //tools/pgo:gen_config_test
+$ bazel test //tools/pgo:gen_config_validate_test
 ```
 
 `gen_config_test` checks the generated configurations without running Envoy.
+`gen_config_validate_test` runs `envoy --mode validate` on each of them, so it catches a renamed or
+removed API field; it builds `//source/exe:envoy-static` and is therefore tagged `manual`.
+
+## Requirements
+
+* Linux and bash 4.4 or newer.
+* `curl`, `openssl` (1.1.1 or newer) and `python3`; `ss` for the UDP port check and `taskset` for
+  CPU pinning are optional.
+* `nighthawk_client` from [Nighthawk](https://github.com/envoyproxy/nighthawk), built from source
+  or taken from the `envoyproxy/nighthawk-dev` image. The HTTP/3 legs need a build with HTTP/3
+  support.
 
 ## What `train.sh` runs
 
@@ -79,7 +94,8 @@ The HTTP/3 legs use a throwaway self-signed ECDSA certificate that `train.sh` ge
 
 In the `xds-s` leg, Envoy reads its routes (RDS) and clusters (CDS) from watched files.
 `xds_churn.py` rewrites both files `CHURN_HZ` times per second (default 2): a full route
-configuration with 200 filler routes in front of the real ones, and the cluster list with 50
+configuration with 200 filler routes in front of the real ones (on purpose, so route matching
+over a larger table is trained), and the cluster list with 50
 filler clusters, one of which changes each time. Both files live in one watched directory, so
 each rewrite reloads both; `legs.txt` reports these reloads.
 
@@ -107,11 +123,16 @@ kernel, which Envoy writes to `logs/*.admin` (`--admin-address-path`); the scrip
 those addresses, and stops only the processes it started.
 
 A leg fails if any response is not a 2xx, or if fewer than 90% of the expected requests
-(`RPS` x `CONCURRENCY` x `--duration`) succeeded.
+(`RPS` x `CONCURRENCY` x `--duration`) succeeded. Each leg writes its profile to `staging/LEG/`,
+and it is moved to `profiles/` only when the leg passes, so a failed run never leaves the profile
+of the failed leg where `merge.sh` would pick it up. A failed run stops at that leg. To finish
+it, run the remaining legs with `--legs` into a new `--out` directory and move their profiles
+into the first run's `profiles/` before merging.
 
 ## Output
 
-* `profiles/*.profraw`: the training profiles, one per leg.
+* `profiles/*.profraw`: the training profiles, one per leg that passed.
+* `staging/`: only after a failed leg, its profile, which is not merged.
 * `legs.txt`: successful, completed and expected requests per leg, plus the xDS reload counts.
 * `logs/`: Envoy and Nighthawk output for each leg.
 * `*.json`, `xds/`: the generated Envoy configurations (from `gen_config.py`).

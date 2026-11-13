@@ -10,8 +10,8 @@ import sys
 import tempfile
 import unittest
 
-import gen_config
-import xds_churn
+from tools.pgo import gen_config
+from tools.pgo import xds_churn
 
 HTTP_PORT = 19080
 H3_PORT = 19443
@@ -117,6 +117,18 @@ class GenConfigTest(unittest.TestCase):
                          os.path.join(self.tls_dir, "server.crt"))
         self.assertEqual(certificate["private_key"]["filename"],
                          os.path.join(self.tls_dir, "server.key"))
+
+    def test_nighthawk_h3_transport_socket(self):
+        with open(os.path.join(self.out, "nighthawk-h3-transport-socket.json")) as f:
+            text = f.read()
+        # nighthawk_client takes the transport socket as one command line argument.
+        self.assertNotIn("\n", text)
+        socket = json.loads(text)
+        self.assertEqual(socket["name"], "envoy.transport_sockets.quic")
+        tls = socket["typed_config"]["upstream_tls_context"]
+        self.assertEqual(tls["sni"], "localhost")
+        self.assertEqual(tls["common_tls_context"]["validation_context"]["trusted_ca"]["filename"],
+                         os.path.join(self.tls_dir, "server.crt"))
 
     def test_proxy_xds(self):
         config = load(self.out, "proxy-xds.json")
