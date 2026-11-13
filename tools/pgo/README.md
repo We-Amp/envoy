@@ -23,7 +23,10 @@ $ bazel build --config=thinlto --fdo_optimize=/tmp/envoy.profdata //source/exe:e
 ```
 
 Copy the instrumented binary out of `bazel-bin` before step 4, since the optimized build
-replaces it. Pass the same Bazel startup options (for example `--output_base`) to every step;
+replaces it. The profile does not have to come from the commit you build: a profile recorded on
+another commit builds and still helps (measured separately). Functions that changed since then
+fall back to normal optimization, and `--config=thinlto` silences the mismatch warnings that
+would otherwise fail the `-Werror` build. Retrain when the code changes substantially. Pass the same Bazel startup options (for example `--output_base`) to every step;
 `merge.sh` takes them in `BAZEL_STARTUP_OPTS`, or set `LLVM_PROFDATA` directly.
 
 ## What `train.sh` runs

@@ -463,6 +463,10 @@ build:thinlto -c opt
 build:thinlto --copt=-flto=thin
 build:thinlto --linkopt=-flto=thin
 build:thinlto --fission=no
+# A profile from another commit is expected; mismatched functions fall back to normal optimization.
+build:thinlto --copt=-Wno-profile-instr-unprofiled
+build:thinlto --copt=-Wno-profile-instr-out-of-date
+build:thinlto --copt=-Wno-backend-plugin
 
 
 #############################################################################

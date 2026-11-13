@@ -90,10 +90,14 @@ Caveats
   then be several gigabytes. Build ``//source/exe:envoy-static.stripped``, or keep the debug
   information separately, before shipping it. A large unstripped binary is also slow to start
   from a cold page cache.
-* **Profile staleness.** A profile describes the code it was recorded from. Retrain when the
-  code changes substantially, or when your traffic changes. Functions that changed since the
-  profile was recorded fall back to normal optimization; they are not miscompiled, but they
-  lose the benefit.
+* **Profile staleness.** A profile describes the code it was recorded from, but it does not
+  have to come from the same commit: a profile recorded on another commit builds and still
+  helps (measured separately). --config=thinlto turns off the profile mismatch warnings
+  (-Wno-profile-instr-unprofiled, -Wno-profile-instr-out-of-date and
+  -Wno-backend-plugin), which would otherwise fail the -Werror build. Functions that
+  changed since the profile was recorded fall back to normal optimization; they are not
+  miscompiled, but they lose the benefit. Retrain when the code changes substantially, or when
+  your traffic changes.
 * **Coverage of the training mix.** Code that never ran during training is optimized as cold
   code. Train on every protocol and feature you serve. In our measurements HTTP/3 improved
   much less when it was left out of the training run than when it was included.
