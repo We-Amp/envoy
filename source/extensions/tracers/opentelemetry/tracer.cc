@@ -124,6 +124,9 @@ void Span::injectContext(Tracing::TraceContext& trace_context, const Tracing::Up
 }
 
 void Span::setAttribute(absl::string_view name, const OTelAttribute& attribute_value) {
+  if (!sampled()) {
+    return;
+  }
   // The attribute key MUST be a non-null and non-empty string.
   if (name.empty()) {
     return;
@@ -181,6 +184,9 @@ convertGrpcStatusToTraceStatusCode(::opentelemetry::proto::trace::v1::Span_SpanK
 }
 
 void Span::setTag(absl::string_view name, absl::string_view value) {
+  if (!sampled()) {
+    return;
+  }
   if (name == Tracing::Tags::get().HttpMethod) {
     static constexpr std::array<absl::string_view, 10> KnownMethods{
         "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "QUERY", "TRACE"};
@@ -243,11 +249,17 @@ void Span::setTypedTag(absl::string_view name, absl::string_view value,
 }
 
 void Span::reserveTags(size_t size) {
+  if (!sampled()) {
+    return;
+  }
   auto* attributes = span_.mutable_attributes();
   attributes->Reserve(attributes->size() + size);
 }
 
 void Span::log(SystemTime timestamp, const std::string& event) {
+  if (!sampled()) {
+    return;
+  }
   if (event.empty()) {
     return;
   }
