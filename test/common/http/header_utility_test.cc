@@ -58,6 +58,78 @@ TEST_F(HeaderUtilityTest, HasHost) {
   }
 }
 
+// Differential coverage for the word-at-a-time headerValueIsValid fast path: every byte value
+// (0..255) at every position of an 8-byte-aligned word, plus adversarial patterns, must give
+// exactly the same accept/reject answer as the original byte-at-a-time validation.
+TEST(HeaderValueIsValidDifferentialTest, MatchesByteLoopEveryByteEveryPosition) {
+  // The original delegate semantics (quiche HeaderValidator::IsValidHeaderValue with
+  // ObsTextOption::kAllow): valid bytes are TAB, 0x20..0x7E, and obs-text 0x80..0xFF.
+  const auto byte_loop_reference = [](absl::string_view value) {
+    for (const char ch : value) {
+      const uint8_t c = static_cast<uint8_t>(ch);
+      if (!(c == 0x09 || (c >= 0x20 && c != 0x7F) || c >= 0x80)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const std::string base(16, 'A'); // printable filler, word-aligned
+  for (unsigned byte_value = 0; byte_value < 256; ++byte_value) {
+    for (unsigned pos = 0; pos < 8; ++pos) {
+      std::string candidate = base;
+      candidate[pos] = static_cast<char>(byte_value);
+      candidate[8] = static_cast<char>(byte_value);
+      const bool expected = byte_loop_reference(candidate);
+      EXPECT_EQ(expected, HeaderUtility::headerValueIsValid(candidate))
+          << "byte " << byte_value << " at positions 0x" << std::hex << pos
+          << " and 8 (all other bytes 'A')";
+    }
+  }
+}
+
+TEST(HeaderValueIsValidDifferentialTest, MatchesByteLoopAdversarialPatterns) {
+  const auto byte_loop_reference = [](absl::string_view value) {
+    for (const char ch : value) {
+      const uint8_t c = static_cast<uint8_t>(ch);
+      if (!(c == 0x09 || (c >= 0x20 && c != 0x7F) || c >= 0x80)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  std::vector<std::string> candidates;
+  // Every 8-byte-aligned window over all byte values, strided so a wrong fast path cannot hide.
+  for (unsigned byte_value :
+       {0x00U, 0x07U, 0x09U, 0x0AU, 0x1FU, 0x20U, 0x7EU, 0x7FU, 0x80U, 0xFFU}) {
+    std::string candidate(40, 'A');
+    for (size_t pos = 0; pos < candidate.size(); pos += 7) {
+      candidate[pos] = static_cast<char>(byte_value);
+    }
+    candidates.push_back(candidate);
+  }
+  // All-low-ASCII words, all-high-bit words, mixed words, boundary lengths.
+  candidates.push_back(std::string(8, 0x7F));
+  candidates.push_back(std::string(16, 0x7F));
+  candidates.push_back(std::string(8, ' ') + "\t ");
+  candidates.push_back("\t\t\t\t\t\t\t\t");
+  candidates.push_back(std::string(8, 0x80));
+  candidates.push_back(std::string(16, 0xFF));
+  std::string mixed(16, 0x20);
+  for (size_t i = 0; i < mixed.size(); ++i) {
+    mixed[i] = static_cast<char>((i % 2 == 0) ? 0x20 + i : 0x80 + i);
+  }
+  candidates.push_back(mixed);
+  candidates.push_back(""); // empty value is valid
+  candidates.push_back(" ");
+
+  for (const auto& candidate : candidates) {
+    const bool expected = byte_loop_reference(candidate);
+    EXPECT_EQ(expected, HeaderUtility::headerValueIsValid(candidate)) << "len " << candidate.size();
+  }
+}
+
 TEST_F(HeaderUtilityTest, HostHasPort) {
   const std::vector<std::pair<std::string, bool>> host_headers{
       {"localhost", false},      // w/o port part

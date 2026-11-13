@@ -139,8 +139,45 @@ HeaderUtility::createHeaderData(const envoy::config::route::v3::HeaderMatcher& c
 }
 
 bool HeaderUtility::headerValueIsValid(const absl::string_view header_value) {
-  return http2::adapter::HeaderValidator::IsValidHeaderValue(header_value,
-                                                             http2::adapter::ObsTextOption::kAllow);
+  // Word-at-a-time fast path: when a full 8-byte word is entirely printable ASCII
+  // (0x20..0x7E), the value is valid and the byte loop can be skipped. Any word containing a
+  // byte outside that set (tab, DEL, control chars, obs-text 0x80..0xFF) falls back to the
+  // exact per-byte validation below, so accept/reject results are identical to the original
+  // delegate (quiche HeaderValidator::IsValidHeaderValue with ObsTextOption::kAllow: valid
+  // bytes are 0x09 and 0x20..0x7E and 0x80..0xFF).
+  //
+  // The two predicates below are the classic SWAR byte tests; they are only ever used on words
+  // whose bytes are all < 0x80 (checked first), where they are exact, and they only gate whether
+  // the exact per-byte loop runs.
+  size_t offset = 0;
+  const size_t len = header_value.size();
+  constexpr uint64_t kOnes = 0x0101010101010101ULL;
+  constexpr uint64_t kHighBits = 0x8080808080808080ULL;
+  constexpr uint64_t kSpaces = 0x2020202020202020ULL;
+  constexpr uint64_t kDels = 0x7F7F7F7F7F7F7F7FULL;
+  while (offset + sizeof(uint64_t) <= len) {
+    uint64_t word;
+    memcpy(&word, header_value.data() + offset, sizeof(word));
+    if (word & kHighBits) {
+      // Contains a byte >= 0x80: obs-text is allowed, but the SWAR predicates below are not
+      // exact once high bytes are present, so let the byte loop classify it.
+      break;
+    }
+    const bool maybe_invalid = ((word - kSpaces) & ~word & kHighBits) != 0;
+    const uint64_t del_cmp = word ^ kDels;
+    const bool has_del = ((del_cmp - kOnes) & ~del_cmp & kHighBits) != 0;
+    if (maybe_invalid || has_del) {
+      break;
+    }
+    offset += sizeof(uint64_t);
+  }
+  for (; offset < len; ++offset) {
+    const uint8_t c = static_cast<uint8_t>(header_value[offset]);
+    if (!(c == 0x09 || (c >= 0x20 && c != 0x7F) || c >= 0x80)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool HeaderUtility::headerNameIsValid(absl::string_view header_key) {
