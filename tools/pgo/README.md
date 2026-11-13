@@ -23,11 +23,14 @@ $ bazel build --config=thinlto --fdo_optimize=/tmp/envoy.profdata //source/exe:e
 ```
 
 Copy the instrumented binary out of `bazel-bin` before step 4, since the optimized build
-replaces it. The profile does not have to come from the commit you build: a profile recorded on
-another commit builds and still helps (measured separately). Functions that changed since then
-fall back to normal optimization, and `--config=thinlto` silences the mismatch warnings that
-would otherwise fail the `-Werror` build. Retrain when the code changes substantially. Pass the same Bazel startup options (for example `--output_base`) to every step;
+replaces it. Pass the same Bazel startup options (for example `--output_base`) to every step;
 `merge.sh` takes them in `BAZEL_STARTUP_OPTS`, or set `LLVM_PROFDATA` directly.
+
+The profile does not have to come from the commit you build. Functions that changed since it
+was recorded fall back to normal optimization, and `--config=thinlto` silences the mismatch
+warnings that would otherwise fail the `-Werror` build. In our measurements, a profile recorded
+11 days or four weeks away from the built commit kept about 80 to 90% of the same-commit gain.
+Retrain periodically, for example once per release.
 
 ## What `train.sh` runs
 

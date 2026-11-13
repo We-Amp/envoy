@@ -92,12 +92,24 @@ Caveats
   from a cold page cache.
 * **Profile staleness.** A profile describes the code it was recorded from, but it does not
   have to come from the same commit: a profile recorded on another commit builds and still
-  helps (measured separately). --config=thinlto turns off the profile mismatch warnings
-  (-Wno-profile-instr-unprofiled, -Wno-profile-instr-out-of-date and
-  -Wno-backend-plugin), which would otherwise fail the -Werror build. Functions that
-  changed since the profile was recorded fall back to normal optimization; they are not
-  miscompiled, but they lose the benefit. Retrain when the code changes substantially, or when
-  your traffic changes.
+  helps. Functions that changed since the profile was recorded fall back to normal
+  optimization; they are not miscompiled, but they lose the benefit. ``--config=thinlto``
+  turns off the profile mismatch warnings (``-Wno-profile-instr-unprofiled``,
+  ``-Wno-profile-instr-out-of-date`` and ``-Wno-backend-plugin``), which would otherwise fail
+  the ``-Werror`` build. In our measurements, each commit built with a profile from another
+  commit, compared with a regular ``-c opt`` build of the same commit, kept about 80 to 90% of
+  the same-commit gain:
+
+  ============================  ================================  ==============================
+  Profile recorded on           HTTP/1 small proxied, 4 workers   Many response headers,
+                                                                  16 workers
+  ============================  ================================  ==============================
+  the same commit               -39% CPU per request              -34% CPU per request
+  a commit 11 days away         -31%                              -26%
+  a commit 4 weeks away         -32%                              -31%
+  ============================  ================================  ==============================
+
+  Retrain periodically, for example once per release, and when your traffic changes.
 * **Coverage of the training mix.** Code that never ran during training is optimized as cold
   code. Train on every protocol and feature you serve. In our measurements HTTP/3 improved
   much less when it was left out of the training run than when it was included.
