@@ -1,5 +1,7 @@
 #include "source/common/conn_pool/conn_pool_base.h"
 
+#include <cstdlib>
+
 #include "envoy/server/overload/load_shed_point.h"
 
 #include "source/common/common/assert.h"
@@ -14,6 +16,17 @@
 namespace Envoy {
 namespace ConnectionPool {
 namespace {
+// Experiment: when ENVOY_EXP_UPSTREAM_POOL_LRU=1, attach new streams to the least recently
+// freed ready client (the back of ready_clients_) instead of the most recently freed one.
+// Read once per process.
+bool upstreamPoolLru() {
+  static const bool lru = [] {
+    const char* v = std::getenv("ENVOY_EXP_UPSTREAM_POOL_LRU");
+    return v != nullptr && v[0] == '1' && v[1] == '\0';
+  }();
+  return lru;
+}
+
 uint64_t currentUnusedCapacity(const std::list<ActiveClientPtr>& connecting_clients) {
   uint64_t ret = 0;
   for (const auto& client : connecting_clients) {
@@ -403,7 +416,7 @@ ConnectionPool::Cancellable* ConnPoolImplBase::newStreamImpl(AttachContext& cont
   assertCapacityCountsAreCorrect();
 
   if (!ready_clients_.empty()) {
-    ActiveClient& client = *ready_clients_.front();
+    ActiveClient& client = upstreamPoolLru() ? *ready_clients_.back() : *ready_clients_.front();
     ENVOY_CONN_LOG(debug, "using existing fully connected connection", client);
     attachStreamToClient(client, context);
     // Even if there's a ready client, we may want to preconnect to handle the next incoming stream.
