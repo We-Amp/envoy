@@ -462,15 +462,14 @@ public:
   OptRef<StatType> get() {
     StatType* stat = stat_.get([this]() -> StatType* {
       StatType* stat = nullptr;
-      IterateFn<StatType> check_stat = [this,
-                                        &stat](const RefcountPtr<StatType>& shared_stat) -> bool {
-        if (shared_stat->name() == name_) {
-          stat = shared_stat.get();
+      IterateRefFn<StatType> check_stat = [this, &stat](StatType& candidate) -> bool {
+        if (candidate.name() == name_) {
+          stat = &candidate;
           return false; // Stop iteration.
         }
         return true;
       };
-      scope_.iterate(check_stat);
+      scope_.iterateRef(check_stat);
       return stat;
     });
     return makeOptRefFromPtr(stat);
