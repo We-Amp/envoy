@@ -513,6 +513,17 @@ private:
       return central_cache_;
     }
 
+    // Detaches the central cache from the scope, and returns it to the
+    // caller. This enables the ScopeImpl to be deleted from any thread,
+    // but guarantee that the stats held by the scope are only removed
+    // from the main thread.
+    CentralCacheEntrySharedPtr releaseCentralCacheLockHeld()
+        ABSL_EXCLUSIVE_LOCKS_REQUIRED(parent_.lock_) {
+      CentralCacheEntrySharedPtr central_cache = std::move(central_cache_);
+      central_cache_.reset();
+      return central_cache;
+    }
+
     CentralCacheEntrySharedPtr&
     centralCacheMutableNoThreadAnalysis() const ABSL_NO_THREAD_SAFETY_ANALYSIS {
       return central_cache_;
@@ -562,7 +573,13 @@ private:
 
   struct TlsCache : public ThreadLocal::ThreadLocalObject {
     TlsCacheEntry& insertScope(uint64_t scope_id);
-    void eraseScopes(const std::vector<uint64_t>& scope_ids);
+
+    // Erases the scopes identified by indices provided in scope_ids. the TLS
+    // cache entries for the scopes are transferred into tls_cache_entries. The
+    // caller must ensure only one thread at a time calls eraseScopes, to avoid
+    // racing the write to tls_cache_entries.
+    void eraseScopes(const std::vector<uint64_t>& scope_ids,
+                     std::vector<TlsCacheEntry>& tls_cache_entries);
     void eraseHistograms(const std::vector<uint64_t>& histograms);
 
     // The TLS scope cache is keyed by scope ID. This is used to avoid complex circular references

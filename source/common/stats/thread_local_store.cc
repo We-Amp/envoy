@@ -373,7 +373,7 @@ void ThreadLocalStoreImpl::releaseScopeCrossThread(ScopeImpl* scope) {
     bool need_post = scopes_to_cleanup_.empty();
     scopes_to_cleanup_.push_back(scope->scope_id_);
     assertLocked(*scope);
-    central_cache_entries_to_cleanup_.push_back(scope->centralCacheLockHeld());
+    central_cache_entries_to_cleanup_.push_back(scope->releaseCentralCacheLockHeld());
     lock.release();
 
     if (need_post) {
@@ -413,9 +413,14 @@ ThreadLocalStoreImpl::TlsCache::insertScope(uint64_t scope_id) {
   return scope_cache_[scope_id];
 }
 
-void ThreadLocalStoreImpl::TlsCache::eraseScopes(const std::vector<uint64_t>& scope_ids) {
+void ThreadLocalStoreImpl::TlsCache::eraseScopes(const std::vector<uint64_t>& scope_ids,
+                                                 std::vector<TlsCacheEntry>& tls_cache_entries) {
   for (uint64_t scope_id : scope_ids) {
-    scope_cache_.erase(scope_id);
+    auto iter = scope_cache_.find(scope_id);
+    if (iter != scope_cache_.end()) {
+      tls_cache_entries.emplace_back(std::move(iter->second));
+      scope_cache_.erase(iter);
+    }
   }
 }
 
@@ -432,14 +437,18 @@ void ThreadLocalStoreImpl::clearScopesFromCaches() {
   // If we are shutting down we no longer perform cache flushes as workers may be shutting down
   // at the same time.
   if (!shutting_down_) {
+    ASSERT_IS_MAIN_OR_TEST_THREAD();
+
     // Perform a cache flush on all threads.
 
     // Capture all the pending scope ids in a local, clearing the list held in
     // this. Once this occurs, if a new scope is deleted, a new post will be
     // required.
     auto scope_ids = std::make_shared<std::vector<uint64_t>>();
-    // Capture all the central cache entries for scopes we're deleting. These will be freed after
-    // all threads have completed.
+
+    // Capture all the central cache entries for scopes we're deleting. These
+    // will be freed explicitly after all threads have completed, in the main
+    // thread.
     auto central_caches = std::make_shared<std::vector<CentralCacheEntrySharedPtr>>();
     {
       Thread::LockGuard lock(lock_);
@@ -449,9 +458,28 @@ void ThreadLocalStoreImpl::clearScopesFromCaches() {
       central_cache_entries_to_cleanup_.clear();
     }
 
+    // The TLS cache entries removed by each worker are moved here, so that they
+    // too are destroyed on the main thread. tls_mutex serializes the workers'
+    // appends.
+    auto tls_cache_entries = std::make_shared<std::vector<TlsCacheEntry>>();
+    auto tls_mutex = std::make_shared<Thread::MutexBasicLockable>();
     tls_cache_->runOnAllThreads(
-        [scope_ids](OptRef<TlsCache> tls_cache) { tls_cache->eraseScopes(*scope_ids); },
-        [central_caches]() { /* Holds onto central_caches until all tls caches are clear */ });
+        [scope_ids, tls_cache_entries = tls_cache_entries.get(),
+         tls_mutex](OptRef<TlsCache> tls_cache) {
+          Thread::LockGuard lock(*tls_mutex);
+          tls_cache->eraseScopes(*scope_ids, *tls_cache_entries);
+        },
+        [central_caches, tls_cache_entries]() {
+          // Runs in the main thread after the worker threads are done
+          // populating these lists. We clear the memory held by the
+          // captured containers here. This is because both the captured
+          // references to the containers may still be held by the worker
+          // threads. We want to make sure all stats are removed from the
+          // allocator in the main thread to avoid racing stats sink iteration
+          // in the MetricSnapshotImpl constructor.
+          central_caches->clear();
+          tls_cache_entries->clear();
+        });
   }
 }
 
@@ -1438,7 +1466,7 @@ void ThreadLocalStoreImpl::evictUnused() {
   // local caches are cleared.
   if (!evicted_metrics->empty()) {
     tls_cache_->runOnAllThreads(
-        [evicted_metrics](OptRef<TlsCache> tls_cache) {
+        [evicted_metrics = evicted_metrics.get()](OptRef<TlsCache> tls_cache) {
           for (const auto& metrics : *evicted_metrics) {
             TlsCacheEntry& entry = tls_cache->insertScope(metrics.scope_id_);
             absl::erase_if(entry.counters_,
@@ -1477,6 +1505,14 @@ void ThreadLocalStoreImpl::evictUnused() {
                     "deleted stale {} counters, {} gauges, {} text readouts, {} histograms from "
                     "{} scopes",
                     counters, gauges, readouts, histograms, scopes);
+          // Runs in the main thread after the worker threads are done
+          // populating these lists. We clear the memory held by the
+          // captured containers here. This is because both the captured
+          // references to the containers may still be held by the worker
+          // threads. We want to make sure all stats are removed from the
+          // allocator in the main thread to avoid racing stats sink iteration
+          // in the MetricSnapshotImpl constructor.
+          evicted_metrics->clear();
         });
   }
 }
