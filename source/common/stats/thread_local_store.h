@@ -519,9 +519,7 @@ private:
     // from the main thread.
     CentralCacheEntrySharedPtr releaseCentralCacheLockHeld()
         ABSL_EXCLUSIVE_LOCKS_REQUIRED(parent_.lock_) {
-      CentralCacheEntrySharedPtr central_cache = std::move(central_cache_);
-      central_cache_.reset();
-      return central_cache;
+      return std::move(central_cache_);
     }
 
     CentralCacheEntrySharedPtr&
@@ -574,10 +572,9 @@ private:
   struct TlsCache : public ThreadLocal::ThreadLocalObject {
     TlsCacheEntry& insertScope(uint64_t scope_id);
 
-    // Erases the scopes identified by indices provided in scope_ids. the TLS
-    // cache entries for the scopes are transferred into tls_cache_entries. The
-    // caller must ensure only one thread at a time calls eraseScopes, to avoid
-    // racing the write to tls_cache_entries.
+    // Erases the scopes identified by indices provided in scope_ids. The TLS
+    // cache entries for the scopes are moved into tls_cache_entries, which must
+    // not be shared with another thread during the call.
     void eraseScopes(const std::vector<uint64_t>& scope_ids,
                      std::vector<TlsCacheEntry>& tls_cache_entries);
     void eraseHistograms(const std::vector<uint64_t>& histograms);

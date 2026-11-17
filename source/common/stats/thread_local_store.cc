@@ -1,7 +1,9 @@
 #include "source/common/stats/thread_local_store.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iterator>
 #include <list>
 #include <memory>
 #include <string>
@@ -459,15 +461,21 @@ void ThreadLocalStoreImpl::clearScopesFromCaches() {
     }
 
     // The TLS cache entries removed by each worker are moved here, so that they
-    // too are destroyed on the main thread. tls_mutex serializes the workers'
-    // appends.
+    // too are destroyed on the main thread. Each worker erases into a local
+    // vector and takes tls_mutex only to append it, so workers do not
+    // serialize on the erase itself.
     auto tls_cache_entries = std::make_shared<std::vector<TlsCacheEntry>>();
     auto tls_mutex = std::make_shared<Thread::MutexBasicLockable>();
     tls_cache_->runOnAllThreads(
         [scope_ids, tls_cache_entries = tls_cache_entries.get(),
          tls_mutex](OptRef<TlsCache> tls_cache) {
+          std::vector<TlsCacheEntry> erased;
+          tls_cache->eraseScopes(*scope_ids, erased);
+          if (erased.empty()) {
+            return;
+          }
           Thread::LockGuard lock(*tls_mutex);
-          tls_cache->eraseScopes(*scope_ids, *tls_cache_entries);
+          std::move(erased.begin(), erased.end(), std::back_inserter(*tls_cache_entries));
         },
         [central_caches, tls_cache_entries]() {
           // Runs in the main thread after the worker threads are done
@@ -477,8 +485,10 @@ void ThreadLocalStoreImpl::clearScopesFromCaches() {
           // threads. We want to make sure all stats are removed from the
           // allocator in the main thread to avoid racing stats sink iteration
           // in the MetricSnapshotImpl constructor.
-          central_caches->clear();
+          // The TLS entries refer to stats owned by the central caches, so
+          // clear them first.
           tls_cache_entries->clear();
+          central_caches->clear();
         });
   }
 }
