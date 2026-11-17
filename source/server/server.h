@@ -50,7 +50,6 @@
 #include "source/server/listener_hooks.h"
 #include "source/server/worker_impl.h"
 
-#include "absl/base/attributes.h"
 #include "absl/container/node_hash_map.h"
 #include "absl/functional/function_ref.h"
 
@@ -485,12 +484,6 @@ public:
   static void capture(Stats::Store& store, Upstream::ClusterManager& cluster_manager,
                       TimeSource& time_source, absl::FunctionRef<void(MetricSnapshotImpl&)> fn);
 
-  // MetricSnapshotImpl captures a snapshot of metrics by latching the delta usage, and optionally
-  // marking the stats as used.
-  ABSL_DEPRECATED("use MetricSnapshotImpl::capture(), which bounds the snapshot's lifetime")
-  explicit MetricSnapshotImpl(Stats::Store& store, Upstream::ClusterManager& cluster_manager,
-                              TimeSource& time_source);
-
   // Stats::MetricSnapshot
   const std::vector<CounterSnapshot>& counters() override { return counters_; }
   const std::vector<std::reference_wrapper<const Stats::Gauge>>& gauges() override {
@@ -509,6 +502,11 @@ public:
   SystemTime snapshotTime() const override { return snapshot_time_; }
 
 private:
+  // Only capture() constructs a snapshot, so that its lifetime is bounded by a single main-thread
+  // call. The constructor latches the counters' pending deltas.
+  MetricSnapshotImpl(Stats::Store& store, Upstream::ClusterManager& cluster_manager,
+                     TimeSource& time_source);
+
   std::vector<Stats::CounterSharedPtr> snapped_counters_;
   std::vector<CounterSnapshot> counters_;
   std::vector<Stats::GaugeSharedPtr> snapped_gauges_;

@@ -480,7 +480,6 @@ envoy_cc_library(
         "//source/common/upstream:cluster_manager_lib",
         "//source/common/version:version_lib",
         "//source/server/admin:admin_lib",
-        "@abseil-cpp//absl/base:core_headers",
         "@abseil-cpp//absl/container:node_hash_map",
         "@abseil-cpp//absl/flags:flag",
         "@abseil-cpp//absl/functional:function_ref",
