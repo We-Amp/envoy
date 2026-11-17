@@ -2,6 +2,8 @@
 
 // This file provides host-side implementations for ABI callbacks specific to bootstrap extensions.
 
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "envoy/server/admin.h"
@@ -39,6 +41,33 @@ absl::string_view serializeMetricName(const Envoy::Stats::Metric& metric,
     symbol_table.serializeToBuffer(stat_name, buffer.data(), buffer.size());
   }
   return absl::string_view(buffer.data(), required);
+}
+
+using MetricNameValueVector = std::vector<std::pair<std::string, uint64_t>>;
+
+// Copies the name and value of every counter, so module code can run after the allocator walk,
+// without its lock held and without keeping any counter alive.
+MetricNameValueVector snapshotCounters(Envoy::Stats::Store& stats_store) {
+  MetricNameValueVector result;
+  std::vector<char> name_buffer;
+  stats_store.forEachCounter([&result](size_t size) { result.reserve(size); },
+                             [&result, &name_buffer](Envoy::Stats::Counter& counter) {
+                               result.emplace_back(serializeMetricName(counter, name_buffer),
+                                                   counter.value());
+                             });
+  return result;
+}
+
+// Gauge counterpart of snapshotCounters().
+MetricNameValueVector snapshotGauges(Envoy::Stats::Store& stats_store) {
+  MetricNameValueVector result;
+  std::vector<char> name_buffer;
+  stats_store.forEachGauge([&result](size_t size) { result.reserve(size); },
+                           [&result, &name_buffer](Envoy::Stats::Gauge& gauge) {
+                             result.emplace_back(serializeMetricName(gauge, name_buffer),
+                                                 gauge.value());
+                           });
+  return result;
 }
 
 } // namespace
@@ -129,19 +158,19 @@ bool envoy_dynamic_module_callback_bootstrap_extension_get_counter_value(
   Envoy::Stats::Store& stats_store = extension->statsStore();
   const absl::string_view name_view(name.ptr, name.length);
 
-  // Use iterate() instead of forEachCounter() to enable early exit once the stat is found.
+  // Use iterateRef() so that the callback stops matching once the stat is found.
   thread_local std::vector<char> name_buffer;
   bool found = false;
-  Envoy::Stats::IterateFn<Envoy::Stats::Counter> counter_callback =
-      [&name_view, &found, value_ptr](const Envoy::Stats::CounterSharedPtr& counter) -> bool {
-    if (serializeMetricName(*counter, name_buffer) == name_view) {
-      *value_ptr = counter->value();
+  Envoy::Stats::IterateRefFn<Envoy::Stats::Counter> counter_callback =
+      [&name_view, &found, value_ptr](Envoy::Stats::Counter& counter) -> bool {
+    if (serializeMetricName(counter, name_buffer) == name_view) {
+      *value_ptr = counter.value();
       found = true;
       return false; // Stop iteration.
     }
     return true; // Continue iteration.
   };
-  stats_store.iterate(counter_callback);
+  stats_store.iterateRef(counter_callback);
   return found;
 }
 
@@ -152,19 +181,19 @@ bool envoy_dynamic_module_callback_bootstrap_extension_get_gauge_value(
   Envoy::Stats::Store& stats_store = extension->statsStore();
   const absl::string_view name_view(name.ptr, name.length);
 
-  // Use iterate() instead of forEachGauge() to enable early exit once the stat is found.
+  // Use iterateRef() so that the callback stops matching once the stat is found.
   thread_local std::vector<char> name_buffer;
   bool found = false;
-  Envoy::Stats::IterateFn<Envoy::Stats::Gauge> gauge_callback =
-      [&name_view, &found, value_ptr](const Envoy::Stats::GaugeSharedPtr& gauge) -> bool {
-    if (serializeMetricName(*gauge, name_buffer) == name_view) {
-      *value_ptr = gauge->value();
+  Envoy::Stats::IterateRefFn<Envoy::Stats::Gauge> gauge_callback =
+      [&name_view, &found, value_ptr](Envoy::Stats::Gauge& gauge) -> bool {
+    if (serializeMetricName(gauge, name_buffer) == name_view) {
+      *value_ptr = gauge.value();
       found = true;
       return false; // Stop iteration.
     }
     return true; // Continue iteration.
   };
-  stats_store.iterate(gauge_callback);
+  stats_store.iterateRef(gauge_callback);
   return found;
 }
 
@@ -197,16 +226,14 @@ void envoy_dynamic_module_callback_bootstrap_extension_iterate_counters(
   auto* extension = static_cast<DynamicModuleBootstrapExtension*>(extension_envoy_ptr);
   Envoy::Stats::Store& stats_store = extension->statsStore();
 
-  // Snapshot the counters so the module callback runs without the allocator lock held. A stats call
-  // from the callback would otherwise re-enter the non-recursive allocator lock and deadlock. The
-  // snapshot holds a reference to each counter so it stays alive during iteration, and a local name
-  // buffer keeps a nested iteration from clobbering it.
-  const std::vector<Envoy::Stats::CounterSharedPtr> counters = stats_store.counters();
-  std::vector<char> name_buffer;
-  for (const auto& counter : counters) {
-    absl::string_view name = serializeMetricName(*counter, name_buffer);
+  // Snapshot the names and values so the module callback runs without the allocator lock held. A
+  // stats call from the callback would otherwise re-enter the non-recursive allocator lock and
+  // deadlock. Copying the values rather than holding a reference to each counter keeps this safe on
+  // any thread: no stat is kept alive past the allocator walk.
+  const MetricNameValueVector counters = snapshotCounters(stats_store);
+  for (const auto& [name, value] : counters) {
     envoy_dynamic_module_type_envoy_buffer name_buf{name.data(), name.size()};
-    if (iterator_fn(name_buf, counter->value(), user_data) ==
+    if (iterator_fn(name_buf, value, user_data) ==
         envoy_dynamic_module_type_stats_iteration_action_Stop) {
       break;
     }
@@ -219,16 +246,11 @@ void envoy_dynamic_module_callback_bootstrap_extension_iterate_gauges(
   auto* extension = static_cast<DynamicModuleBootstrapExtension*>(extension_envoy_ptr);
   Envoy::Stats::Store& stats_store = extension->statsStore();
 
-  // Snapshot the gauges so the module callback runs without the allocator lock held. A stats call
-  // from the callback would otherwise re-enter the non-recursive allocator lock and deadlock. The
-  // snapshot holds a reference to each gauge so it stays alive during iteration, and a local name
-  // buffer keeps a nested iteration from clobbering it.
-  const std::vector<Envoy::Stats::GaugeSharedPtr> gauges = stats_store.gauges();
-  std::vector<char> name_buffer;
-  for (const auto& gauge : gauges) {
-    absl::string_view name = serializeMetricName(*gauge, name_buffer);
+  // See envoy_dynamic_module_callback_bootstrap_extension_iterate_counters.
+  const MetricNameValueVector gauges = snapshotGauges(stats_store);
+  for (const auto& [name, value] : gauges) {
     envoy_dynamic_module_type_envoy_buffer name_buf{name.data(), name.size()};
-    if (iterator_fn(name_buf, gauge->value(), user_data) ==
+    if (iterator_fn(name_buf, value, user_data) ==
         envoy_dynamic_module_type_stats_iteration_action_Stop) {
       break;
     }
