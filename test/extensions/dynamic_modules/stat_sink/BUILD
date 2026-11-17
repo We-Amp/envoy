@@ -95,6 +95,7 @@ envoy_extension_cc_test(
         "//source/extensions/dynamic_modules/abi",
         "//source/extensions/stat_sinks/dynamic_modules:abi_impl",
         "//source/extensions/stat_sinks/dynamic_modules:sink_config_lib",
+        "//test/mocks/event:event_mocks",
         "//test/mocks/server:server_factory_context_mocks",
         "//test/mocks/stats:stats_mocks",
         "//test/test_common:thread_factory_for_test_lib",

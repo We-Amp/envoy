@@ -19,6 +19,7 @@ envoy_cc_library(
     deps = [
         ":sink_config_lib",
         "//envoy/common:time_interface",
+        "//envoy/event:dispatcher_interface",
         "//envoy/stats:histogram_interface",
         "//envoy/stats:primitive_stats_interface",
         "//envoy/stats:sink_interface",

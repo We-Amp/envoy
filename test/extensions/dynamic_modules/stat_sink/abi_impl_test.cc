@@ -1,11 +1,13 @@
 #include <string>
 
+#include "source/common/common/thread.h"
 #include "source/common/stats/histogram_impl.h"
 #include "source/extensions/dynamic_modules/abi/abi.h"
 #include "source/extensions/stat_sinks/dynamic_modules/flush_context.h"
 #include "source/extensions/stat_sinks/dynamic_modules/sink_config.h"
 
 #include "test/extensions/dynamic_modules/stat_sink/test_util.h"
+#include "test/mocks/event/mocks.h"
 #include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/test_common/thread_factory_for_test.h"
@@ -44,7 +46,8 @@ public:
   envoy_dynamic_module_type_stat_sink_snapshot_envoy_ptr snapshotHandle() { return &context_; }
 
   NiceMock<Stats::MockMetricSnapshot> snapshot_;
-  DynamicModuleStatsSinkFlushContext context_{snapshot_};
+  NiceMock<Event::MockDispatcher> main_thread_dispatcher_;
+  DynamicModuleStatsSinkFlushContext context_{snapshot_, main_thread_dispatcher_};
 
   NiceMock<Stats::MockCounter> c0_, c1_, c2_;
   NiceMock<Stats::MockGauge> g0_, g1_;
@@ -861,7 +864,28 @@ public:
     g0_.incRefCount();
     h0_.incRefCount();
     h1_.incRefCount();
+    // A release off the main thread posts the deletion to the main thread. Queue those callbacks
+    // so a test can check that nothing is dropped before they run.
+    ON_CALL(main_thread_dispatcher_, post(_)).WillByDefault([this](Event::PostCb cb) {
+      Thread::LockGuard lock(posted_mutex_);
+      posted_.push_back(std::move(cb));
+    });
   }
+
+  // Runs the callbacks posted to the main thread dispatcher.
+  void runPostedOnMainThread() {
+    std::vector<Event::PostCb> posted;
+    {
+      Thread::LockGuard lock(posted_mutex_);
+      posted.swap(posted_);
+    }
+    for (auto& cb : posted) {
+      cb();
+    }
+  }
+
+  Thread::MutexBasicLockable posted_mutex_;
+  std::vector<Event::PostCb> posted_ ABSL_GUARDED_BY(posted_mutex_);
 
   // Fills the flush snapshot with one stat of each kind, plus a second histogram.
   void populateSnapshot() {
@@ -1106,6 +1130,12 @@ TEST_F(DynamicModuleStatsSinkRetainAbiTest, RetainedHandleReadAndReleasedOnAnoth
   EXPECT_EQ("cluster.foo.rq_total", name);
   EXPECT_EQ(100u, value);
   EXPECT_EQ(7u, delta);
+  // The release happened off the main thread, so the references are still held until the posted
+  // deletion runs on the main thread.
+  EXPECT_EQ(2u, c0_.use_count());
+  EXPECT_EQ(2u, h0_.use_count());
+  EXPECT_EQ(2u, h1_.use_count());
+  runPostedOnMainThread();
   EXPECT_EQ(1u, c0_.use_count());
   EXPECT_EQ(1u, h0_.use_count());
   EXPECT_EQ(1u, h1_.use_count());
@@ -1145,13 +1175,17 @@ TEST_F(DynamicModuleStatsSinkRetainAbiTest, RetainedHandleRetainedOnAnotherThrea
   ASSERT_NE(nullptr, second);
   EXPECT_NE(first, second);
   EXPECT_EQ(3u, use_count_after_retain);
-  EXPECT_EQ(2u, c0_.use_count());
+  // The first handle was released off the main thread; its references are dropped only once the
+  // posted deletion runs on the main thread.
+  EXPECT_EQ(3u, c0_.use_count());
   EXPECT_EQ("cluster.foo.rq_total", name);
   EXPECT_EQ(100u, value);
   EXPECT_EQ(7u, delta);
   EXPECT_EQ(expected_sample_count, sample_count);
 
   envoy_dynamic_module_callback_stat_sink_snapshot_release(second);
+  EXPECT_EQ(2u, c0_.use_count());
+  runPostedOnMainThread();
   EXPECT_EQ(1u, c0_.use_count());
   EXPECT_EQ(1u, h0_.use_count());
   EXPECT_EQ(1u, h1_.use_count());

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "envoy/common/time.h"
+#include "envoy/event/dispatcher.h"
 #include "envoy/stats/histogram.h"
 #include "envoy/stats/primitive_stats.h"
 #include "envoy/stats/sink.h"
@@ -50,14 +51,20 @@ class DynamicModuleStatsSinkRetainedSnapshot;
  * linear.
  */
 struct DynamicModuleStatsSinkFlushContext {
-  explicit DynamicModuleStatsSinkFlushContext(Stats::MetricSnapshot& snapshot)
-      : snapshot_(snapshot) {}
   DynamicModuleStatsSinkFlushContext(Stats::MetricSnapshot& snapshot,
+                                     Event::Dispatcher& main_thread_dispatcher)
+      : snapshot_(snapshot), main_thread_dispatcher_(main_thread_dispatcher) {}
+  DynamicModuleStatsSinkFlushContext(Stats::MetricSnapshot& snapshot,
+                                     Event::Dispatcher& main_thread_dispatcher,
                                      const DynamicModuleStatsSinkFrozenValues& frozen,
                                      DynamicModuleStatsSinkRetainedSnapshot& owner)
-      : snapshot_(snapshot), frozen_(&frozen), owner_(&owner) {}
+      : snapshot_(snapshot), main_thread_dispatcher_(main_thread_dispatcher), frozen_(&frozen),
+        owner_(&owner) {}
 
   Stats::MetricSnapshot& snapshot_;
+  // Retained snapshots released off the main thread are deleted here; see
+  // envoy_dynamic_module_callback_stat_sink_snapshot_release.
+  Event::Dispatcher& main_thread_dispatcher_;
   // Set only for a retained snapshot.
   const DynamicModuleStatsSinkFrozenValues* frozen_ = nullptr;
   DynamicModuleStatsSinkRetainedSnapshot* owner_ = nullptr;
@@ -80,9 +87,10 @@ struct DynamicModuleStatsSinkFlushContext {
  * thread. Reads after construction only touch the frozen values and the immutable name and tag
  * storage of the referenced stats, so one thread at a time may read it anywhere.
  *
- * Dropping the stat references off the main thread is supported: counters, gauges, and text
- * readouts take the allocator lock for their final decrement, and histograms hand their cache
- * cleanup back to the main thread.
+ * The module may release it on any thread. A release off the main thread posts the deletion to the
+ * main thread dispatcher, so the stat references it holds are always dropped on the main thread.
+ * Stats are only destroyed on the main thread, which is what lets the per-flush snapshot read stats
+ * without holding a reference to each of them.
  */
 class DynamicModuleStatsSinkRetainedSnapshot : public Stats::MetricSnapshot {
 public:
@@ -128,7 +136,7 @@ private:
   const std::vector<Stats::PrimitiveGaugeSnapshot> host_gauges_;
   const SystemTime snapshot_time_;
   DynamicModuleStatsSinkFrozenValues frozen_;
-  DynamicModuleStatsSinkFlushContext context_{*this, frozen_, *this};
+  DynamicModuleStatsSinkFlushContext context_;
 };
 
 } // namespace DynamicModules

@@ -177,7 +177,8 @@ namespace DynamicModules {
 
 DynamicModuleStatsSinkRetainedSnapshot::DynamicModuleStatsSinkRetainedSnapshot(
     DynamicModuleStatsSinkFlushContext& source)
-    : snapshot_time_(source.snapshot_.snapshotTime()) {
+    : snapshot_time_(source.snapshot_.snapshotTime()),
+      context_(*this, source.main_thread_dispatcher_, frozen_, *this) {
   // The flush hook's handle reads live stats, and its histogram statistics are only stable on the
   // main thread. A retained source only exposes its frozen values and stats it already references,
   // so adding references to them is a lock-free increment from a count of at least one, which is
@@ -274,7 +275,16 @@ void envoy_dynamic_module_callback_stat_sink_snapshot_release(
   // Releasing the borrowed flush handle is a module bug. Ignore it rather than free Envoy's own
   // snapshot.
   ASSERT(owner != nullptr);
-  delete owner;
+  if (owner == nullptr) {
+    return;
+  }
+  if (Envoy::Thread::MainThread::isMainOrTestThread()) {
+    delete owner;
+    return;
+  }
+  // The retained snapshot holds a reference on every stat in it, and stats must only be destroyed
+  // on the main thread, so a release on any other thread drops those references there.
+  owner->context().main_thread_dispatcher_.post([owner]() { delete owner; });
 }
 
 size_t envoy_dynamic_module_callback_stat_sink_snapshot_get_counter_count(

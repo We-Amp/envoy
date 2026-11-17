@@ -17,7 +17,7 @@ DynamicModuleStatsSink::DynamicModuleStatsSink(DynamicModuleStatsSinkConfigShare
 
 void DynamicModuleStatsSink::flush(Stats::MetricSnapshot& snapshot) {
   ASSERT(config_->on_flush_ != nullptr);
-  DynamicModuleStatsSinkFlushContext context(snapshot);
+  DynamicModuleStatsSinkFlushContext context(snapshot, config_->main_thread_dispatcher_);
   config_->on_flush_(config_->in_module_config_, &context);
 }
 
