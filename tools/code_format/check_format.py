@@ -408,6 +408,11 @@ class FormatChecker:
     def allow_listed_for_raw_try(self, file_path):
         return file_path in self.config.paths["raw_try"]["include"]
 
+    def allow_listed_for_stats_shared_ptr(self, file_path):
+        # Only production code is checked; tests may hold stat references.
+        return ("/test/" in file_path or file_path.startswith("./test/")
+                or file_path.startswith(self.config.paths["stats_shared_ptr"]["include"]))
+
     def deny_listed_for_exceptions(self, file_path):
         # Returns if this file is deny listed for exceptions.
         # Header files are strongly discouraged from throwing exceptions, both for
@@ -751,6 +756,13 @@ class FormatChecker:
             report_error("The MOCK_METHODn() macros should not be used, use MOCK_METHOD() instead")
         if self.config.re["for_each_n"].search(line):
             report_error("std::for_each_n should not be used, use an alternative for loop instead")
+
+        if (self.is_in_subdir(file_path, "source", "envoy", "contrib", "mobile")
+                and not self.allow_listed_for_stats_shared_ptr(file_path)
+                and self.config.re["stats_shared_ptr"].search(line)):
+            report_error(
+                "Don't hold refcounted pointers to individual stats outside the stats system; "
+                "see https://github.com/envoyproxy/envoy/issues/43836")
 
         if not self.allow_listed_for_serialize_as_string(file_path) and "SerializeAsString" in line:
             # The MessageLite::SerializeAsString doesn't generate deterministic serialization,

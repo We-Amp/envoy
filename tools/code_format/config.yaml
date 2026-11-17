@@ -252,6 +252,22 @@ paths:
     - source/common/common/thread.h
     - source/exe/terminate_handler.cc
 
+  # Production paths that may hold refcounted pointers to individual stats. Elsewhere, take stats
+  # by reference from a scope and keep the scope alive instead. Stats must only be destroyed on the
+  # main thread, so that a metrics snapshot can read them without taking a reference on each one.
+  # See https://github.com/envoyproxy/envoy/issues/43836. Prefix match.
+  stats_shared_ptr:
+    include:
+    - envoy/stats/
+    - source/common/stats/
+    # Streams /stats across several main-thread calls; takes and drops references on the main
+    # thread only.
+    - source/server/admin/stats_request.
+    # Holds references for a module that retains a flush snapshot; drops them on the main thread.
+    - source/extensions/stat_sinks/dynamic_modules/
+    # MetricSnapshotImpl, until it holds scopes instead of per-stat references.
+    - source/server/server.
+
   # Files matching these exact names can reference real-world time. These include the class
   # definitions for real-world time, the construction of them in main(), and perf annotation.
   # For now it includes the validation server but that really should be injected too.
@@ -392,6 +408,7 @@ re:
   duration_value: \b[Dd]uration\(([0-9.]+)
   # C++17 feature, lacks sufficient support across various libraries / compilers.
   for_each_n: for_each_n\(
+  stats_shared_ptr: \b(?:(?:Counter|Gauge|TextReadout|Histogram|ParentHistogram)SharedPtr|RefcountPtr<(?:Stats::)?(?:Counter|Gauge|TextReadout|Histogram|ParentHistogram)>)
   histogram_si_suffix: (?<=HISTOGRAM\()[a-zA-Z0-9_]+_(b|kb|mb|ns|us|ms|s)(?=,)
   line_number: ^(\d+)[a|c|d]?\d*(?:,\d+[a|c|d]?\d*)?$
   mangled_protobuf_name: envoy::[a-z0-9_:]+::[A-Z][a-z]\w*_\w*_[A-Z]{2}
