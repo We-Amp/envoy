@@ -50,7 +50,9 @@
 #include "source/server/listener_hooks.h"
 #include "source/server/worker_impl.h"
 
+#include "absl/base/attributes.h"
 #include "absl/container/node_hash_map.h"
+#include "absl/functional/function_ref.h"
 
 namespace Envoy {
 namespace Server {
@@ -471,8 +473,21 @@ private:
 //                     copying and probably be a cleaner API in general.
 class MetricSnapshotImpl : public Stats::MetricSnapshot {
 public:
+  /**
+   * Captures a snapshot of the store's sinked metrics, latching counter deltas, and passes it to
+   * `fn`. The snapshot exists only for the duration of the call.
+   *
+   * Must be called on the main thread. `fn` must not yield the main thread, for example by
+   * running a nested event loop or waiting for a main-thread post: the snapshot refers to stats
+   * that are only guaranteed to stay alive until the main thread processes its next event.
+   * `fn` must not keep references to the snapshot or to the stats in it after it returns.
+   */
+  static void capture(Stats::Store& store, Upstream::ClusterManager& cluster_manager,
+                      TimeSource& time_source, absl::FunctionRef<void(MetricSnapshotImpl&)> fn);
+
   // MetricSnapshotImpl captures a snapshot of metrics by latching the delta usage, and optionally
   // marking the stats as used.
+  ABSL_DEPRECATED("use MetricSnapshotImpl::capture(), which bounds the snapshot's lifetime")
   explicit MetricSnapshotImpl(Stats::Store& store, Upstream::ClusterManager& cluster_manager,
                               TimeSource& time_source);
 

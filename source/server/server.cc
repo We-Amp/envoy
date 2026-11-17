@@ -238,16 +238,25 @@ MetricSnapshotImpl::MetricSnapshotImpl(Stats::Store& store,
   snapshot_time_ = time_source.systemTime();
 }
 
+void MetricSnapshotImpl::capture(Stats::Store& store, Upstream::ClusterManager& cluster_manager,
+                                 TimeSource& time_source,
+                                 absl::FunctionRef<void(MetricSnapshotImpl&)> fn) {
+  ASSERT_IS_MAIN_OR_TEST_THREAD();
+  MetricSnapshotImpl snapshot(store, cluster_manager, time_source);
+  fn(snapshot);
+}
+
 void InstanceUtil::flushMetricsToSinks(const std::list<Stats::SinkPtr>& sinks, Stats::Store& store,
                                        Upstream::ClusterManager& cm, TimeSource& time_source) {
   // Create a snapshot and flush to all sinks.
   // NOTE: Even if there are no sinks, creating the snapshot has the important property that it
   //       latches all counters on a periodic basis. The hot restart code assumes this is being
   //       done so this should not be removed.
-  MetricSnapshotImpl snapshot(store, cm, time_source);
-  for (const auto& sink : sinks) {
-    sink->flush(snapshot);
-  }
+  MetricSnapshotImpl::capture(store, cm, time_source, [&sinks](MetricSnapshotImpl& snapshot) {
+    for (const auto& sink : sinks) {
+      sink->flush(snapshot);
+    }
+  });
 }
 
 void InstanceBase::flushStats() { flushStatsImpl(); }
