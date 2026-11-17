@@ -18,6 +18,8 @@
 #include "source/common/stats/allocator.h"
 #include "source/common/stats/symbol_table.h"
 
+#include "test/common/stats/allocator_peer.h"
+
 #include "absl/strings/str_cat.h"
 #include "benchmark/benchmark.h"
 
@@ -30,8 +32,8 @@ public:
   explicit DecRefCountFixture(size_t num_counters) : alloc_(symbol_table_), pool_(symbol_table_) {
     counters_.reserve(num_counters);
     for (size_t i = 0; i < num_counters; ++i) {
-      counters_.push_back(
-          alloc_.makeCounter(pool_.add(absl::StrCat("benchmark.counter.", i)), StatName(), {}));
+      counters_.push_back(TestUtil::AllocatorPeer::makeCounter(
+          alloc_, pool_.add(absl::StrCat("benchmark.counter.", i)), StatName(), {}));
     }
   }
 

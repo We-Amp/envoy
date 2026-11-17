@@ -16,6 +16,7 @@ envoy_cc_test(
     name = "allocator_test",
     srcs = ["allocator_test.cc"],
     deps = [
+        ":allocator_peer_lib",
         "//source/common/stats:allocator_lib",
         "//test/test_common:logging_lib",
         "//test/test_common:thread_factory_for_test_lib",
@@ -83,6 +84,7 @@ envoy_cc_test(
     name = "metric_impl_test",
     srcs = ["metric_impl_test.cc"],
     deps = [
+        ":allocator_peer_lib",
         "//source/common/stats:allocator_lib",
         "//source/common/stats:utility_lib",
         "//test/test_common:logging_lib",
@@ -128,6 +130,12 @@ envoy_cc_test(
         "//source/common/stats:thread_local_store_lib",
         "//test/test_common:utility_lib",
     ],
+)
+
+envoy_cc_test_library(
+    name = "allocator_peer_lib",
+    hdrs = ["allocator_peer.h"],
+    deps = ["//source/common/stats:allocator_lib"],
 )
 
 envoy_cc_test_library(
@@ -399,6 +407,7 @@ envoy_cc_test(
         },
     },
     deps = [
+        ":allocator_peer_lib",
         ":real_thread_test_base",
         ":stat_test_utility_lib",
         "//source/common/memory:stats_lib",
@@ -463,6 +472,7 @@ envoy_cc_benchmark_binary(
     name = "dec_ref_count_speed_test",
     srcs = ["dec_ref_count_speed_test.cc"],
     deps = [
+        ":allocator_peer_lib",
         "//source/common/common:assert_lib",
         "//source/common/stats:allocator_lib",
         "//source/common/stats:symbol_table_lib",

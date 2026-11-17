@@ -271,6 +271,7 @@ envoy_cc_test(
         },
     },
     deps = [
+        "//test/common/stats:allocator_peer_lib",
         "//source/common/stats:tag_producer_lib",
         "//source/common/stats:thread_local_store_lib",
         "//source/server/admin:prometheus_stats_lib",

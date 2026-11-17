@@ -3,6 +3,7 @@
 #include "source/common/stats/allocator.h"
 #include "source/common/stats/utility.h"
 
+#include "test/common/stats/allocator_peer.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/test_common/logging.h"
 
@@ -19,6 +20,13 @@ protected:
 
   StatName makeStat(absl::string_view name) { return pool_.add(name); }
 
+  // Allocator's stat-creation methods are private; production code creates
+  // stats through a Scope.
+  CounterSharedPtr makeCounter(StatName name, StatName tag_extracted_name,
+                               StatNameTagSpan stat_name_tags) {
+    return TestUtil::AllocatorPeer::makeCounter(alloc_, name, tag_extracted_name, stat_name_tags);
+  }
+
   void clearStorage() {
     pool_.clear();
     EXPECT_EQ(num_base_symbols_, symbol_table_.numSymbols());
@@ -33,12 +41,12 @@ protected:
 
 // No truncation occurs in the implementation of HeapStatData.
 TEST_F(MetricImplTest, NoTags) {
-  CounterSharedPtr counter = alloc_.makeCounter(makeStat("counter"), StatName(), {});
+  CounterSharedPtr counter = makeCounter(makeStat("counter"), StatName(), {});
   EXPECT_EQ(0, counter->tags().size());
 }
 
 TEST_F(MetricImplTest, OneTag) {
-  CounterSharedPtr counter = alloc_.makeCounter(makeStat("counter.name.value"), makeStat("counter"),
+  CounterSharedPtr counter = makeCounter(makeStat("counter.name.value"), makeStat("counter"),
                                                 {{makeStat("name"), makeStat("value")}});
   TagVector tags = counter->tags();
   ASSERT_EQ(1, tags.size());
@@ -50,7 +58,7 @@ TEST_F(MetricImplTest, OneTag) {
 }
 
 TEST_F(MetricImplTest, TwoTagsIterOnce) {
-  CounterSharedPtr counter = alloc_.makeCounter(
+  CounterSharedPtr counter = makeCounter(
       makeStat("counter.name.value"), makeStat("counter"),
       {{makeStat("name1"), makeStat("value1")}, {makeStat("name2"), makeStat("value2")}});
   StatName name1 = makeStat("name1");
@@ -66,7 +74,7 @@ TEST_F(MetricImplTest, TwoTagsIterOnce) {
 }
 
 TEST_F(MetricImplTest, FindTag) {
-  CounterSharedPtr counter = alloc_.makeCounter(
+  CounterSharedPtr counter = makeCounter(
       makeStat("counter.name.value"), makeStat("counter"),
       {{makeStat("name1"), makeStat("value1")}, {makeStat("name2"), makeStat("value2")}});
   EXPECT_EQ(makeStat("value1"), Utility::findTag(*counter, makeStat("name1")));

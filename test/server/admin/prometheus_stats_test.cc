@@ -15,6 +15,7 @@
 #include "source/common/stats/thread_local_store.h"
 #include "source/server/admin/prometheus_stats.h"
 
+#include "test/common/stats/allocator_peer.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/server_factory_context.h"
 #include "test/mocks/stats/mocks.h"
@@ -71,8 +72,8 @@ protected:
   void addCounter(const std::string& name, Stats::StatNameTagVector cluster_tags) {
     Stats::StatNameManagedStorage name_storage(baseName(name, cluster_tags), *symbol_table_);
     Stats::StatNameManagedStorage tag_extracted_name_storage(name, *symbol_table_);
-    counter_refs_.push_back(alloc_.makeCounter(
-        name_storage.statName(), tag_extracted_name_storage.statName(), cluster_tags));
+    counter_refs_.push_back(Stats::TestUtil::AllocatorPeer::makeCounter(
+        alloc_, name_storage.statName(), tag_extracted_name_storage.statName(), cluster_tags));
     counters_.push_back(counter_refs_.back().get());
   }
 
@@ -80,8 +81,9 @@ protected:
                 Stats::Gauge::ImportMode import_mode = Stats::Gauge::ImportMode::Accumulate) {
     Stats::StatNameManagedStorage name_storage(baseName(name, cluster_tags), *symbol_table_);
     Stats::StatNameManagedStorage tag_extracted_name_storage(name, *symbol_table_);
-    gauge_refs_.push_back(alloc_.makeGauge(
-        name_storage.statName(), tag_extracted_name_storage.statName(), cluster_tags, import_mode));
+    gauge_refs_.push_back(Stats::TestUtil::AllocatorPeer::makeGauge(
+        alloc_, name_storage.statName(), tag_extracted_name_storage.statName(), cluster_tags,
+        import_mode));
     gauges_.push_back(gauge_refs_.back().get());
   }
 
@@ -89,8 +91,8 @@ protected:
                       Stats::StatNameTagVector cluster_tags) {
     Stats::StatNameManagedStorage name_storage(baseName(name, cluster_tags), *symbol_table_);
     Stats::StatNameManagedStorage tag_extracted_name_storage(name, *symbol_table_);
-    Stats::TextReadoutSharedPtr textReadout = alloc_.makeTextReadout(
-        name_storage.statName(), tag_extracted_name_storage.statName(), cluster_tags);
+    Stats::TextReadoutSharedPtr textReadout = Stats::TestUtil::AllocatorPeer::makeTextReadout(
+        alloc_, name_storage.statName(), tag_extracted_name_storage.statName(), cluster_tags);
     textReadout->set(value);
     text_readout_refs_.push_back(textReadout);
     textReadouts_.push_back(textReadout.get());

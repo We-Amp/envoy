@@ -15,6 +15,10 @@
 namespace Envoy {
 namespace Stats {
 
+namespace TestUtil {
+class AllocatorPeer;
+} // namespace TestUtil
+
 /**
  * Helper class for Store to manage memory for statistics.
  */
@@ -36,32 +40,6 @@ public:
   GaugeSharedPtr findGauge(StatName name) const;
   TextReadoutSharedPtr findTextReadout(StatName name) const;
 
-  /**
-   * @param name the full name of the stat.
-   * @param tag_extracted_name the name of the stat with tag-values stripped out.
-   * @param tags the tag values.
-   * @return CounterSharedPtr a counter.
-   */
-  CounterSharedPtr makeCounter(StatName name, StatName tag_extracted_name,
-                               StatNameTagSpan stat_name_tags);
-
-  /**
-   * @param name the full name of the stat.
-   * @param tag_extracted_name the name of the stat with tag-values stripped out.
-   * @param stat_name_tags the tag values.
-   * @return GaugeSharedPtr a gauge.
-   */
-  GaugeSharedPtr makeGauge(StatName name, StatName tag_extracted_name,
-                           StatNameTagSpan stat_name_tags, Gauge::ImportMode import_mode);
-
-  /**
-   * @param name the full name of the stat.
-   * @param tag_extracted_name the name of the stat with tag-values stripped out.
-   * @param tags the tag values.
-   * @return TextReadoutSharedPtr a text readout.
-   */
-  TextReadoutSharedPtr makeTextReadout(StatName name, StatName tag_extracted_name,
-                                       StatNameTagSpan stat_name_tags);
   SymbolTable& symbolTable() { return symbol_table_; }
   const SymbolTable& constSymbolTable() const { return symbol_table_; }
 
@@ -131,7 +109,44 @@ private:
   template <class BaseClass> friend class StatsSharedImpl;
   friend class CounterImpl;
   friend class GaugeImpl;
+  friend class IsolatedStoreImpl;
   friend class TextReadoutImpl;
+  friend class ThreadLocalStoreImpl;
+  friend class TestUtil::AllocatorPeer;
+
+  // Stats are created only by the stores, through a Scope, never directly by
+  // filters or other production code. That way every stat is owned by at
+  // least one scope, and MetricSnapshotImpl can keep the stats it collects
+  // alive by holding the scopes, instead of taking a reference on every
+  // individual stat, which is slow (#43836), particularly on ARM. Tests use
+  // TestUtil::AllocatorPeer.
+
+  /**
+   * @param name the full name of the stat.
+   * @param tag_extracted_name the name of the stat with tag-values stripped out.
+   * @param tags the tag values.
+   * @return CounterSharedPtr a counter.
+   */
+  CounterSharedPtr makeCounter(StatName name, StatName tag_extracted_name,
+                               StatNameTagSpan stat_name_tags);
+
+  /**
+   * @param name the full name of the stat.
+   * @param tag_extracted_name the name of the stat with tag-values stripped out.
+   * @param stat_name_tags the tag values.
+   * @return GaugeSharedPtr a gauge.
+   */
+  GaugeSharedPtr makeGauge(StatName name, StatName tag_extracted_name,
+                           StatNameTagSpan stat_name_tags, Gauge::ImportMode import_mode);
+
+  /**
+   * @param name the full name of the stat.
+   * @param tag_extracted_name the name of the stat with tag-values stripped out.
+   * @param tags the tag values.
+   * @return TextReadoutSharedPtr a text readout.
+   */
+  TextReadoutSharedPtr makeTextReadout(StatName name, StatName tag_extracted_name,
+                                       StatNameTagSpan stat_name_tags);
 
   // A mutex is needed here to protect both the stats_ object from both
   // alloc() and free() operations. Although alloc() operations are called under existing locking,
