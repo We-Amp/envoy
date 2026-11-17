@@ -266,8 +266,6 @@ paths:
     - source/server/admin/stats_request.
     # Holds references for a module that retains a flush snapshot; drops them on the main thread.
     - source/extensions/stat_sinks/dynamic_modules/
-    # MetricSnapshotImpl, until it holds scopes instead of per-stat references.
-    - source/server/server.
 
   # Files matching these exact names can reference real-world time. These include the class
   # definitions for real-world time, the construction of them in main(), and perf annotation.

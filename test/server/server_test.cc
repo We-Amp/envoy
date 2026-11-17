@@ -134,6 +134,28 @@ TEST(ServerInstanceUtil, flushHelper) {
   InstanceUtil::flushMetricsToSinks(sinks, mock_store, cm, time_system);
 }
 
+// The snapshot keeps its stats alive by holding their scopes rather than by
+// taking a reference on every stat, which made flushing large stores slow (#43836).
+TEST(ServerInstanceUtil, FlushDoesNotReferenceIndividualStats) {
+  NiceMock<Upstream::MockClusterManager> cm;
+  Stats::TestUtil::TestStore store;
+  Event::SimulatedTimeSystem time_system;
+  Stats::ScopeSharedPtr scope = store.createScope("scope");
+  Stats::Counter& counter = scope->counterFromString("counter");
+  counter.inc();
+  const uint32_t use_count = counter.use_count();
+
+  std::list<Stats::SinkPtr> sinks;
+  Stats::MockSink* sink = new StrictMock<Stats::MockSink>();
+  sinks.emplace_back(sink);
+  EXPECT_CALL(*sink, flush(_)).WillOnce([&](Stats::MetricSnapshot& snapshot) {
+    ASSERT_EQ(1, snapshot.counters().size());
+    EXPECT_EQ(&counter, &snapshot.counters()[0].counter_.get());
+    EXPECT_EQ(use_count, counter.use_count());
+  });
+  InstanceUtil::flushMetricsToSinks(sinks, store, cm, time_system);
+}
+
 TEST(ServerInstanceUtil, flushImportModeUninitializedGauges) {
   InSequence s;
 
