@@ -609,15 +609,6 @@ private:
   bool iterateScopesLockHeld(const std::function<bool(const ScopeImplSharedPtr&)> fn) const
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
-  // The Store versions of iterate cover all the scopes in the store.
-  template <class StatFn> bool iterHelper(StatFn fn) const {
-    return iterateScopes([this, fn](const ScopeImplSharedPtr& scope)
-                             ABSL_EXCLUSIVE_LOCKS_REQUIRED(lock_) -> bool {
-                               assertLocked(*scope);
-                               return scope->iterateLockHeld(fn);
-                             });
-  }
-
   std::string getTagsForName(const std::string& name, TagVector& tags) const;
   void clearScopesFromCaches();
   void clearHistogramsFromCaches();

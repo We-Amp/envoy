@@ -530,7 +530,7 @@ ThreadLocalStoreImpl::ScopeImpl::~ScopeImpl() {
 
   // Note that scope iteration is thread-safe due to the lock held in
   // releaseScopeCrossThread. For more details see the comment in
-  // `ThreadLocalStoreImpl::iterHelper`, and the lock it takes prior to the loop.
+  // `ThreadLocalStoreImpl::iterateScopesLockHeld`, and the lock taken before calling it.
   parent_.releaseScopeCrossThread(this);
   prefix_list_.clear(symbolTable());
 }
