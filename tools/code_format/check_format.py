@@ -758,11 +758,16 @@ class FormatChecker:
             report_error("std::for_each_n should not be used, use an alternative for loop instead")
 
         if (self.is_in_subdir(file_path, "source", "envoy", "contrib", "mobile")
-                and not self.allow_listed_for_stats_shared_ptr(file_path)
-                and self.config.re["stats_shared_ptr"].search(line)):
-            report_error(
-                "Don't hold refcounted pointers to individual stats outside the stats system; "
-                "see https://github.com/envoyproxy/envoy/issues/43836")
+                and not self.allow_listed_for_stats_shared_ptr(file_path)):
+            if self.config.re["stats_shared_ptr"].search(line):
+                report_error(
+                    "Don't hold refcounted pointers to individual stats outside the stats system; "
+                    "see https://github.com/envoyproxy/envoy/issues/43836")
+            if self.config.re["stats_shared_ptr_accessors"].search(line):
+                report_error(
+                    "Don't use Store::counters()/gauges()/textReadouts()/histograms() or "
+                    "IterateFn; use forEach*() or iterateRef(). "
+                    "See https://github.com/envoyproxy/envoy/issues/43836")
 
         if not self.allow_listed_for_serialize_as_string(file_path) and "SerializeAsString" in line:
             # The MessageLite::SerializeAsString doesn't generate deterministic serialization,

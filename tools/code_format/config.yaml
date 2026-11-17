@@ -260,8 +260,9 @@ paths:
     include:
     - envoy/stats/
     - source/common/stats/
-    # Streams /stats across several main-thread calls; takes and drops references on the main
-    # thread only.
+    # Streams /stats across several main-thread calls. Takes and drops references on the main
+    # thread, except that an embedder destroying an AdminResponse off the main thread destroys the
+    # request there (source/exe/admin_response.cc); see #43836 follow-ups.
     - source/server/admin/stats_request.
     # Holds references for a module that retains a flush snapshot; drops them on the main thread.
     - source/extensions/stat_sinks/dynamic_modules/
@@ -409,6 +410,10 @@ re:
   # C++17 feature, lacks sufficient support across various libraries / compilers.
   for_each_n: for_each_n\(
   stats_shared_ptr: \b(?:(?:Counter|Gauge|TextReadout|Histogram|ParentHistogram)SharedPtr|RefcountPtr<(?:Stats::)?(?:Counter|Gauge|TextReadout|Histogram|ParentHistogram)>)
+  # Deprecated accessors that hand out refcounted stats, also when the result is bound with auto
+  # or consumed by a range-for. Heuristic: matched on common receiver names, because hosts and
+  # metric snapshots have accessors with the same names.
+  stats_shared_ptr_accessors: \bIterateFn<|\b(?:store|stats_store|stat_store|statStore|statsStore)_?(?:\(\))?(?:\.|->)(?:counters|gauges|textReadouts|histograms)\(\)
   histogram_si_suffix: (?<=HISTOGRAM\()[a-zA-Z0-9_]+_(b|kb|mb|ns|us|ms|s)(?=,)
   line_number: ^(\d+)[a|c|d]?\d*(?:,\d+[a|c|d]?\d*)?$
   mangled_protobuf_name: envoy::[a-z0-9_:]+::[A-Z][a-z]\w*_\w*_[A-Z]{2}
