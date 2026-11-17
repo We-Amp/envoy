@@ -184,6 +184,14 @@ void StatsHandler::prometheusRender(Stats::Store& stats,
                                     const Http::RequestHeaderMap& request_headers,
                                     Http::ResponseHeaderMap& response_headers,
                                     Buffer::Instance& response) {
+  // Pin every scope for the duration of the render, so the stats that were in a live scope stay
+  // alive however the scopes are released meanwhile. Stats are otherwise only destroyed on the
+  // main thread, which this call does not yield.
+  std::vector<Stats::ConstScopeSharedPtr> scopes;
+  stats.forEachScope(
+      [&scopes](std::size_t size) { scopes.reserve(size); },
+      [&scopes](const Stats::Scope& scope) { scopes.push_back(scope.getConstShared()); });
+
   std::vector<Stats::Counter*> counters = Stats::Utility::countersMainThread(stats);
   std::vector<Stats::Gauge*> gauges = Stats::Utility::gaugesMainThread(stats);
   std::vector<Stats::ParentHistogram*> histograms = Stats::Utility::histogramsMainThread(stats);
