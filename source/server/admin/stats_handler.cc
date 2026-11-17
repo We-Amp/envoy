@@ -10,6 +10,7 @@
 #include "source/common/common/empty_string.h"
 #include "source/common/http/headers.h"
 #include "source/common/http/utility.h"
+#include "source/common/stats/main_thread_utility.h"
 #include "source/server/admin/prometheus_stats.h"
 #include "source/server/admin/stats_request.h"
 
@@ -51,9 +52,7 @@ StatsHandler::StatsHandler(Server::Instance& server) : HandlerContextBase(server
 
 Http::Code StatsHandler::handlerResetCounters(Http::ResponseHeaderMap&, Buffer::Instance& response,
                                               AdminStream&) {
-  for (const Stats::CounterSharedPtr& counter : server_.stats().counters()) {
-    counter->reset();
-  }
+  server_.stats().forEachCounter(nullptr, [](Stats::Counter& counter) { counter.reset(); });
   server_.stats().symbolTable().clearRecentLookups();
   response.add("OK\n");
   return Http::Code::OK;
@@ -185,12 +184,17 @@ void StatsHandler::prometheusRender(Stats::Store& stats,
                                     const Http::RequestHeaderMap& request_headers,
                                     Http::ResponseHeaderMap& response_headers,
                                     Buffer::Instance& response) {
-  const std::vector<Stats::TextReadoutSharedPtr>& text_readouts_vec =
-      params.prometheus_text_readouts_ ? stats.textReadouts()
-                                       : std::vector<Stats::TextReadoutSharedPtr>();
-  PrometheusStatsFormatter::statsAsPrometheus(
-      stats.counters(), stats.gauges(), stats.histograms(), text_readouts_vec, cluster_manager,
-      request_headers, response_headers, response, params, custom_namespaces);
+  std::vector<Stats::Counter*> counters = Stats::Utility::countersMainThread(stats);
+  std::vector<Stats::Gauge*> gauges = Stats::Utility::gaugesMainThread(stats);
+  std::vector<Stats::ParentHistogram*> histograms = Stats::Utility::histogramsMainThread(stats);
+  std::vector<Stats::TextReadout*> text_readouts;
+  if (params.prometheus_text_readouts_) {
+    text_readouts = Stats::Utility::textReadoutsMainThread(stats);
+  }
+
+  PrometheusStatsFormatter::statsAsPrometheus(counters, gauges, histograms, text_readouts,
+                                              cluster_manager, request_headers, response_headers,
+                                              response, params, custom_namespaces);
 }
 
 Http::Code StatsHandler::handlerContention(Http::ResponseHeaderMap& response_headers,

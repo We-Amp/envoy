@@ -71,16 +71,18 @@ protected:
   void addCounter(const std::string& name, Stats::StatNameTagVector cluster_tags) {
     Stats::StatNameManagedStorage name_storage(baseName(name, cluster_tags), *symbol_table_);
     Stats::StatNameManagedStorage tag_extracted_name_storage(name, *symbol_table_);
-    counters_.push_back(alloc_.makeCounter(name_storage.statName(),
-                                           tag_extracted_name_storage.statName(), cluster_tags));
+    counter_refs_.push_back(alloc_.makeCounter(
+        name_storage.statName(), tag_extracted_name_storage.statName(), cluster_tags));
+    counters_.push_back(counter_refs_.back().get());
   }
 
   void addGauge(const std::string& name, Stats::StatNameTagVector cluster_tags,
                 Stats::Gauge::ImportMode import_mode = Stats::Gauge::ImportMode::Accumulate) {
     Stats::StatNameManagedStorage name_storage(baseName(name, cluster_tags), *symbol_table_);
     Stats::StatNameManagedStorage tag_extracted_name_storage(name, *symbol_table_);
-    gauges_.push_back(alloc_.makeGauge(
+    gauge_refs_.push_back(alloc_.makeGauge(
         name_storage.statName(), tag_extracted_name_storage.statName(), cluster_tags, import_mode));
+    gauges_.push_back(gauge_refs_.back().get());
   }
 
   void addTextReadout(const std::string& name, const std::string& value,
@@ -90,7 +92,8 @@ protected:
     Stats::TextReadoutSharedPtr textReadout = alloc_.makeTextReadout(
         name_storage.statName(), tag_extracted_name_storage.statName(), cluster_tags);
     textReadout->set(value);
-    textReadouts_.push_back(textReadout);
+    text_readout_refs_.push_back(textReadout);
+    textReadouts_.push_back(textReadout.get());
   }
 
   void addClusterEndpoints(const std::string& cluster_name, uint32_t num_hosts,
@@ -104,7 +107,10 @@ protected:
   }
 
   using MockHistogramSharedPtr = Stats::RefcountPtr<NiceMock<Stats::MockParentHistogram>>;
-  void addHistogram(MockHistogramSharedPtr histogram) { histograms_.push_back(histogram); }
+  void addHistogram(MockHistogramSharedPtr histogram) {
+    histograms_.push_back(histogram.get());
+    histogram_refs_.push_back(histogram);
+  }
 
   MockHistogramSharedPtr makeHistogram(const std::string& name,
                                        Stats::StatNameTagVector cluster_tags) {
@@ -137,6 +143,10 @@ protected:
     gauges_.clear();
     histograms_.clear();
     textReadouts_.clear();
+    counter_refs_.clear();
+    gauge_refs_.clear();
+    histogram_refs_.clear();
+    text_readout_refs_.clear();
     endpoints_helper_.reset();
     EXPECT_EQ(num_base_symbols_, symbol_table_->numSymbols());
   }
@@ -146,10 +156,15 @@ protected:
   const uint64_t num_base_symbols_{symbol_table_->numSymbols()};
   Stats::Allocator alloc_;
   Stats::StatNamePool pool_;
-  std::vector<Stats::CounterSharedPtr> counters_;
-  std::vector<Stats::GaugeSharedPtr> gauges_;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms_;
-  std::vector<Stats::TextReadoutSharedPtr> textReadouts_;
+  // The formatter takes raw pointers; the *_refs_ vectors keep the allocator-created stats alive.
+  std::vector<Stats::Counter*> counters_;
+  std::vector<Stats::Gauge*> gauges_;
+  std::vector<Stats::ParentHistogram*> histograms_;
+  std::vector<Stats::TextReadout*> textReadouts_;
+  std::vector<Stats::CounterSharedPtr> counter_refs_;
+  std::vector<Stats::GaugeSharedPtr> gauge_refs_;
+  std::vector<Stats::ParentHistogramSharedPtr> histogram_refs_;
+  std::vector<Stats::TextReadoutSharedPtr> text_readout_refs_;
   std::unique_ptr<Upstream::PerEndpointMetricsTestHelper> endpoints_helper_;
   std::vector<std::unique_ptr<Stats::TagVector>> endpoints_tags_;
 };
@@ -350,7 +365,7 @@ TEST_F(PrometheusStatsFormatterTest, DifferentNamedScopeSameStat) {
   Stats::StatName name = pool_.add("default.total_match_count");
 
   Stats::ScopeSharedPtr scope1 = store.rootScope()->createScope("cluster.a");
-  counters_.push_back(Stats::CounterSharedPtr(&scope1->counterFromStatName(name)));
+  counters_.push_back(&scope1->counterFromStatName(name));
 
   // To reproduce the problem from we will render
   // cluster.a.default.total_match_count before we discover the existence of
@@ -358,7 +373,7 @@ TEST_F(PrometheusStatsFormatterTest, DifferentNamedScopeSameStat) {
   // "default" comes before "x" with
   // https://github.com/envoyproxy/envoy/pull/24998
   Stats::ScopeSharedPtr scope2 = store.rootScope()->createScope("cluster.x");
-  counters_.push_back(Stats::CounterSharedPtr(&scope2->counterFromStatName(name)));
+  counters_.push_back(&scope2->counterFromStatName(name));
 
   constexpr absl::string_view expected_output =
       R"EOF(# TYPE envoy_cluster_default_total_match_count counter
@@ -1792,7 +1807,7 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramUsesPrometheusBucketInd
     Http::TestResponseHeaderMapImpl response_headers;
     Buffer::OwnedImpl response;
     EXPECT_EQ(1, PrometheusStatsFormatter::statsAsPrometheusProtobuf(
-                     {}, {}, {parent_histogram}, {}, endpoints_helper_->cm_, response_headers,
+                     {}, {}, {parent_histogram.get()}, {}, endpoints_helper_->cm_, response_headers,
                      response, params, custom_namespaces_));
 
     const auto families = parsePrometheusProtobuf(response.toString());
@@ -1825,10 +1840,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramWithOnlyZeros) {
   auto parent_histogram = getParentHistogram("histogram_zeros");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -1877,10 +1892,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramWithZerosAndPositiveVal
   auto parent_histogram = getParentHistogram("histogram_mixed");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -1928,10 +1943,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramWithBoundaryValues) {
   auto parent_histogram = getParentHistogram("histogram_boundary");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -1998,10 +2013,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramWithWideRange) {
   auto parent_histogram = getParentHistogram("histogram_wide");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -2055,10 +2070,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramSchemaReduction) {
   auto parent_histogram = getParentHistogram("histogram_schema");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   // Use small max_buckets to force schema reduction
   StatsParams params;
@@ -2115,10 +2130,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramWithPercent) {
   auto parent_histogram = getParentHistogram("histogram_percent_mixed");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -2264,10 +2279,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramSparseDataAccuracy) {
   auto parent_histogram = getParentHistogram("histogram_sparse");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -2342,10 +2357,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramDenseDataAccuracy) {
   auto parent_histogram = getParentHistogram("histogram_dense");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -2417,10 +2432,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramBucketIndexAccuracy) {
   auto parent_histogram = getParentHistogram("histogram_exact");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -2479,10 +2494,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramVerySparseData) {
   auto parent_histogram = getParentHistogram("histogram_very_sparse");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -2549,10 +2564,10 @@ TEST_F(RealHistogramNativePrometheusTest, TraditionalHistogramWithPercent) {
   auto parent_histogram = getParentHistogram("histogram_percent");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   // Use default params (traditional/cumulative histogram, not native)
   StatsParams params;
@@ -2618,10 +2633,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramCumulativeAccuracy) {
   auto parent_histogram = getParentHistogram("histogram_cumulative");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -2727,10 +2742,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramNormalDistribution) {
   auto parent_histogram = getParentHistogram("histogram_normal");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -2826,10 +2841,10 @@ TEST_F(RealHistogramNativePrometheusTest, NativeHistogramSchemaFallback) {
   auto parent_histogram = getParentHistogram("histogram_fallback");
   ASSERT_NE(nullptr, parent_histogram);
 
-  std::vector<Stats::CounterSharedPtr> counters;
-  std::vector<Stats::GaugeSharedPtr> gauges;
-  std::vector<Stats::ParentHistogramSharedPtr> histograms = {parent_histogram};
-  std::vector<Stats::TextReadoutSharedPtr> text_readouts;
+  std::vector<Stats::Counter*> counters;
+  std::vector<Stats::Gauge*> gauges;
+  std::vector<Stats::ParentHistogram*> histograms = {parent_histogram.get()};
+  std::vector<Stats::TextReadout*> text_readouts;
 
   StatsParams params;
   params.histogram_buckets_mode_ = Utility::HistogramBucketsMode::PrometheusNative;
@@ -3095,8 +3110,8 @@ protected:
       Http::TestResponseHeaderMapImpl response_headers;
       Buffer::OwnedImpl response;
       ASSERT_EQ(1, PrometheusStatsFormatter::statsAsPrometheusProtobuf(
-                       {}, {}, {parent_histogram}, {}, endpoints_helper_->cm_, response_headers,
-                       response, params, custom_namespaces_));
+                       {}, {}, {parent_histogram.get()}, {}, endpoints_helper_->cm_,
+                       response_headers, response, params, custom_namespaces_));
       const auto families = parsePrometheusProtobuf(response.toString());
       ASSERT_EQ(1, families.size());
       ASSERT_EQ(1, families[0].metric_size());
