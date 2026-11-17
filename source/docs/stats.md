@@ -95,6 +95,23 @@ whenever accessed from a worker thread. They are strongly referenced in the
 `ParentHistogram` as well as in a cache in the `ThreadLocalStore`, to help
 maintain data continuity as scopes are re-created during operation.
 
+### Stat lifetime and metrics snapshots
+
+Stats are created only through a `Scope` (the `Allocator`'s creation methods
+are private), so every stat is owned by at least one scope, and stats are only
+destroyed on the main thread: when a scope is deleted or stats are evicted,
+the central and thread-local cache entries that hold them are released on the
+main thread after all workers have cleared their caches. Debug builds assert
+this in the stat destructor.
+
+This lets `MetricSnapshotImpl` read stats without taking a reference on each
+one. A snapshot exists only inside `MetricSnapshotImpl::capture()`, which runs
+on the main thread and holds a reference to every scope while the sinks run.
+Sinks must not yield the main thread or keep references to the snapshot after
+`flush()` returns. Production code outside the stats system should not hold
+`CounterSharedPtr` and similar refcounted stat pointers; `check_format`
+enforces this.
+
 ## Stat naming infrastructure and memory consumption
 
 Stat names are replicated in several places in various forms.
