@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <memory>
 
 #include "envoy/stats/histogram.h"
 #include "envoy/stats/stats.h"
@@ -278,13 +279,16 @@ void envoy_dynamic_module_callback_stat_sink_snapshot_release(
   if (owner == nullptr) {
     return;
   }
-  if (Envoy::Thread::MainThread::isMainOrTestThread()) {
-    delete owner;
+  std::unique_ptr<DynamicModuleStatsSinkRetainedSnapshot> retained(owner);
+  if (Envoy::Thread::MainThread::isMainThread()) {
     return;
   }
   // The retained snapshot holds a reference on every stat in it, and stats must only be destroyed
-  // on the main thread, so a release on any other thread drops those references there.
-  owner->context().main_thread_dispatcher_.post([owner]() { delete owner; });
+  // on the main thread, so a release on any other thread drops those references there. The
+  // callback owns the snapshot: if the dispatcher drops the callback without running it, for
+  // example during shutdown, destroying the callback still deletes the snapshot.
+  Envoy::Event::Dispatcher& dispatcher = retained->context().main_thread_dispatcher_;
+  dispatcher.post([retained = std::move(retained)]() mutable { retained.reset(); });
 }
 
 size_t envoy_dynamic_module_callback_stat_sink_snapshot_get_counter_count(

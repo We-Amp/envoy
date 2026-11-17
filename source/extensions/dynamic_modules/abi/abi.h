@@ -17047,8 +17047,8 @@ envoy_dynamic_module_callback_stat_sink_snapshot_retain(
  * envoy_dynamic_module_callback_stat_sink_snapshot_release drops a snapshot handle returned by
  * envoy_dynamic_module_callback_stat_sink_snapshot_retain, along with its stat references. It may
  * be called on any thread. Stats are only destroyed on the main thread, so a release on another
- * thread hands the stat references to the main thread, which drops them later. The handle must not
- * be used afterwards.
+ * thread hands the stat references to the main thread, which drops them later. All retained handles
+ * must be released before the server shuts down. The handle must not be used afterwards.
  *
  * @param retained_snapshot_envoy_ptr is a handle returned by
  *        envoy_dynamic_module_callback_stat_sink_snapshot_retain. It must not be the handle passed

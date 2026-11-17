@@ -857,6 +857,10 @@ private:
 // reports the values copied at retain time, and holds a reference on every stat it covers.
 class DynamicModuleStatsSinkRetainAbiTest : public DynamicModuleStatsSinkHistogramAbiTest {
 public:
+  // A release on the main thread deletes the retained snapshot directly; any other thread posts the
+  // deletion to the main thread. Register this test's thread as the main thread.
+  Thread::MainThread main_thread_;
+
   DynamicModuleStatsSinkRetainAbiTest() {
     // The fixture stats live on the stack and start with no references. Hold one for the whole test
     // so dropping the references a retained handle took never frees them.
