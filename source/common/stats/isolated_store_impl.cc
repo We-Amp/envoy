@@ -78,7 +78,7 @@ ConstScopeSharedPtr IsolatedStoreImpl::constRootScope() const {
   return const_cast<IsolatedStoreImpl*>(this)->rootScope();
 }
 
-IsolatedStoreImpl::~IsolatedStoreImpl() = default;
+IsolatedStoreImpl::~IsolatedStoreImpl() { alloc_.setShuttingDown(); }
 
 ScopeSharedPtr IsolatedScopeImpl::createScopeWithTaggedName(
     absl::string_view base_name, TagStringViewSpan name_tags, absl::string_view tagged_name,

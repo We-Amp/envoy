@@ -287,6 +287,7 @@ void ThreadLocalStoreImpl::initializeThreading(Event::Dispatcher& main_thread_di
 void ThreadLocalStoreImpl::shutdownThreading() {
   // This will block both future cache fills as well as cache flushes.
   shutting_down_ = true;
+  alloc_.setShuttingDown();
   ASSERT(!tls_.has_value() || tls_->isShutdown());
 
   // We can't call runOnAllThreads here as global threading has already been shutdown. It is okay

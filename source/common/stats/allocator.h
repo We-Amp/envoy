@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <vector>
 
 #include "envoy/stats/sink.h"
@@ -116,6 +117,12 @@ public:
   void markGaugeForDeletion(const GaugeSharedPtr& gauge);
   void markTextReadoutForDeletion(const TextReadoutSharedPtr& text_readout);
 
+  // Indicate that the server is shutting down. This is used for disabling debug
+  // assertions that stats are only destroyed on the main thread. During
+  // destruction we do not need that guarantee.
+  void setShuttingDown();
+  bool shuttingDown() const { return shutting_down_; }
+
 protected:
   virtual Counter* makeCounterInternal(StatName name, StatName tag_extracted_name,
                                        StatNameTagSpan stat_name_tags);
@@ -131,6 +138,8 @@ private:
   // free() operations are made from the destructors of the individual stat objects, which are not
   // protected by locks.
   mutable Thread::MutexBasicLockable mutex_;
+
+  std::atomic<bool> shutting_down_{false};
 
   StatSet<Counter> counters_ ABSL_GUARDED_BY(mutex_);
   StatSet<Gauge> gauges_ ABSL_GUARDED_BY(mutex_);
