@@ -1,9 +1,9 @@
 #include <memory>
 
 #include "source/common/stats/isolated_store_impl.h"
+#include "source/common/stats/main_thread_utility.h"
 #include "source/common/stats/stat_merger.h"
 #include "source/common/stats/thread_local_store.h"
-#include "source/common/stats/utility.h"
 
 #include "test/test_common/utility.h"
 

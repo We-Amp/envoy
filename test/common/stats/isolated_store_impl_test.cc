@@ -4,10 +4,10 @@
 #include "envoy/stats/stats_macros.h"
 
 #include "source/common/stats/isolated_store_impl.h"
+#include "source/common/stats/main_thread_utility.h"
 #include "source/common/stats/null_counter.h"
 #include "source/common/stats/null_gauge.h"
 #include "source/common/stats/stats_matcher_impl.h"
-#include "source/common/stats/utility.h"
 
 #include "test/mocks/server/server_factory_context.h"
 

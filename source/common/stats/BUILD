@@ -292,6 +292,18 @@ envoy_cc_library(
 )
 
 envoy_cc_library(
+    name = "main_thread_utility_lib",
+    srcs = ["main_thread_utility.cc"],
+    hdrs = ["main_thread_utility.h"],
+    deps = [
+        "//envoy/stats:stats_interface",
+        "//envoy/stats:store_interface",
+        "//source/common/common:assert_lib",
+        "//source/common/common:thread_lib",
+    ],
+)
+
+envoy_cc_library(
     name = "utility_lib",
     srcs = ["utility.cc"],
     hdrs = ["utility.h"],
@@ -299,9 +311,7 @@ envoy_cc_library(
         ":symbol_table_lib",
         "//envoy/stats:scope_interface",
         "//envoy/stats:stats_interface",
-        "//envoy/stats:store_interface",
         "//source/common/common:assert_lib",
-        "//source/common/common:thread_lib",
     ],
 )
 
