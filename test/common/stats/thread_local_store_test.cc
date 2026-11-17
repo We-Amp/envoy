@@ -20,8 +20,8 @@
 #include "source/common/stats/thread_local_store.h"
 
 #include "test/common/memory/memory_test_utility.h"
-#include "test/common/stats/real_thread_test_base.h"
 #include "test/common/stats/allocator_peer.h"
+#include "test/common/stats/real_thread_test_base.h"
 #include "test/common/stats/stat_test_utility.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/server/instance.h"

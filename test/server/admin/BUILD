@@ -271,10 +271,10 @@ envoy_cc_test(
         },
     },
     deps = [
-        "//test/common/stats:allocator_peer_lib",
         "//source/common/stats:tag_producer_lib",
         "//source/common/stats:thread_local_store_lib",
         "//source/server/admin:prometheus_stats_lib",
+        "//test/common/stats:allocator_peer_lib",
         "//test/mocks/server:server_factory_context_mocks",
         "//test/mocks/thread_local:thread_local_mocks",
         "//test/mocks/upstream:cluster_manager_mocks",

@@ -322,8 +322,8 @@ TEST_F(AllocatorTest, HiddenGauge) {
   EXPECT_NE(non_hidden_gauge->importMode(), Gauge::ImportMode::HiddenAccumulate);
   EXPECT_FALSE(non_hidden_gauge->hidden());
 
-  GaugeSharedPtr never_import_hidden_gauge = makeGauge(
-      makeStat("never_import_hidden"), StatName(), {}, Gauge::ImportMode::NeverImport);
+  GaugeSharedPtr never_import_hidden_gauge =
+      makeGauge(makeStat("never_import_hidden"), StatName(), {}, Gauge::ImportMode::NeverImport);
   EXPECT_NE(never_import_hidden_gauge->importMode(), Gauge::ImportMode::HiddenAccumulate);
   EXPECT_FALSE(never_import_hidden_gauge->hidden());
 }
@@ -712,11 +712,9 @@ TEST_F(AllocatorTest, ForEachSinkedGaugeHidden) {
   size_t num_gauges = 0;
   size_t num_iterations = 0;
 
-  unhidden_gauge =
-      makeGauge(unhidden_stat_name, StatName(), {}, Gauge::ImportMode::Accumulate);
+  unhidden_gauge = makeGauge(unhidden_stat_name, StatName(), {}, Gauge::ImportMode::Accumulate);
 
-  hidden_gauge =
-      makeGauge(hidden_stat_name, StatName(), {}, Gauge::ImportMode::HiddenAccumulate);
+  hidden_gauge = makeGauge(hidden_stat_name, StatName(), {}, Gauge::ImportMode::HiddenAccumulate);
 
   alloc_.forEachSinkedGauge([&num_gauges](std::size_t size) { num_gauges = size; },
                             [&num_iterations, unhidden_stat_name](Gauge& gauge) {
@@ -745,11 +743,9 @@ TEST_F(AllocatorTest, ForEachSinkedGaugeHiddenPredicate) {
   size_t num_gauges = 0;
   size_t num_iterations = 0;
 
-  unhidden_gauge =
-      makeGauge(unhidden_stat_name, StatName(), {}, Gauge::ImportMode::Accumulate);
+  unhidden_gauge = makeGauge(unhidden_stat_name, StatName(), {}, Gauge::ImportMode::Accumulate);
 
-  hidden_gauge =
-      makeGauge(hidden_stat_name, StatName(), {}, Gauge::ImportMode::HiddenAccumulate);
+  hidden_gauge = makeGauge(hidden_stat_name, StatName(), {}, Gauge::ImportMode::HiddenAccumulate);
 
   alloc_.forEachSinkedGauge([&num_gauges](std::size_t size) { num_gauges = size; },
                             [&num_iterations, &sink_predicates](Gauge& gauge) {
