@@ -28,8 +28,6 @@ enum class StoreType {
 
 class StatsUtilityTest : public testing::TestWithParam<StoreType> {
 protected:
-  template <class StatType>
-  using IterateFn = std::function<bool(const RefcountPtr<StatType>& stat)>;
   using MakeStatFn = std::function<void(Scope& scope, const ElementVec& elements)>;
 
   StatsUtilityTest()
@@ -63,16 +61,16 @@ protected:
     make_stat(*scope_, {Stats::DynamicSavedName("dynamicsaved3")});
   }
 
-  template <class StatType> IterateFn<StatType> iterOnce() {
-    return [this](const RefcountPtr<StatType>& stat) -> bool {
-      results_.insert(stat->name());
+  template <class StatType> IterateRefFn<StatType> iterOnce() {
+    return [this](StatType& stat) -> bool {
+      results_.insert(stat.name());
       return false;
     };
   }
 
-  template <class StatType> IterateFn<StatType> iterAll() {
-    return [this](const RefcountPtr<StatType>& stat) -> bool {
-      results_.insert(stat->name());
+  template <class StatType> IterateRefFn<StatType> iterAll() {
+    return [this](const StatType& stat) -> bool {
+      results_.insert(stat.name());
       return true;
     };
   }
@@ -123,7 +121,7 @@ protected:
 
     ASSERT_TRUE(symbolic1_ref.get());
     ASSERT_TRUE(dynamic1_ref.get());
-    EXPECT_FALSE(store_->iterate(iterOnce<StatType>()));
+    EXPECT_FALSE(store_->iterateRef(iterOnce<StatType>()));
     EXPECT_EQ(1, results_.size());
     EXPECT_TRUE(checkValue(*symbolic1_ref.get()));
     EXPECT_TRUE(checkValue(*dynamic1_ref.get()));
@@ -131,7 +129,7 @@ protected:
 
   template <class StatType> void storeAll(const MakeStatFn make_stat) {
     init(make_stat);
-    EXPECT_TRUE(store_->iterate(iterAll<StatType>()));
+    EXPECT_TRUE(store_->iterateRef(iterAll<StatType>()));
     EXPECT_THAT(results_, UnorderedElementsAre("symbolic1", "dynamic1", "scope.symbolic2",
                                                "scope.dynamicsaved3", "scope.dynamic2"));
   }
@@ -146,7 +144,7 @@ protected:
 
     ASSERT_TRUE(symbolic2_ref.get());
     ASSERT_TRUE(dynamic2_ref.get());
-    EXPECT_FALSE(scope_->iterate(iterOnce<StatType>()));
+    EXPECT_FALSE(scope_->iterateRef(iterOnce<StatType>()));
     EXPECT_EQ(1, results_.size());
     EXPECT_TRUE(checkValue(*symbolic2_ref.get()));
     EXPECT_TRUE(checkValue(*dynamic2_ref.get()));
@@ -154,7 +152,7 @@ protected:
 
   template <class StatType> void scopeAll(const MakeStatFn make_stat) {
     init(make_stat);
-    EXPECT_TRUE(scope_->iterate(iterAll<StatType>()));
+    EXPECT_TRUE(scope_->iterateRef(iterAll<StatType>()));
     EXPECT_THAT(results_,
                 UnorderedElementsAre("scope.symbolic2", "scope.dynamic2", "scope.dynamicsaved3"));
   }

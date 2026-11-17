@@ -37,6 +37,7 @@ envoy_cc_library(
         "//envoy/common:pure_lib",
         "//envoy/event:dispatcher_interface",
         "//envoy/thread_local:thread_local_interface",
+        "@abseil-cpp//absl/base:core_headers",
     ],
 )
 
@@ -50,6 +51,7 @@ envoy_cc_library(
         ":tag_interface",
         "//envoy/common:pure_lib",
         "//source/common/stats:symbol_table_lib",
+        "@abseil-cpp//absl/base:core_headers",
     ],
 )
 

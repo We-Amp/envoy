@@ -7,6 +7,7 @@
 #include "source/common/stats/null_counter.h"
 #include "source/common/stats/null_gauge.h"
 #include "source/common/stats/stats_matcher_impl.h"
+#include "source/common/stats/utility.h"
 
 #include "test/mocks/server/server_factory_context.h"
 
@@ -126,8 +127,8 @@ TEST_F(StatsIsolatedStoreImplTest, All) {
   ScopeSharedPtr scope3 = scope1->createScope(std::string("foo:\0:.", 7));
   EXPECT_EQ("scope1.foo___.bar", scope3->counterFromString("bar").name());
 
-  EXPECT_EQ(4UL, store_->counters().size());
-  EXPECT_EQ(2UL, store_->gauges().size());
+  EXPECT_EQ(4UL, Stats::Utility::countersMainThread(*store_).size());
+  EXPECT_EQ(2UL, Stats::Utility::gaugesMainThread(*store_).size());
 
   StatNameManagedStorage nonexistent_name("nonexistent", store_->symbolTable());
   EXPECT_EQ(scope_->findCounter(nonexistent_name.statName()), std::nullopt);
@@ -226,9 +227,9 @@ TEST_F(StatsIsolatedStoreImplTest, AllWithSymbolTable) {
   ScopeSharedPtr scope3 = scope1->createScope(std::string("foo:\0:.", 7));
   EXPECT_EQ("scope1.foo___.bar", scope3->counterFromString("bar").name());
 
-  EXPECT_EQ(4UL, store_->counters().size());
-  EXPECT_EQ(2UL, store_->gauges().size());
-  EXPECT_EQ(2UL, store_->textReadouts().size());
+  EXPECT_EQ(4UL, Stats::Utility::countersMainThread(*store_).size());
+  EXPECT_EQ(2UL, Stats::Utility::gaugesMainThread(*store_).size());
+  EXPECT_EQ(2UL, Stats::Utility::textReadoutsMainThread(*store_).size());
 }
 
 TEST_F(StatsIsolatedStoreImplTest, CounterWithTag) {
@@ -357,6 +358,7 @@ TEST_F(StatsIsolatedStoreImplTest, StatsMacros) {
 TEST_F(StatsIsolatedStoreImplTest, NullImplCoverage) {
   NullCounterImpl& c = store_->nullCounter();
   c.inc();
+  c.markUnused();
   EXPECT_EQ(0, c.value());
   c.add(1);
   c.reset();
@@ -370,6 +372,8 @@ TEST_F(StatsIsolatedStoreImplTest, NullImplCoverage) {
 
   NullGaugeImpl& g = store_->nullGauge();
   g.inc();
+  g.setParentValue(0);
+  g.markUnused();
   EXPECT_EQ(0, g.value());
   g.add(1);
   g.dec();
@@ -684,6 +688,25 @@ TEST_F(StatsIsolatedStoreImplTest, HistogramAndTextReadoutNameAndNameTags) {
   EXPECT_EQ("cluster.version", t.tagExtractedName());
   ASSERT_EQ(1, t.tags().size());
   EXPECT_EQ("foo", t.tags()[0].value_);
+}
+
+TEST_F(IsolatedStoreScopeMatcherTest, Coverage) {
+  EXPECT_EQ(num_base_symbols_, store_->constSymbolTable().numSymbols());
+  EXPECT_EQ(0, store_->counters().size());
+  EXPECT_EQ(0, store_->gauges().size());
+  EXPECT_EQ(0, store_->histograms().size());
+  uint32_t count = 0;
+  store_->forEachHistogram(nullptr, [&count](ParentHistogram&) { ++count; });
+  EXPECT_EQ(0, count);
+  store_->evictUnused();
+  StatNamePool pool(store_->symbolTable());
+  StatNameTagVector tags;
+  store_->extractAndAppendTags(StatName(), pool, tags);
+  EXPECT_TRUE(tags.empty());
+  store_->extractAndAppendTags("", pool, tags);
+  EXPECT_TRUE(tags.empty());
+  EXPECT_FALSE(scope_->findTextReadout(StatName()).has_value());
+  EXPECT_EQ(store_.get(), &scope_->constStore());
 }
 
 } // namespace Stats

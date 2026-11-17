@@ -108,15 +108,17 @@ public:
   NullGaugeImpl& nullGauge() override { return null_gauge_; }
   NullTextReadoutImpl& nullTextReadout() { return null_text_readout_; }
 
-  bool iterate(const IterateFn<Counter>& fn) const override {
-    return constRootScope()->iterate(fn);
+  bool iterateRef(const IterateRefFn<Counter>& fn) const override {
+    return constRootScope()->iterateRef(fn);
   }
-  bool iterate(const IterateFn<Gauge>& fn) const override { return constRootScope()->iterate(fn); }
-  bool iterate(const IterateFn<Histogram>& fn) const override {
-    return constRootScope()->iterate(fn);
+  bool iterateRef(const IterateRefFn<Gauge>& fn) const override {
+    return constRootScope()->iterateRef(fn);
   }
-  bool iterate(const IterateFn<TextReadout>& fn) const override {
-    return constRootScope()->iterate(fn);
+  bool iterateRef(const IterateRefFn<Histogram>& fn) const override {
+    return constRootScope()->iterateRef(fn);
+  }
+  bool iterateRef(const IterateRefFn<TextReadout>& fn) const override {
+    return constRootScope()->iterateRef(fn);
   }
 
   void extractAndAppendTags(StatName, StatNamePool&, StatNameTagVector&) override {}
@@ -244,9 +246,9 @@ private:
       return vec;
     }
 
-    bool iterate(const IterateFn<Base>& fn) const {
+    bool iterateRef(const IterateRefFn<Base>& fn) const {
       for (auto& stat : stats_) {
-        if (!fn(stat.second)) {
+        if (!fn(*stat.second)) {
           return false;
         }
       }
@@ -395,17 +397,17 @@ public:
     return store_.text_readouts_.find(name);
   }
 
-  bool iterate(const IterateFn<Counter>& fn) const override {
-    return store_.counters_.iterate(iterFilter(fn));
+  bool iterateRef(const IterateRefFn<Counter>& fn) const override {
+    return store_.counters_.iterateRef(iterFilter(fn));
   }
-  bool iterate(const IterateFn<Gauge>& fn) const override {
-    return store_.gauges_.iterate(iterFilter(fn));
+  bool iterateRef(const IterateRefFn<Gauge>& fn) const override {
+    return store_.gauges_.iterateRef(iterFilter(fn));
   }
-  bool iterate(const IterateFn<Histogram>& fn) const override {
-    return store_.histograms_.iterate(iterFilter(fn));
+  bool iterateRef(const IterateRefFn<Histogram>& fn) const override {
+    return store_.histograms_.iterateRef(iterFilter(fn));
   }
-  bool iterate(const IterateFn<TextReadout>& fn) const override {
-    return store_.text_readouts_.iterate(iterFilter(fn));
+  bool iterateRef(const IterateRefFn<TextReadout>& fn) const override {
+    return store_.text_readouts_.iterateRef(iterFilter(fn));
   }
 
   Counter& counterFromString(const std::string& name) override {
@@ -432,7 +434,8 @@ public:
 protected:
   void addScopeToStore(const ScopeSharedPtr& scope) { store_.scopes_.push_back(scope); }
 
-  template <class StatType> IterateFn<StatType> iterFilter(const IterateFn<StatType>& fn) const {
+  template <class StatType>
+  IterateRefFn<StatType> iterFilter(const IterateRefFn<StatType>& fn) const {
     // We determine here what's in the scope by looking at name
     // prefixes. Strictly speaking this is not correct, as the same stat can be
     // in different scopes, e.g. counter "b.c" in scope "a", and counter "c"
@@ -450,8 +453,8 @@ protected:
     if (!prefix_str.empty() && !absl::EndsWith(prefix_str, ".")) {
       prefix_str += ".";
     }
-    return [fn, prefix_str](const RefcountPtr<StatType>& stat) -> bool {
-      return !absl::StartsWith(stat->name(), prefix_str) || fn(stat);
+    return [fn, prefix_str](StatType& stat) -> bool {
+      return !absl::StartsWith(stat.name(), prefix_str) || fn(stat);
     };
   }
 

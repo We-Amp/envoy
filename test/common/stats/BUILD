@@ -43,6 +43,7 @@ envoy_cc_test(
     deps = [
         "//source/common/stats:isolated_store_lib",
         "//source/common/stats:stats_matcher_lib",
+        "//source/common/stats:utility_lib",
         "//test/mocks/server:server_factory_context_mocks",
         "@envoy_api//envoy/config/metrics/v3:pkg_cc_proto",
     ],
@@ -124,6 +125,7 @@ envoy_cc_test(
         "//source/common/stats:isolated_store_lib",
         "//source/common/stats:stat_merger_lib",
         "//source/common/stats:thread_local_store_lib",
+        "//source/common/stats:utility_lib",
         "//test/test_common:utility_lib",
     ],
 )

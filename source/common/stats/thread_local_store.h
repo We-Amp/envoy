@@ -177,10 +177,33 @@ public:
   const SymbolTable& constSymbolTable() const override { return alloc_.constSymbolTable(); }
   SymbolTable& symbolTable() override { return alloc_.symbolTable(); }
 
-  bool iterate(const IterateFn<Counter>& fn) const override { return iterHelper(fn); }
-  bool iterate(const IterateFn<Gauge>& fn) const override { return iterHelper(fn); }
-  bool iterate(const IterateFn<Histogram>& fn) const override { return iterHelper(fn); }
-  bool iterate(const IterateFn<TextReadout>& fn) const override { return iterHelper(fn); }
+  bool iterateRef(const IterateRefFn<Counter>& fn) const override {
+    bool cont = true;
+    forEachCounter(nullptr, [fn, &cont](Counter& counter) { cont = cont && fn(counter); });
+    return cont;
+  }
+
+  bool iterateRef(const IterateRefFn<Gauge>& fn) const override {
+    bool cont = true;
+    forEachGauge(nullptr, [fn, &cont](Gauge& gauge) { cont = cont && fn(gauge); });
+    return cont;
+  }
+
+  bool iterateRef(const IterateRefFn<Histogram>& fn) const override {
+    bool cont = true;
+    forEachHistogram(nullptr, [fn, &cont](ParentHistogram& histogram) {
+      // Note: up-casts to Histogram, annoyingly.
+      cont = cont && fn(histogram);
+    });
+    return cont;
+  }
+
+  bool iterateRef(const IterateRefFn<TextReadout>& fn) const override {
+    bool cont = true;
+    forEachTextReadout(nullptr,
+                       [fn, &cont](TextReadout& text_readout) { cont = cont && fn(text_readout); });
+    return cont;
+  }
 
   std::vector<CounterSharedPtr> counters() const override;
   std::vector<GaugeSharedPtr> gauges() const override;
@@ -372,47 +395,47 @@ private:
                                         Histogram::Unit unit);
     TextReadout& getOrCreateTextReadoutBase(const TagUtility::TagStatNameJoiner& joiner);
 
-    template <class StatMap, class StatFn> bool iterHelper(StatFn fn, const StatMap& map) const {
+    template <class StatMap, class StatFn> bool iterRefHelper(StatFn fn, const StatMap& map) const {
       for (auto& iter : map) {
-        if (!fn(iter.second)) {
+        if (!fn(*iter.second)) {
           return false;
         }
       }
       return true;
     }
 
-    bool iterate(const IterateFn<Counter>& fn) const override {
+    bool iterateRef(const IterateRefFn<Counter>& fn) const override {
       Thread::LockGuard lock(parent_.lock_);
       return iterateLockHeld(fn);
     }
-    bool iterate(const IterateFn<Gauge>& fn) const override {
+    bool iterateRef(const IterateRefFn<Gauge>& fn) const override {
       Thread::LockGuard lock(parent_.lock_);
       return iterateLockHeld(fn);
     }
-    bool iterate(const IterateFn<Histogram>& fn) const override {
+    bool iterateRef(const IterateRefFn<Histogram>& fn) const override {
       Thread::LockGuard lock(parent_.lock_);
       return iterateLockHeld(fn);
     }
-    bool iterate(const IterateFn<TextReadout>& fn) const override {
+    bool iterateRef(const IterateRefFn<TextReadout>& fn) const override {
       Thread::LockGuard lock(parent_.lock_);
       return iterateLockHeld(fn);
     }
 
-    bool iterateLockHeld(const IterateFn<Counter>& fn) const
+    bool iterateLockHeld(const IterateRefFn<Counter>& fn) const
         ABSL_EXCLUSIVE_LOCKS_REQUIRED(parent_.lock_) {
-      return iterHelper(fn, centralCacheLockHeld()->counters_);
+      return iterRefHelper(fn, centralCacheLockHeld()->counters_);
     }
-    bool iterateLockHeld(const IterateFn<Gauge>& fn) const
+    bool iterateLockHeld(const IterateRefFn<Gauge>& fn) const
         ABSL_EXCLUSIVE_LOCKS_REQUIRED(parent_.lock_) {
-      return iterHelper(fn, centralCacheLockHeld()->gauges_);
+      return iterRefHelper(fn, centralCacheLockHeld()->gauges_);
     }
-    bool iterateLockHeld(const IterateFn<Histogram>& fn) const
+    bool iterateLockHeld(const IterateRefFn<Histogram>& fn) const
         ABSL_EXCLUSIVE_LOCKS_REQUIRED(parent_.lock_) {
-      return iterHelper(fn, centralCacheLockHeld()->histograms_);
+      return iterRefHelper(fn, centralCacheLockHeld()->histograms_);
     }
-    bool iterateLockHeld(const IterateFn<TextReadout>& fn) const
+    bool iterateLockHeld(const IterateRefFn<TextReadout>& fn) const
         ABSL_EXCLUSIVE_LOCKS_REQUIRED(parent_.lock_) {
-      return iterHelper(fn, centralCacheLockHeld()->text_readouts_);
+      return iterRefHelper(fn, centralCacheLockHeld()->text_readouts_);
     }
     ThreadLocalStoreImpl& store() override { return parent_; }
     const ThreadLocalStoreImpl& constStore() const override { return parent_; }
