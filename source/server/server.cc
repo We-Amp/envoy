@@ -186,11 +186,12 @@ void InstanceBase::failHealthcheck(bool fail) {
 MetricSnapshotImpl::MetricSnapshotImpl(Stats::Store& store,
                                        Upstream::ClusterManager& cluster_manager,
                                        TimeSource& time_source) {
-  // Hold a reference to every scope rather than to every stat. Every stat is
-  // owned by at least one scope, and stats are only destroyed on the main
-  // thread, which cannot run anything else until capture() returns. Taking and
-  // dropping a reference on each of millions of stats made flushing a large
-  // store far slower than holding the (much fewer) scopes; see #43836.
+  // No reference is taken on the collected stats: stats are only destroyed on
+  // the main thread, which cannot run anything else until capture() returns.
+  // Taking and dropping a reference on each of millions of stats made flushing
+  // a large store far slower; see #43836. Holding the (much fewer) scopes is
+  // extra insurance: it pins the stats that were in a live scope at capture
+  // time, but it is not what makes the snapshot safe.
   store.forEachScope(
       [this](std::size_t size) { scopes_.reserve(size); },
       [this](const Stats::Scope& scope) { scopes_.push_back(scope.getConstShared()); });

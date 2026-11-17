@@ -115,11 +115,11 @@ private:
   friend class TestUtil::AllocatorPeer;
 
   // Stats are created only by the stores, through a Scope, never directly by
-  // filters or other production code. That way every stat is owned by at
-  // least one scope, and MetricSnapshotImpl can keep the stats it collects
-  // alive by holding the scopes, instead of taking a reference on every
-  // individual stat, which is slow (#43836), particularly on ARM. Tests use
-  // TestUtil::AllocatorPeer.
+  // filters or other production code. Together with stats only being destroyed
+  // on the main thread, this lets MetricSnapshotImpl collect stats without
+  // taking a reference on each one, which is slow with many stats (#43836).
+  // A stat can still outlive its scopes while something else holds a
+  // reference to it. Tests use TestUtil::AllocatorPeer.
 
   /**
    * @param name the full name of the stat.

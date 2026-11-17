@@ -98,15 +98,20 @@ maintain data continuity as scopes are re-created during operation.
 ### Stat lifetime and metrics snapshots
 
 Stats are created only through a `Scope` (the `Allocator`'s creation methods
-are private), so every stat is owned by at least one scope, and stats are only
-destroyed on the main thread: when a scope is deleted or stats are evicted,
-the central and thread-local cache entries that hold them are released on the
-main thread after all workers have cleared their caches. Debug builds assert
-this in the stat destructor.
+are private). A stat can outlive its scopes while something else holds a
+reference to it, but stats are only destroyed on the main thread: when a scope
+is deleted or stats are evicted, the central and thread-local cache entries
+that hold them are released on the main thread after all workers have cleared
+their caches, and the remaining in-tree reference holders release on the main
+thread too. Debug builds assert this in the stat destructor. Known exceptions
+still to close: integration tests release references on the test thread, and
+an embedder destroying an `AdminResponse` off the main thread releases its
+streaming request's references there.
 
 This lets `MetricSnapshotImpl` read stats without taking a reference on each
 one. A snapshot exists only inside `MetricSnapshotImpl::capture()`, which runs
-on the main thread and holds a reference to every scope while the sinks run.
+on the main thread. It also holds a reference to every scope while the sinks
+run; that pins the stats of live scopes but is not what makes it safe.
 Sinks must not yield the main thread or keep references to the snapshot after
 `flush()` returns. Production code outside the stats system should not hold
 `CounterSharedPtr` and similar refcounted stat pointers; `check_format`
