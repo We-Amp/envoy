@@ -227,8 +227,17 @@ public:
   }
 
   // Stats::Gauge
+  //
+  // Gauge updates and reads are relaxed. Each update is one atomic operation,
+  // so none is lost, and the value publishes no other memory. A few production
+  // paths do read gauges to decide (the fault filter's active_faults_ limit,
+  // the health check filter's membership gauges, bounded-load hashing on
+  // upstream_rq_active_, the local rate limiter's share of membership_total_,
+  // the statsd TCP sink's upstream_cx_tx_bytes_buffered_); each reads one
+  // atomic value, which these decisions already treat as approximate because
+  // workers update it concurrently.
   void add(uint64_t amount) override {
-    child_value_ += amount;
+    child_value_.fetch_add(amount, std::memory_order_relaxed);
     markUsed();
   }
   void dec() override { sub(1); }
@@ -239,11 +248,14 @@ public:
     markUsed();
   }
   void sub(uint64_t amount) override {
-    ASSERT(child_value_ >= amount);
+    ASSERT(child_value_.load(std::memory_order_relaxed) >= amount);
     ASSERT(used() || amount == 0);
-    child_value_ -= amount;
+    child_value_.fetch_sub(amount, std::memory_order_relaxed);
   }
-  uint64_t value() const override { return child_value_ + parent_value_; }
+  uint64_t value() const override {
+    return child_value_.load(std::memory_order_relaxed) +
+           parent_value_.load(std::memory_order_relaxed);
+  }
 
   // TODO(diazalan): Rename importMode and to more generic name
   ImportMode importMode() const override {
@@ -290,7 +302,9 @@ public:
     }
   }
 
-  void setParentValue(uint64_t value) override { parent_value_ = value; }
+  void setParentValue(uint64_t value) override {
+    parent_value_.store(value, std::memory_order_relaxed);
+  }
 
 private:
   std::atomic<uint64_t> parent_value_{0};
