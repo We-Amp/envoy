@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 
 #include "envoy/stats/tag.h"
@@ -21,15 +22,19 @@ class PrimitiveCounter : NonCopyable {
 public:
   PrimitiveCounter() = default;
 
-  uint64_t value() const { return value_; }
+  // Relaxed ordering is enough, as for Stats::Counter (see CounterImpl in
+  // source/common/stats/allocator.cc): the updates are atomic, latch() reports
+  // each increment exactly once, and no in-tree decision depends on ordering
+  // between these values and other memory.
+  uint64_t value() const { return value_.load(std::memory_order_relaxed); }
 
   void add(uint64_t amount) {
-    value_ += amount;
-    pending_increment_ += amount;
+    value_.fetch_add(amount, std::memory_order_relaxed);
+    pending_increment_.fetch_add(amount, std::memory_order_relaxed);
   }
   void inc() { add(1); }
-  void reset() { value_ = 0; }
-  uint64_t latch() { return pending_increment_.exchange(0); }
+  void reset() { value_.store(0, std::memory_order_relaxed); }
+  uint64_t latch() { return pending_increment_.exchange(0, std::memory_order_relaxed); }
 
 private:
   std::atomic<uint64_t> value_{0};
@@ -45,15 +50,17 @@ class PrimitiveGauge : NonCopyable {
 public:
   PrimitiveGauge() = default;
 
-  uint64_t value() const { return value_; }
+  // Relaxed, as for Stats::Gauge: the load balancers and the per-host
+  // connection limit read one atomic value that workers update concurrently.
+  uint64_t value() const { return value_.load(std::memory_order_relaxed); }
 
-  void add(uint64_t amount) { value_ += amount; }
+  void add(uint64_t amount) { value_.fetch_add(amount, std::memory_order_relaxed); }
   void dec() { sub(1); }
   void inc() { add(1); }
-  void set(uint64_t value) { value_ = value; }
+  void set(uint64_t value) { value_.store(value, std::memory_order_relaxed); }
   void sub(uint64_t amount) {
-    ASSERT(value_ >= amount);
-    value_ -= amount;
+    ASSERT(value_.load(std::memory_order_relaxed) >= amount);
+    value_.fetch_sub(amount, std::memory_order_relaxed);
   }
 
 private:
