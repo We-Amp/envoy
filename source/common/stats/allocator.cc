@@ -133,7 +133,15 @@ public:
   virtual void removeFromSetLockHeld() ABSL_EXCLUSIVE_LOCKS_REQUIRED(alloc_.mutex_) PURE;
 
 protected:
-  void markUsed() { flags_.fetch_or(Metric::Flags::Used, std::memory_order_relaxed); }
+  // Sets the used flag, skipping the read-modify-write when it is already set, which it is for
+  // every update but the first after a markUnused(). The cost is a small behaviour change: an
+  // update that races markUnused() may see the old flag, skip the write, and leave the stat
+  // marked unused, so eviction can drop it one pass early.
+  void markUsed() {
+    if ((flags_.load(std::memory_order_relaxed) & Metric::Flags::Used) == 0) {
+      flags_.fetch_or(Metric::Flags::Used, std::memory_order_relaxed);
+    }
+  }
 
   Allocator& alloc_;
 
