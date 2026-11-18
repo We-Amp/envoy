@@ -1177,7 +1177,7 @@ ThreadLocalHistogramImpl::~ThreadLocalHistogramImpl() {
 void ThreadLocalHistogramImpl::recordValue(uint64_t value) {
   ASSERT(std::this_thread::get_id() == created_thread_id_);
   hist_insert_intscale(histograms_[current_active_], value, 0, 1);
-  used_ = true;
+  used_.store(true, std::memory_order_relaxed);
 }
 
 void ThreadLocalHistogramImpl::merge(histogram_t* target) {

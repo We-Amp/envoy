@@ -62,8 +62,11 @@ public:
 
   // Stats::Metric
   SymbolTable& symbolTable() final { return symbol_table_; }
-  bool used() const override { return used_; }
-  void markUnused() override { used_ = false; }
+  // used_ is a hint for the main thread's merge and eviction. The histogram data is handed to the
+  // main thread by the merge's dispatcher posts (beginMerge() runs on this worker), not through
+  // used_, so the flag needs no ordering.
+  bool used() const override { return used_.load(std::memory_order_relaxed); }
+  void markUnused() override { used_.store(false, std::memory_order_relaxed); }
   bool hidden() const override { return false; }
 
 private:

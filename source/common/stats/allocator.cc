@@ -234,7 +234,8 @@ public:
   void dec() override { sub(1); }
   void inc() override { add(1); }
   void set(uint64_t value) override {
-    child_value_ = value;
+    // A relaxed store: see the ordering note on add().
+    child_value_.store(value, std::memory_order_relaxed);
     markUsed();
   }
   void sub(uint64_t amount) override {
