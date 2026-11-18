@@ -94,7 +94,12 @@ public:
 
   // Metric
   SymbolTable& symbolTable() final { return alloc_.symbolTable(); }
-  bool used() const override { return flags_ & Metric::Flags::Used; }
+  // The used flag feeds eviction and the used-only filters. Their readers already tolerate a
+  // flag that lags the update it describes, and the flag publishes no other memory, so it needs
+  // no ordering.
+  bool used() const override {
+    return flags_.load(std::memory_order_relaxed) & Metric::Flags::Used;
+  }
   void markUnused() override { flags_ &= ~Metric::Flags::Used; }
   bool hidden() const override { return flags_ & Metric::Flags::Hidden; }
   bool noTagExtraction() const override { return flags_ & Metric::Flags::NoTagExtraction; }
@@ -128,6 +133,8 @@ public:
   virtual void removeFromSetLockHeld() ABSL_EXCLUSIVE_LOCKS_REQUIRED(alloc_.mutex_) PURE;
 
 protected:
+  void markUsed() { flags_.fetch_or(Metric::Flags::Used, std::memory_order_relaxed); }
+
   Allocator& alloc_;
 
   // ref_count_ can be incremented as an atomic, without taking a new lock, as
@@ -158,17 +165,30 @@ public:
   }
 
   // Stats::Counter
+  //
+  // Relaxed ordering is enough for counters:
+  //   * each fetch_add is atomic, so no increment is lost at any ordering;
+  //   * latch() is an atomic exchange, so every increment is reported by
+  //     exactly one latch, whatever order the latching thread observes
+  //     value_ and pending_increment_ in;
+  //   * a reader of value() could already see a value that races with
+  //     in-flight increments;
+  //   * no in-tree decision depends on ordering between a counter and other
+  //     memory: counters are reported, and the few readers that hand values
+  //     to other code (dynamic-module ABIs, load reporting) read one coherent
+  //     value either way.
+  // Tests must not use a counter as a synchronization point for other data.
   void add(uint64_t amount) override {
     // Note that a reader may see a new value but an old pending_increment_ or
     // used(). From a system perspective this should be eventually consistent.
-    value_ += amount;
-    pending_increment_ += amount;
-    flags_ |= Flags::Used;
+    value_.fetch_add(amount, std::memory_order_relaxed);
+    pending_increment_.fetch_add(amount, std::memory_order_relaxed);
+    markUsed();
   }
   void inc() override { add(1); }
-  uint64_t latch() override { return pending_increment_.exchange(0); }
-  void reset() override { value_ = 0; }
-  uint64_t value() const override { return value_; }
+  uint64_t latch() override { return pending_increment_.exchange(0, std::memory_order_relaxed); }
+  void reset() override { value_.store(0, std::memory_order_relaxed); }
+  uint64_t value() const override { return value_.load(std::memory_order_relaxed); }
 
 private:
   std::atomic<uint64_t> value_{0};
@@ -209,13 +229,13 @@ public:
   // Stats::Gauge
   void add(uint64_t amount) override {
     child_value_ += amount;
-    flags_ |= Flags::Used;
+    markUsed();
   }
   void dec() override { sub(1); }
   void inc() override { add(1); }
   void set(uint64_t value) override {
     child_value_ = value;
-    flags_ |= Flags::Used;
+    markUsed();
   }
   void sub(uint64_t amount) override {
     ASSERT(child_value_ >= amount);
@@ -293,7 +313,7 @@ public:
     std::string value_copy(value);
     absl::MutexLock lock(mutex_);
     value_ = std::move(value_copy);
-    flags_ |= Flags::Used;
+    markUsed();
   }
   std::string value() const override {
     absl::MutexLock lock(mutex_);
