@@ -616,6 +616,31 @@ envoy_benchmark_test(
     benchmark_binary = "server_stats_flush_benchmark",
 )
 
+envoy_cc_benchmark_binary(
+    name = "server_stats_flush_contended_benchmark",
+    srcs = ["server_stats_flush_contended_benchmark_test.cc"],
+    rbe_pool = {"build": "linux_x64_small"},
+    deps = [
+        "//envoy/stats:stats_interface",
+        "//source/common/common:thread_lib",
+        "//source/common/stats:thread_local_store_lib",
+        "//source/server:server_lib",
+        "//test/common/stats:bench_pinning_lib",
+        "//test/mocks/upstream:cluster_manager_mocks",
+        "//test/test_common:simulated_time_system_lib",
+        "//test/test_common:test_time_lib",
+        "//test/test_common:thread_factory_for_test_lib",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/synchronization",
+        "@benchmark",
+    ],
+)
+
+envoy_benchmark_test(
+    name = "server_stats_flush_contended_benchmark_test",
+    benchmark_binary = "server_stats_flush_contended_benchmark",
+)
+
 envoy_cc_test(
     name = "utils_test",
     srcs = envoy_select_admin_functionality(["utils_test.cc"]),

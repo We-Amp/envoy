@@ -151,6 +151,16 @@ envoy_cc_test_library(
 )
 
 envoy_cc_test_library(
+    name = "bench_pinning_lib",
+    hdrs = ["bench_pinning.h"],
+    deps = [
+        "//test/benchmark:main_lib",
+        "@abseil-cpp//absl/strings",
+        "@benchmark",
+    ],
+)
+
+envoy_cc_test_library(
     name = "stat_test_utility_lib",
     srcs = ["stat_test_utility.cc"],
     hdrs = ["stat_test_utility.h"],
@@ -506,4 +516,59 @@ envoy_cc_test(
         "//source/common/stats:prefix_utility_lib",
         "//test/test_common:utility_lib",
     ],
+)
+
+# Multi-threaded stats benchmarks (see the comments at the top of each source). They only use APIs
+# that exist on every compared branch.
+envoy_cc_benchmark_binary(
+    name = "stat_update_benchmark",
+    srcs = ["stat_update_speed_test.cc"],
+    deps = [
+        ":bench_pinning_lib",
+        "//envoy/stats:primitive_stats_interface",
+        "//source/common/stats:allocator_lib",
+        "//source/common/stats:symbol_table_lib",
+        "//source/common/stats:thread_local_store_lib",
+        "@abseil-cpp//absl/strings",
+        "@benchmark",
+    ],
+)
+
+envoy_benchmark_test(
+    name = "stat_update_benchmark_test",
+    benchmark_binary = "stat_update_benchmark",
+)
+
+envoy_cc_benchmark_binary(
+    name = "atomic_model_benchmark",
+    srcs = ["atomic_model_speed_test.cc"],
+    deps = [
+        ":bench_pinning_lib",
+        "@benchmark",
+    ],
+)
+
+envoy_benchmark_test(
+    name = "atomic_model_benchmark_test",
+    benchmark_binary = "atomic_model_benchmark",
+)
+
+envoy_cc_benchmark_binary(
+    name = "histogram_record_benchmark",
+    srcs = ["histogram_record_speed_test.cc"],
+    deps = [
+        ":bench_pinning_lib",
+        ":real_thread_test_base",
+        "//source/common/event:libevent_lib",
+        "//source/common/stats:thread_local_store_lib",
+        "//test/test_common:test_time_lib",
+        "@abseil-cpp//absl/strings",
+        "@abseil-cpp//absl/synchronization",
+        "@benchmark",
+    ],
+)
+
+envoy_benchmark_test(
+    name = "histogram_record_benchmark_test",
+    benchmark_binary = "histogram_record_benchmark",
 )
