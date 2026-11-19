@@ -132,12 +132,27 @@ inline double clockSourceOk() {
   return (source == "tsc" || source == "kvm-clock" || source == "arch_sys_counter") ? 1 : 0;
 }
 
+// The atomics the compiler was allowed to emit, from the target macros. On aarch64 "lse" means
+// the build targets LSE (-march=armv8-a+lse or later); "base" means it does not, so atomics are
+// load-/store-exclusive loops, inline or through the outline helpers. This only labels the run:
+// whether the increment path is inline LSE, inline exclusives or a helper call is verified by
+// disassembly (see the Arm build notes).
+inline const char* atomicsTarget() {
+#if defined(__aarch64__) && defined(__ARM_FEATURE_ATOMICS)
+  return "lse";
+#elif defined(__aarch64__)
+  return "base";
+#else
+  return "native";
+#endif
+}
+
 inline std::string label() {
   const char* cpus_env = std::getenv("STATS_BENCH_CPUS");
   const char* placement = std::getenv("STATS_BENCH_PLACEMENT");
   return absl::StrCat("cpus=", cpus_env != nullptr ? cpus_env : "unpinned",
                       " placement=", placement != nullptr ? placement : "unset",
-                      " clocksource=", clockSource());
+                      " clocksource=", clockSource(), " atomics=", atomicsTarget());
 }
 
 inline double monotonicSeconds() {
@@ -309,9 +324,15 @@ inline double envSeconds(const char* name, double default_seconds, double prefli
   return Envoy::benchmark::skipExpensiveBenchmarks() ? preflight_seconds : default_seconds;
 }
 
-// Operations between two clock reads in the timed window. The clock read costs the same in every
+// Operations between two clock reads in the timed window. A thread starts with OpsPerBatch and
+// halves its batch while one batch takes longer than MaxBatchSeconds, down to MinOpsPerBatch, so
+// a starved thread on a contended line still sees each deadline within about 0.2 ms rather than
+// one 256-operation batch (1 to 18 ms at 12 threads on one shared line) late. The batch only
+// shrinks, and almost always settles during the warm-up. The clock read costs the same in every
 // variant (about 20 ns per batch).
 constexpr uint64_t OpsPerBatch = 256;
+constexpr uint64_t MinOpsPerBatch = 8;
+constexpr double MaxBatchSeconds = 200e-6;
 
 // What one thread measured over its window.
 struct ThreadWindow {
@@ -321,6 +342,7 @@ struct ThreadWindow {
   double cycles = -1;
   double instructions = -1;
   int64_t involuntary_switches = -1;
+  uint64_t batch_ops = 0; // Batch size at the end of the window.
 };
 
 inline int64_t involuntarySwitches() {
@@ -407,7 +429,9 @@ public:
     bool have_pmu = true;
     int64_t switches = 0;
     bool have_switches = true;
+    uint64_t min_batch_ops = windows_[0].batch_ops;
     for (const ThreadWindow& w : windows_) {
+      min_batch_ops = std::min(min_batch_ops, w.batch_ops);
       earliest_start = std::min(earliest_start, w.start);
       latest_start = std::max(latest_start, w.start);
       earliest_end = std::min(earliest_end, w.end);
@@ -447,6 +471,8 @@ public:
     state.counters["clocksource_ok"] = clockSourceOk();
     state.counters["fairness"] = max_ops > 0 ? static_cast<double>(min_ops) / max_ops : 0;
     state.counters["min_thread_ops"] = static_cast<double>(min_ops);
+    // The smallest batch any thread ended on: the clock granularity of the window edges.
+    state.counters["min_batch_ops"] = static_cast<double>(min_batch_ops);
     state.counters["window_overlap"] = span > 0 ? (earliest_end - latest_start) / span : 0;
     state.counters["invol_switches"] = have_switches ? static_cast<double>(switches) : -1;
     const int64_t steal_end = stealTicks();
@@ -471,17 +497,18 @@ private:
 //     perf counters, then waits at a start barrier inside the timed region;
 //   * the shared deadlines put a warm-up before the window, and every thread snapshots its
 //     operations, time, cycles, instructions and involuntary context switches at the first
-//     batch boundary past each deadline;
+//     batch boundary past each deadline; batches are time-based (see OpsPerBatch), so that
+//     boundary is normally within about 0.2 ms of the deadline, contended or not;
 //   * after its window a thread keeps running `op` until every thread has finished its window,
 //     so each window is covered by all other threads at full load: there is no tail with fewer
 //     contenders, however unevenly a contended line is served.
 // Thread 0 reports ns_per_op (what the runner reads; not the time column), ops_per_sec,
 // cycles_per_op and instructions_per_op (totals over all threads / total operations; the
 // per-thread means are *_thread_mean), fairness and min_thread_ops as results, and
-// window_overlap, invol_switches, steal_ticks and clocksource_ok as gate inputs; the runner gates,
-// the benchmark never aborts on them. The clock read and loop overhead are the same in every arm,
-// so relaxed/current ratios read slightly closer to 1 than the truth. Returns false if the run
-// was skipped.
+// min_batch_ops, window_overlap, invol_switches, steal_ticks and clocksource_ok as gate inputs;
+// the runner gates, the benchmark never aborts on them. The clock read and loop overhead are the
+// same in every arm, so relaxed/current ratios read slightly closer to 1 than the truth. Returns
+// false if the run was skipped.
 template <class Op>
 bool timedLoop(::benchmark::State& state, RunSync& sync, size_t first_cpu_index, Op op) {
   // Uniform checks first, so that either every thread skips or none does.
@@ -514,14 +541,20 @@ bool timedLoop(::benchmark::State& state, RunSync& sync, size_t first_cpu_index,
     uint64_t ops = 0;
     uint64_t ops_at_start = 0;
     int64_t switches_at_start = 0;
+    uint64_t batch = OpsPerBatch;
+    double last = monotonicSeconds();
     while (true) {
       if (pinned) {
-        for (uint64_t i = 0; i < OpsPerBatch; ++i) {
+        for (uint64_t i = 0; i < batch; ++i) {
           op();
         }
-        ops += OpsPerBatch;
+        ops += batch;
       }
       const double now = monotonicSeconds();
+      if (now - last > MaxBatchSeconds && batch > MinOpsPerBatch) {
+        batch /= 2;
+      }
+      last = now;
       if (phase == 0 && now >= warmup_end) {
         ops_at_start = ops;
         window.start = now;
@@ -532,6 +565,7 @@ bool timedLoop(::benchmark::State& state, RunSync& sync, size_t first_cpu_index,
         perf.stop();
         window.end = now;
         window.ops = ops - ops_at_start;
+        window.batch_ops = batch;
         window.cycles = perf.cycles();
         window.instructions = perf.instructions();
         const int64_t switches = involuntarySwitches();
