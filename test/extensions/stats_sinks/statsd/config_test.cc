@@ -109,6 +109,53 @@ TEST_P(StatsConfigParameterizedTest, UdpSinkCustomPrefix) {
   EXPECT_EQ(udp_sink->getPrefix(), customPrefix);
 }
 
+TEST_P(StatsConfigParameterizedTest, UdpSinkMaxBytesPerDatagramBatchesFlushAndSamples) {
+  envoy::config::metrics::v3::StatsdSink sink_config;
+  envoy::config::core::v3::SocketAddress& socket_address =
+      *sink_config.mutable_address()->mutable_socket_address();
+  socket_address.set_protocol(envoy::config::core::v3::SocketAddress::UDP);
+  socket_address.set_address(GetParam() == Network::Address::IpVersion::v4 ? "127.0.0.1" : "::1");
+  socket_address.set_port_value(8125);
+
+  Server::Configuration::StatsSinkFactory* factory =
+      Registry::FactoryRegistry<Server::Configuration::StatsSinkFactory>::getFactory(StatsdName);
+  ASSERT_NE(factory, nullptr);
+  NiceMock<Server::Configuration::MockServerFactoryContext> server;
+  {
+    // Unset: one metric per datagram, as before.
+    ProtobufTypes::MessagePtr message = factory->createEmptyConfigProto();
+    TestUtility::jsonConvert(sink_config, *message);
+    Stats::SinkPtr sink = factory->createStatsSink(*message, server).value();
+    auto udp_sink = dynamic_cast<Common::Statsd::UdpStatsdSink*>(sink.get());
+    ASSERT_NE(udp_sink, nullptr);
+    EXPECT_EQ(0, udp_sink->getBufferSizeForTest());
+    EXPECT_EQ(0, udp_sink->getSampleBatchBytesForTest());
+  }
+  sink_config.mutable_max_bytes_per_datagram()->set_value(1432);
+  ProtobufTypes::MessagePtr message = factory->createEmptyConfigProto();
+  TestUtility::jsonConvert(sink_config, *message);
+  Stats::SinkPtr sink = factory->createStatsSink(*message, server).value();
+  auto udp_sink = dynamic_cast<Common::Statsd::UdpStatsdSink*>(sink.get());
+  ASSERT_NE(udp_sink, nullptr);
+  EXPECT_EQ(1432, udp_sink->getBufferSizeForTest());
+  EXPECT_EQ(1432, udp_sink->getSampleBatchBytesForTest());
+}
+
+TEST(StatsConfigTest, TcpSinkRejectsMaxBytesPerDatagram) {
+  envoy::config::metrics::v3::StatsdSink sink_config;
+  sink_config.set_tcp_cluster_name("fake_cluster");
+  sink_config.mutable_max_bytes_per_datagram()->set_value(1432);
+  Server::Configuration::StatsSinkFactory* factory =
+      Registry::FactoryRegistry<Server::Configuration::StatsSinkFactory>::getFactory(StatsdName);
+  ASSERT_NE(factory, nullptr);
+  ProtobufTypes::MessagePtr message = factory->createEmptyConfigProto();
+  TestUtility::jsonConvert(sink_config, *message);
+  NiceMock<Server::Configuration::MockServerFactoryContext> server;
+  EXPECT_EQ(
+      factory->createStatsSink(*message, server).status().message(),
+      "statsd: max_bytes_per_datagram applies only to a UDP address, not to tcp_cluster_name");
+}
+
 TEST(StatsConfigTest, TcpSinkDefaultPrefix) {
   envoy::config::metrics::v3::StatsdSink sink_config;
   const auto& defaultPrefix = Common::Statsd::getDefaultPrefix();

@@ -1,5 +1,6 @@
 #include "source/extensions/stat_sinks/common/statsd/statsd.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -107,30 +108,127 @@ std::optional<double> scaledTimerMilliseconds(const Stats::Histogram& histogram,
   PANIC_DUE_TO_CORRUPT_ENUM;
 }
 
+namespace {
+
+// The datagram size limit, lowered to the largest UDP payload of the address family.
+uint64_t datagramLimit(std::optional<uint64_t> configured,
+                       const Network::Address::InstanceConstSharedPtr& address) {
+  const uint64_t value = configured.value_or(0);
+  const uint64_t max = (address != nullptr && address->ip() != nullptr &&
+                        address->ip()->version() == Network::Address::IpVersion::v6)
+                           ? UdpStatsdSink::MAX_UDP_PAYLOAD_IPV6
+                           : UdpStatsdSink::MAX_UDP_PAYLOAD_IPV4;
+  if (value > max) {
+    ENVOY_LOG_MISC(warn,
+                   "statsd: max_bytes_per_datagram {} is above the largest UDP payload; using {}",
+                   value, max);
+    return max;
+  }
+  return value;
+}
+
+// Per thread, only this much of the batch buffer is reserved up front; a larger batch grows on
+// demand up to the limit.
+constexpr uint64_t SampleBatchReserveBytes = 1500;
+
+} // namespace
+
 UdpStatsdSink::UdpStatsdSink(ThreadLocal::SlotAllocator& tls,
                              Network::Address::InstanceConstSharedPtr address, const bool use_tag,
                              const std::string& prefix, std::optional<uint64_t> buffer_size,
-                             const Statsd::TagFormat& tag_format, const bool scale_histogram_units)
+                             const Statsd::TagFormat& tag_format, const bool scale_histogram_units,
+                             const bool batch_histogram_samples)
     : tls_(tls.allocateSlot()), server_address_(std::move(address)), use_tag_(use_tag),
       prefix_(prefix.empty() ? Statsd::getDefaultPrefix() : prefix),
-      buffer_size_(buffer_size.value_or(0)), tag_format_(tag_format),
-      scale_histogram_units_(scale_histogram_units) {
+      buffer_size_(datagramLimit(buffer_size, server_address_)), tag_format_(tag_format),
+      scale_histogram_units_(scale_histogram_units),
+      sample_batch_bytes_(batch_histogram_samples ? buffer_size_ : 0) {
   // Read once, when the sink is created: a later runtime override does not reach existing sinks.
   const bool connect =
       Runtime::runtimeFeatureEnabled("envoy.reloadable_features.statsd_udp_connect_socket");
-  tls_->set([address = server_address_,
-             connect](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
-    return std::make_shared<WriterImpl>(address, connect);
+  // Capture values, not the sink: the per-thread objects may outlive it during shutdown.
+  tls_->set([address = server_address_, connect, batch_bytes = sample_batch_bytes_](
+                Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectSharedPtr {
+    return std::make_shared<ThreadLocalWriter>(std::make_shared<WriterImpl>(address, connect),
+                                               dispatcher, batch_bytes);
   });
 }
 
+UdpStatsdSink::UdpStatsdSink(ThreadLocal::SlotAllocator& tls, const std::shared_ptr<Writer>& writer,
+                             const bool use_tag, const std::string& prefix,
+                             std::optional<uint64_t> buffer_size,
+                             const Statsd::TagFormat& tag_format, const bool scale_histogram_units,
+                             const bool batch_histogram_samples)
+    : tls_(tls.allocateSlot()), use_tag_(use_tag),
+      prefix_(prefix.empty() ? getDefaultPrefix() : prefix),
+      buffer_size_(datagramLimit(buffer_size, nullptr)), tag_format_(tag_format),
+      scale_histogram_units_(scale_histogram_units),
+      sample_batch_bytes_(batch_histogram_samples ? buffer_size_ : 0) {
+  tls_->set([writer, batch_bytes = sample_batch_bytes_](
+                Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectSharedPtr {
+    return std::make_shared<ThreadLocalWriter>(writer, dispatcher, batch_bytes);
+  });
+}
+
+UdpStatsdSink::ThreadLocalWriter::ThreadLocalWriter(std::shared_ptr<Writer> writer,
+                                                    Event::Dispatcher& dispatcher,
+                                                    uint64_t batch_bytes)
+    : writer_(std::move(writer)), dispatcher_(dispatcher), batch_bytes_(batch_bytes) {
+  if (batch_bytes_ > 0) {
+    pending_.reserve(std::min(batch_bytes_, SampleBatchReserveBytes));
+  }
+}
+
+UdpStatsdSink::ThreadLocalWriter::~ThreadLocalWriter() {
+  // The thread is going away, or the sink released its slot: send what is pending, so that no
+  // sample recorded before this point is lost to batching.
+  flushSamples();
+}
+
+void UdpStatsdSink::ThreadLocalWriter::writeSample(const std::string& line) {
+  if (line.size() >= batch_bytes_) {
+    // Batching is off, or the line alone fills a datagram: send the pending batch first to keep the
+    // order of the samples, then the line on its own.
+    flushSamples();
+    writer_->write(line);
+    return;
+  }
+  if (!pending_.empty()) {
+    if (pending_.size() + 1 + line.size() > batch_bytes_) {
+      flushSamples();
+    } else {
+      pending_.push_back('\n');
+    }
+  }
+  pending_.append(line);
+  if (flush_cb_ == nullptr) {
+    // Created on first use, so a thread that never records a sample never allocates it.
+    flush_cb_ = dispatcher_.createSchedulableCallback([this]() { flushSamples(); });
+  }
+  // Runs after the events already queued in this iteration; a no-op when already scheduled.
+  flush_cb_->scheduleCallbackCurrentIteration();
+}
+
+void UdpStatsdSink::ThreadLocalWriter::flushSamples() {
+  if (pending_.empty()) {
+    return;
+  }
+  writer_->write(pending_);
+  pending_.clear();
+}
+
 bool UdpStatsdSink::writerConnectedForTest() {
-  const auto* writer = dynamic_cast<const WriterImpl*>(&tls_->getTyped<Writer>());
+  const auto* writer =
+      dynamic_cast<const WriterImpl*>(&tls_->getTyped<ThreadLocalWriter>().writer());
   return writer != nullptr && writer->connected();
 }
 
 void UdpStatsdSink::flush(Stats::MetricSnapshot& snapshot) {
-  Writer& writer = tls_->getTyped<Writer>();
+  ThreadLocalWriter& tls_writer = tls_->getTyped<ThreadLocalWriter>();
+  // Samples this thread recorded before the flush go out first, so the output order is the
+  // recording order.
+  tls_writer.flushSamples();
+  Writer& writer = tls_writer.writer();
   Buffer::OwnedImpl buffer;
 
   for (const auto& counter : snapshot.counters()) {
@@ -212,7 +310,7 @@ void UdpStatsdSink::onHistogramComplete(const Stats::Histogram& histogram, uint6
       message = buildMessage(histogram, value, "|ms");
     }
   }
-  tls_->getTyped<Writer>().write(message);
+  tls_->getTyped<ThreadLocalWriter>().writeSample(message);
 }
 
 template <class StatType, typename ValueType>

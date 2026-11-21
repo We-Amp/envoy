@@ -28,3 +28,18 @@ envoy_extension_cc_test(
         "@envoy_api//envoy/config/metrics/v3:pkg_cc_proto",
     ],
 )
+
+envoy_extension_cc_test(
+    name = "statsd_integration_test",
+    size = "large",
+    srcs = ["statsd_integration_test.cc"],
+    extension_names = ["envoy.stat_sinks.statsd"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/extensions/stat_sinks/statsd:config",
+        "//test/integration:http_integration_lib",
+        "//test/test_common:network_utility_lib",
+        "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/metrics/v3:pkg_cc_proto",
+    ],
+)

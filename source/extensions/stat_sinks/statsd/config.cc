@@ -27,11 +27,21 @@ StatsdSinkFactory::createStatsSink(const Protobuf::Message& config,
     RETURN_IF_NOT_OK_REF(address_or_error.status());
     Network::Address::InstanceConstSharedPtr address = address_or_error.value();
     ENVOY_LOG(debug, "statsd UDP ip address: {}", address->asString());
+    std::optional<uint64_t> max_bytes;
+    if (statsd_sink.has_max_bytes_per_datagram()) {
+      max_bytes = statsd_sink.max_bytes_per_datagram().value();
+    }
+    // With max_bytes_per_datagram set, both the flush and the histogram samples are batched.
     return std::make_unique<Common::Statsd::UdpStatsdSink>(
-        server.threadLocal(), std::move(address), false, statsd_sink.prefix(), std::nullopt,
-        Common::Statsd::getDefaultTagFormat(), statsd_sink.scale_histogram_units_to_milliseconds());
+        server.threadLocal(), std::move(address), false, statsd_sink.prefix(), max_bytes,
+        Common::Statsd::getDefaultTagFormat(), statsd_sink.scale_histogram_units_to_milliseconds(),
+        /*batch_histogram_samples=*/max_bytes.has_value());
   }
   case envoy::config::metrics::v3::StatsdSink::StatsdSpecifierCase::kTcpClusterName:
+    if (statsd_sink.has_max_bytes_per_datagram()) {
+      return absl::InvalidArgumentError(
+          "statsd: max_bytes_per_datagram applies only to a UDP address, not to tcp_cluster_name");
+    }
     ENVOY_LOG(debug, "statsd TCP cluster: {}", statsd_sink.tcp_cluster_name());
     return Common::Statsd::TcpStatsdSink::create(
         server.localInfo(), statsd_sink.tcp_cluster_name(), server.threadLocal(),

@@ -318,6 +318,7 @@ message HistogramBucketSettings {
 // Stats configuration proto schema for built-in ``envoy.stat_sinks.statsd`` sink. This sink does not support
 // tagged metrics.
 // [#extension: envoy.stat_sinks.statsd]
+// [#next-free-field: 6]
 message StatsdSink {
   option (udpa.annotations.versioning).previous_message_type = "envoy.config.metrics.v2.StatsdSink";
 
@@ -370,6 +371,22 @@ message StatsdSink {
   // unchanged with an ``ms`` suffix regardless of the histogram's unit, so histograms recording
   // microseconds are reported a factor of 1000 off.
   bool scale_histogram_units_to_milliseconds = 4;
+
+  // Optional maximum UDP datagram size, for the UDP :ref:`address
+  // <envoy_v3_api_field_config.metrics.v3.StatsdSink.address>` only (a configuration that sets it
+  // with ``tcp_cluster_name`` is rejected). By default Envoy sends one metric per datagram. When
+  // this is set, Envoy sends newline-separated metrics in datagrams of at most this many bytes:
+  //
+  // * the counters and gauges of each stats flush, and
+  // * the histogram samples that each thread records during one iteration of its event loop. A
+  //   sample then waits at most until the end of that iteration, or until the batch is full.
+  //
+  // A metric larger than this value is sent in a datagram of its own. A value above the largest
+  // UDP payload of the address family (65,507 bytes for IPv4, 65,527 for IPv6) is lowered to it.
+  // The value should not exceed the network's MTU; 512 is safe on any IPv4 or IPv6 path. The
+  // receiver must accept several newline-separated metrics in one datagram. One lost datagram
+  // loses every metric in it.
+  google.protobuf.UInt64Value max_bytes_per_datagram = 5 [(validate.rules).uint64 = {gt: 0}];
 }
 
 // Stats configuration proto schema for built-in ``envoy.stat_sinks.dog_statsd`` sink.
@@ -401,7 +418,9 @@ message DogStatsdSink {
   // metric, Envoy will emit multiple, new-line separated metrics. The max datagram
   // size should not exceed your network's MTU.
   //
-  // Note that this value may not be respected if smaller than a single metric.
+  // Note that this value may not be respected if smaller than a single metric. It applies to the
+  // counters and gauges of a stats flush; histogram samples are sent one per datagram. A value
+  // above the largest UDP payload (65,507 bytes for IPv4, 65,527 for IPv6) is lowered to it.
   google.protobuf.UInt64Value max_bytes_per_datagram = 4 [(validate.rules).uint64 = {gt: 0}];
 
   // If true, histogram samples are scaled to milliseconds according to the histogram's unit
