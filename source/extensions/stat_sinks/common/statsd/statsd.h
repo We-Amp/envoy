@@ -15,6 +15,7 @@
 #include "envoy/upstream/cluster_manager.h"
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/logger.h"
 #include "source/common/common/macros.h"
 #include "source/common/network/io_socket_handle_impl.h"
 #include "source/extensions/stat_sinks/common/statsd/tag_formats.h"
@@ -83,23 +84,36 @@ public:
   bool getUseTagForTest() { return use_tag_; }
   uint64_t getBufferSizeForTest() { return buffer_size_; }
   bool getScaleHistogramUnitsForTest() { return scale_histogram_units_; }
+  // Whether this thread's writer sends over a connected socket. False for sinks built with a
+  // writer for testing.
+  bool writerConnectedForTest();
   const std::string& getPrefix() { return prefix_; }
 
 private:
   /**
-   * This is a simple UDP localhost writer for statsd messages.
+   * The UDP writer of one thread. For an IP address it connects its socket, so that every send
+   * reuses the route and source address resolved once instead of naming the destination (see
+   * send() for how errors on the connected socket are handled). Unix datagram sockets are never
+   * connected: a connected one is tied to one receiver socket and fails for good once that
+   * receiver re-binds its path. The writer owns the address, so it never depends on the sink's
+   * lifetime.
    */
-  class WriterImpl : public Writer {
+  class WriterImpl : public Writer, Logger::Loggable<Logger::Id::stats> {
   public:
-    WriterImpl(UdpStatsdSink& parent);
+    WriterImpl(Network::Address::InstanceConstSharedPtr address, bool connect);
 
     // Writer
     void write(const std::string& message) override;
     void writeBuffer(Buffer::Instance& data) override;
 
+    bool connected() const { return connected_; }
+
   private:
-    UdpStatsdSink& parent_;
-    const Network::IoHandlePtr io_handle_;
+    void send(Buffer::RawSlice* slices, uint64_t num_slices);
+
+    const Network::Address::InstanceConstSharedPtr address_;
+    Network::IoHandlePtr io_handle_;
+    bool connected_{false};
   };
 
   void flushBuffer(Buffer::OwnedImpl& buffer, Writer& writer) const;

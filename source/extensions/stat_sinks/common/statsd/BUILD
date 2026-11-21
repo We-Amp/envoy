@@ -27,10 +27,12 @@ envoy_cc_library(
         "//envoy/upstream:cluster_manager_interface",
         "//source/common/buffer:buffer_lib",
         "//source/common/common:assert_lib",
+        "//source/common/common:minimal_logger_lib",
         "//source/common/common:utility_lib",
         "//source/common/config:utility_lib",
         "//source/common/network:address_lib",
         "//source/common/network:default_socket_interface_lib",
         "//source/common/network:utility_lib",
+        "//source/common/runtime:runtime_features_lib",
     ],
 )

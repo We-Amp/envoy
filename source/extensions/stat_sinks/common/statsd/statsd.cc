@@ -1,5 +1,6 @@
 #include "source/extensions/stat_sinks/common/statsd/statsd.h"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -18,6 +19,7 @@
 #include "source/common/config/utility.h"
 #include "source/common/network/socket_interface.h"
 #include "source/common/network/utility.h"
+#include "source/common/runtime/runtime_features.h"
 #include "source/common/stats/symbol_table.h"
 
 #include "absl/strings/str_join.h"
@@ -28,19 +30,61 @@ namespace StatSinks {
 namespace Common {
 namespace Statsd {
 
-UdpStatsdSink::WriterImpl::WriterImpl(UdpStatsdSink& parent)
-    : parent_(parent), io_handle_(Network::ioHandleForAddr(Network::Socket::Type::Datagram,
-                                                           parent_.server_address_, {})) {}
+UdpStatsdSink::WriterImpl::WriterImpl(Network::Address::InstanceConstSharedPtr address,
+                                      bool connect)
+    : address_(std::move(address)),
+      io_handle_(Network::ioHandleForAddr(Network::Socket::Type::Datagram, address_, {})) {
+  if (connect && address_->type() == Network::Address::Type::Ip) {
+    const Api::SysCallIntResult result = io_handle_->connect(address_);
+    connected_ = result.return_value_ == 0;
+    if (!connected_) {
+      ENVOY_LOG(warn,
+                "statsd: could not connect the UDP socket to {} (errno {}), sending unconnected",
+                address_->asString(), result.errno_);
+    }
+  }
+}
 
 void UdpStatsdSink::WriterImpl::write(const std::string& message) {
   // TODO(mattklein123): We can avoid this const_cast pattern by having a constant variant of
   // RawSlice. This can be fixed elsewhere as well.
   Buffer::RawSlice slice{const_cast<char*>(message.c_str()), message.size()};
-  Network::Utility::writeToSocket(*io_handle_, &slice, 1, nullptr, *parent_.server_address_);
+  send(&slice, 1);
 }
 
 void UdpStatsdSink::WriterImpl::writeBuffer(Buffer::Instance& data) {
-  Network::Utility::writeToSocket(*io_handle_, data, nullptr, *parent_.server_address_);
+  Buffer::RawSliceVector slices = data.getRawSlices();
+  send(slices.data(), slices.size());
+}
+
+void UdpStatsdSink::WriterImpl::send(Buffer::RawSlice* slices, uint64_t num_slices) {
+  const Api::IoCallUint64Result result =
+      Network::Utility::writeToSocket(*io_handle_, slices, num_slices, nullptr, *address_);
+  if (result.ok() || !connected_) {
+    // Send errors are not retried on an unconnected socket, as before.
+    return;
+  }
+  const Api::IoError& err = *result.err_;
+  if (err.getSystemErrorCode() == ECONNREFUSED ||
+      err.getErrorCode() == Api::IoError::IoErrorCode::ConnectionReset) {
+    // A connected datagram socket reports an ICMP port unreachable for an earlier datagram on the
+    // next send, and that send sends nothing. The error is consumed by reporting it, so send once
+    // more: this datagram is then lost only if the receiver is still down.
+    Network::Utility::writeToSocket(*io_handle_, slices, num_slices, nullptr, *address_);
+    return;
+  }
+  if (err.getErrorCode() == Api::IoError::IoErrorCode::AddressNotAvailable ||
+      err.getErrorCode() == Api::IoError::IoErrorCode::NetworkUnreachable ||
+      err.getErrorCode() == Api::IoError::IoErrorCode::InvalidArgument) {
+    // The source address or the route fixed by connect() is gone (an address change, for
+    // example). Replace the socket by an unconnected one, which resolves both on every send, as
+    // before this writer connected, and send this datagram again through it.
+    ENVOY_LOG(warn, "statsd: send on the connected socket to {} failed ({}), sending unconnected",
+              address_->asString(), err.getErrorDetails());
+    io_handle_ = Network::ioHandleForAddr(Network::Socket::Type::Datagram, address_, {});
+    connected_ = false;
+    Network::Utility::writeToSocket(*io_handle_, slices, num_slices, nullptr, *address_);
+  }
 }
 
 std::optional<double> scaledTimerMilliseconds(const Stats::Histogram& histogram, uint64_t value,
@@ -71,9 +115,18 @@ UdpStatsdSink::UdpStatsdSink(ThreadLocal::SlotAllocator& tls,
       prefix_(prefix.empty() ? Statsd::getDefaultPrefix() : prefix),
       buffer_size_(buffer_size.value_or(0)), tag_format_(tag_format),
       scale_histogram_units_(scale_histogram_units) {
-  tls_->set([this](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
-    return std::make_shared<WriterImpl>(*this);
+  // Read once, when the sink is created: a later runtime override does not reach existing sinks.
+  const bool connect =
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.statsd_udp_connect_socket");
+  tls_->set([address = server_address_,
+             connect](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
+    return std::make_shared<WriterImpl>(address, connect);
   });
+}
+
+bool UdpStatsdSink::writerConnectedForTest() {
+  const auto* writer = dynamic_cast<const WriterImpl*>(&tls_->getTyped<Writer>());
+  return writer != nullptr && writer->connected();
 }
 
 void UdpStatsdSink::flush(Stats::MetricSnapshot& snapshot) {
