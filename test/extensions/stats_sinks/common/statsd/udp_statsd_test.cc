@@ -10,16 +10,20 @@
 #include "source/extensions/stat_sinks/common/statsd/statsd.h"
 #include "source/extensions/stat_sinks/common/statsd/tag_formats.h"
 
+#include "test/mocks/event/mocks.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/mocks/thread_local/mocks.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "spdlog/spdlog.h"
 
+using testing::_;
+using testing::InSequence;
 using testing::NiceMock;
 
 namespace Envoy {
@@ -41,6 +45,19 @@ public:
   }
 
   std::vector<std::string> buffer_writes;
+};
+
+constexpr absl::string_view BatchGuard = "envoy.reloadable_features.statsd_batch_histogram_samples";
+constexpr absl::string_view ConnectGuard = "envoy.reloadable_features.statsd_connect_udp_socket";
+
+// The tests below that check the text of single samples run with sample batching off, so that
+// every sample is one write() as before batching existed; the batching tests come after them.
+class PerSampleWrites {
+public:
+  PerSampleWrites() { scoped_runtime_.mergeValues({{std::string(BatchGuard), "false"}}); }
+
+private:
+  TestScopedRuntime scoped_runtime_;
 };
 
 // Skipping this test as Datagram sockets are not currently supported by UDS on Windows
@@ -82,6 +99,7 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, UdpStatsdSinkTest,
                          TestUtility::ipTestParamsToString);
 
 TEST_P(UdpStatsdSinkTest, InitWithIpAddress) {
+  PerSampleWrites per_sample_writes;
   NiceMock<ThreadLocal::MockInstance> tls_;
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   Network::Test::UdpSyncPeer server(GetParam());
@@ -149,6 +167,7 @@ INSTANTIATE_TEST_SUITE_P(IpVersions, UdpStatsdSinkWithTagsTest,
                          TestUtility::ipTestParamsToString);
 
 TEST_P(UdpStatsdSinkWithTagsTest, InitWithIpAddress) {
+  PerSampleWrites per_sample_writes;
   NiceMock<ThreadLocal::MockInstance> tls_;
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   Network::Test::UdpSyncPeer server(GetParam());
@@ -217,6 +236,7 @@ TEST_P(UdpStatsdSinkWithTagsTest, InitWithIpAddress) {
 }
 
 TEST(UdpStatsdSinkTest, CheckActualStats) {
+  PerSampleWrites per_sample_writes;
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
   writer_ptr->delegateBufferFake();
@@ -378,6 +398,7 @@ TEST(UdpStatsdSinkTest, CheckActualStatsWithCustomPrefix) {
 }
 
 TEST(UdpStatsdSinkTest, SiSuffix) {
+  PerSampleWrites per_sample_writes;
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
   NiceMock<ThreadLocal::MockInstance> tls_;
@@ -448,6 +469,7 @@ TEST(UdpStatsdSinkTest, SiSuffix) {
 
 // Unit scaling is off by default: every sample is reported unscaled with an ms suffix.
 TEST(UdpStatsdSinkTest, HistogramUnitScalingOffByDefault) {
+  PerSampleWrites per_sample_writes;
   auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
   NiceMock<ThreadLocal::MockInstance> tls_;
   UdpStatsdSink sink(tls_, writer_ptr, false);
@@ -472,6 +494,7 @@ TEST(UdpStatsdSinkTest, HistogramUnitScalingOffByDefault) {
 }
 
 TEST(UdpStatsdSinkTest, ScaledPercent) {
+  PerSampleWrites per_sample_writes;
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
   NiceMock<ThreadLocal::MockInstance> tls_;
@@ -489,6 +512,7 @@ TEST(UdpStatsdSinkTest, ScaledPercent) {
 }
 
 TEST(UdpStatsdSinkWithTagsTest, CheckActualStats) {
+  PerSampleWrites per_sample_writes;
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
   writer_ptr->delegateBufferFake();
@@ -532,6 +556,7 @@ TEST(UdpStatsdSinkWithTagsTest, CheckActualStats) {
 }
 
 TEST(UdpStatsdSinkWithTagsTest, SiSuffix) {
+  PerSampleWrites per_sample_writes;
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
   NiceMock<ThreadLocal::MockInstance> tls_;
@@ -589,6 +614,7 @@ TEST(UdpStatsdSinkWithTagsTest, SiSuffix) {
 }
 
 TEST(UdpStatsdSinkWithTagsTest, GraphiteTagSyntax) {
+  PerSampleWrites per_sample_writes;
   NiceMock<Stats::MockMetricSnapshot> snapshot;
   auto writer_ptr = std::make_shared<NiceMock<MockWriter>>();
   writer_ptr->delegateBufferFake();
@@ -628,6 +654,244 @@ TEST(UdpStatsdSinkWithTagsTest, GraphiteTagSyntax) {
               write("envoy.test_timer;key1=value1;key2=value2:5|ms"));
   sink.onHistogramComplete(timer, 5);
 
+  tls_.shutdownThread();
+}
+
+// Histogram samples recorded on a thread during one event-loop turn.
+
+class UdpStatsdSinkBatchTest : public testing::Test {
+protected:
+  UdpStatsdSinkBatchTest() : writer_(std::make_shared<NiceMock<MockWriter>>()) {}
+
+  // The flush callback is created on the first sample; this captures it.
+  NiceMock<Event::MockSchedulableCallback>* expectFlushCallback() {
+    return new NiceMock<Event::MockSchedulableCallback>(&tls_.dispatcher_);
+  }
+
+  void sample(UdpStatsdSink& sink, const std::string& name, uint64_t value) {
+    NiceMock<Stats::MockHistogram> histogram;
+    histogram.name_ = name;
+    sink.onHistogramComplete(histogram, value);
+  }
+
+  NiceMock<ThreadLocal::MockInstance> tls_;
+  std::shared_ptr<NiceMock<MockWriter>> writer_;
+};
+
+TEST_F(UdpStatsdSinkBatchTest, BatchLimit) {
+  {
+    UdpStatsdSink sink(tls_, writer_, false);
+    EXPECT_EQ(UdpStatsdSink::DEFAULT_SAMPLE_BATCH_BYTES, sink.getSampleBatchBytesForTest());
+  }
+  {
+    // max_bytes_per_datagram is the limit when it is set.
+    UdpStatsdSink sink(tls_, writer_, false, getDefaultPrefix(), 1432);
+    EXPECT_EQ(1432, sink.getSampleBatchBytesForTest());
+  }
+  {
+    PerSampleWrites per_sample_writes;
+    UdpStatsdSink sink(tls_, writer_, false, getDefaultPrefix(), 1432);
+    EXPECT_EQ(0, sink.getSampleBatchBytesForTest());
+  }
+}
+
+TEST_F(UdpStatsdSinkBatchTest, SamplesOfOneTurnAreOneDatagram) {
+  UdpStatsdSink sink(tls_, writer_, false);
+  auto* flush_cb = expectFlushCallback();
+
+  // Nothing is sent while the turn runs.
+  EXPECT_CALL(*writer_, write(_)).Times(0);
+  EXPECT_CALL(*flush_cb, scheduleCallbackCurrentIteration()).Times(3);
+  sample(sink, "upstream_rq_time", 5);
+  EXPECT_TRUE(flush_cb->enabled_);
+  sample(sink, "external.upstream_rq_time", 5);
+  sample(sink, "downstream_rq_time", 7);
+  testing::Mock::VerifyAndClearExpectations(writer_.get());
+  testing::Mock::VerifyAndClearExpectations(flush_cb);
+
+  // At the end of the turn the three lines go out as one datagram, in recording order.
+  EXPECT_CALL(*writer_, write("envoy.upstream_rq_time:5|ms\n"
+                              "envoy.external.upstream_rq_time:5|ms\n"
+                              "envoy.downstream_rq_time:7|ms"));
+  flush_cb->invokeCallback();
+  testing::Mock::VerifyAndClearExpectations(writer_.get());
+
+  // The next turn starts a new batch with the same callback.
+  EXPECT_CALL(*writer_, write("envoy.upstream_rq_time:6|ms"));
+  sample(sink, "upstream_rq_time", 6);
+  EXPECT_TRUE(flush_cb->enabled_);
+  flush_cb->invokeCallback();
+  testing::Mock::VerifyAndClearExpectations(writer_.get());
+
+  // A callback with nothing pending sends nothing, and neither does shutdown.
+  EXPECT_CALL(*writer_, write(_)).Times(0);
+  flush_cb->enabled_ = true;
+  flush_cb->invokeCallback();
+  tls_.shutdownThread();
+}
+
+TEST_F(UdpStatsdSinkBatchTest, FullBatchIsSentBeforeTheTurnEnds) {
+  // Each line is 21 bytes; two lines and a newline (43) fit in 64, a third (65) does not.
+  UdpStatsdSink sink(tls_, writer_, false, getDefaultPrefix(), 64);
+  auto* flush_cb = expectFlushCallback();
+
+  InSequence s;
+  EXPECT_CALL(*writer_, write("envoy.test_timer:1|ms\nenvoy.test_timer:2|ms"));
+  EXPECT_CALL(*writer_, write("envoy.test_timer:3|ms"));
+  sample(sink, "test_timer", 1);
+  sample(sink, "test_timer", 2);
+  sample(sink, "test_timer", 3);
+  flush_cb->invokeCallback();
+  tls_.shutdownThread();
+}
+
+TEST_F(UdpStatsdSinkBatchTest, ExactFit) {
+  // Two 21-byte lines and their newline are exactly 43 bytes: one datagram.
+  UdpStatsdSink sink(tls_, writer_, false, getDefaultPrefix(), 43);
+  auto* flush_cb = expectFlushCallback();
+
+  EXPECT_CALL(*writer_, write("envoy.test_timer:1|ms\nenvoy.test_timer:2|ms"));
+  sample(sink, "test_timer", 1);
+  sample(sink, "test_timer", 2);
+  flush_cb->invokeCallback();
+  tls_.shutdownThread();
+}
+
+TEST_F(UdpStatsdSinkBatchTest, LineAtTheLimitIsSentAloneInOrder) {
+  // "envoy.a:1|ms" is 12 bytes and batched; "envoy.test_timer:2|ms" is 21 bytes, at the limit.
+  UdpStatsdSink sink(tls_, writer_, false, getDefaultPrefix(), 21);
+  auto* flush_cb = expectFlushCallback();
+
+  InSequence s;
+  EXPECT_CALL(*writer_, write("envoy.a:1|ms"));
+  EXPECT_CALL(*writer_, write("envoy.test_timer:2|ms"));
+  EXPECT_CALL(*writer_, write("envoy.a:3|ms"));
+  sample(sink, "a", 1);
+  sample(sink, "test_timer", 2);
+  sample(sink, "a", 3);
+  flush_cb->invokeCallback();
+  tls_.shutdownThread();
+}
+
+TEST_F(UdpStatsdSinkBatchTest, ThreadShutdownSendsPendingSamples) {
+  UdpStatsdSink sink(tls_, writer_, false);
+  expectFlushCallback();
+
+  sample(sink, "test_timer", 1);
+  sample(sink, "test_timer", 2);
+  EXPECT_CALL(*writer_, write("envoy.test_timer:1|ms\nenvoy.test_timer:2|ms"));
+  tls_.shutdownThread();
+  testing::Mock::VerifyAndClearExpectations(writer_.get());
+}
+
+TEST_F(UdpStatsdSinkBatchTest, SinkDestructionSendsPendingSamples) {
+  {
+    UdpStatsdSink sink(tls_, writer_, false);
+    expectFlushCallback();
+    sample(sink, "test_timer", 1);
+    EXPECT_CALL(*writer_, write("envoy.test_timer:1|ms"));
+  }
+  testing::Mock::VerifyAndClearExpectations(writer_.get());
+}
+
+TEST_F(UdpStatsdSinkBatchTest, FlushIsNotBatchedWithSamples) {
+  UdpStatsdSink sink(tls_, writer_, false, getDefaultPrefix(), 1024);
+  writer_->delegateBufferFake();
+  auto* flush_cb = expectFlushCallback();
+
+  sample(sink, "test_timer", 1);
+  NiceMock<Stats::MockMetricSnapshot> snapshot;
+  NiceMock<Stats::MockCounter> counter;
+  counter.name_ = "test_counter";
+  counter.used_ = true;
+  counter.latch_ = 1;
+  snapshot.counters_.push_back({1, counter});
+  sink.flush(snapshot);
+  ASSERT_EQ(1, writer_->buffer_writes.size());
+  EXPECT_EQ("envoy.test_counter:1|c", writer_->buffer_writes[0]);
+
+  EXPECT_CALL(*writer_, write("envoy.test_timer:1|ms"));
+  flush_cb->invokeCallback();
+  tls_.shutdownThread();
+}
+
+TEST_F(UdpStatsdSinkBatchTest, BatchingOffWritesEverySample) {
+  PerSampleWrites per_sample_writes;
+  UdpStatsdSink sink(tls_, writer_, false);
+  EXPECT_CALL(tls_.dispatcher_, createSchedulableCallback_(_)).Times(0);
+
+  InSequence s;
+  EXPECT_CALL(*writer_, write("envoy.test_timer:1|ms"));
+  EXPECT_CALL(*writer_, write("envoy.test_timer:2|ms"));
+  sample(sink, "test_timer", 1);
+  sample(sink, "test_timer", 2);
+  tls_.shutdownThread();
+}
+
+// A real UDP socket and a real dispatcher: count the datagrams the receiver gets.
+class UdpStatsdSinkBatchSocketTest : public testing::TestWithParam<Network::Address::IpVersion> {
+protected:
+  UdpStatsdSinkBatchSocketTest()
+      : api_(Api::createApiForTest()), dispatcher_(api_->allocateDispatcher("test_thread")),
+        server_(GetParam()) {
+    tls_.setDispatcher(dispatcher_.get());
+  }
+
+  void sample(UdpStatsdSink& sink, const std::string& name, uint64_t value) {
+    NiceMock<Stats::MockHistogram> histogram;
+    histogram.name_ = name;
+    sink.onHistogramComplete(histogram, value);
+  }
+
+  std::string recv() {
+    Network::UdpRecvData data;
+    server_.recv(data);
+    return data.buffer_->toString();
+  }
+
+  Api::ApiPtr api_;
+  Event::DispatcherPtr dispatcher_;
+  Network::Test::UdpSyncPeer server_;
+  NiceMock<ThreadLocal::MockInstance> tls_;
+};
+INSTANTIATE_TEST_SUITE_P(IpVersions, UdpStatsdSinkBatchSocketTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+TEST_P(UdpStatsdSinkBatchSocketTest, OneDatagramPerTurn) {
+  UdpStatsdSink sink(tls_, server_.localAddress(), false);
+  EXPECT_TRUE(sink.writerConnectedForTest());
+
+  sample(sink, "upstream_rq_time", 5);
+  sample(sink, "external.upstream_rq_time", 5);
+  sample(sink, "downstream_rq_time", 7);
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  // The next turn's sample is the next datagram, so the first turn sent exactly one.
+  sample(sink, "upstream_rq_time", 6);
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  EXPECT_EQ("envoy.upstream_rq_time:5|ms\nenvoy.external.upstream_rq_time:5|ms\n"
+            "envoy.downstream_rq_time:7|ms",
+            recv());
+  EXPECT_EQ("envoy.upstream_rq_time:6|ms", recv());
+
+  // A pending sample is sent when the thread shuts down.
+  sample(sink, "downstream_rq_time", 8);
+  tls_.shutdownThread();
+  EXPECT_EQ("envoy.downstream_rq_time:8|ms", recv());
+}
+
+TEST_P(UdpStatsdSinkBatchSocketTest, GuardsOff) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{std::string(BatchGuard), "false"}, {std::string(ConnectGuard), "false"}});
+  UdpStatsdSink sink(tls_, server_.localAddress(), false);
+  EXPECT_FALSE(sink.writerConnectedForTest());
+
+  sample(sink, "upstream_rq_time", 5);
+  sample(sink, "downstream_rq_time", 7);
+  EXPECT_EQ("envoy.upstream_rq_time:5|ms", recv());
+  EXPECT_EQ("envoy.downstream_rq_time:7|ms", recv());
   tls_.shutdownThread();
 }
 

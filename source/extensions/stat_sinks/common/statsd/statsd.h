@@ -4,6 +4,8 @@
 
 #include "envoy/buffer/buffer.h"
 #include "envoy/common/platform.h"
+#include "envoy/event/dispatcher.h"
+#include "envoy/event/schedulable_cb.h"
 #include "envoy/local_info/local_info.h"
 #include "envoy/network/connection.h"
 #include "envoy/stats/histogram.h"
@@ -67,14 +69,11 @@ public:
                 const bool use_tag, const std::string& prefix = getDefaultPrefix(),
                 std::optional<uint64_t> buffer_size = std::nullopt,
                 const Statsd::TagFormat& tag_format = Statsd::getDefaultTagFormat(),
-                const bool scale_histogram_units = false)
-      : tls_(tls.allocateSlot()), use_tag_(use_tag),
-        prefix_(prefix.empty() ? getDefaultPrefix() : prefix),
-        buffer_size_(buffer_size.value_or(0)), tag_format_(tag_format),
-        scale_histogram_units_(scale_histogram_units) {
-    tls_->set(
-        [writer](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr { return writer; });
-  }
+                const bool scale_histogram_units = false);
+
+  // Datagram size limit for batched histogram samples when max_bytes_per_datagram is not set. Small
+  // enough to avoid IP fragmentation on any path.
+  static constexpr uint64_t DEFAULT_SAMPLE_BATCH_BYTES = 512;
 
   // Stats::Sink
   void flush(Stats::MetricSnapshot& snapshot) override;
@@ -83,7 +82,42 @@ public:
   bool getUseTagForTest() { return use_tag_; }
   uint64_t getBufferSizeForTest() { return buffer_size_; }
   bool getScaleHistogramUnitsForTest() { return scale_histogram_units_; }
+  uint64_t getSampleBatchBytesForTest() { return sample_batch_bytes_; }
+  // Whether this thread's writer has a connected socket. Only valid for sinks built with an
+  // address.
+  bool writerConnectedForTest();
   const std::string& getPrefix() { return prefix_; }
+
+  /**
+   * Per-thread state of the sink: the thread's writer, plus the histogram samples recorded on the
+   * thread during the current event-loop turn. Samples are joined by newlines, as flush() joins
+   * lines, and sent as one datagram when the next sample would exceed the size limit, at the end of
+   * the current dispatcher iteration, or when this object is destroyed, whichever comes first.
+   */
+  class ThreadLocalWriter : public ThreadLocal::ThreadLocalObject {
+  public:
+    /**
+     * @param writer the writer of this thread.
+     * @param dispatcher the dispatcher of this thread, used to send the batch at the end of the
+     *        current iteration.
+     * @param batch_bytes the datagram size limit for batched samples; 0 sends every sample as its
+     *        own datagram.
+     */
+    ThreadLocalWriter(std::shared_ptr<Writer> writer, Event::Dispatcher& dispatcher,
+                      uint64_t batch_bytes);
+    ~ThreadLocalWriter() override;
+
+    Writer& writer() { return *writer_; }
+    void writeSample(const std::string& line);
+    void flushSamples();
+
+  private:
+    const std::shared_ptr<Writer> writer_;
+    Event::Dispatcher& dispatcher_;
+    const uint64_t batch_bytes_;
+    std::string pending_;
+    Event::SchedulableCallbackPtr flush_cb_;
+  };
 
 private:
   /**
@@ -91,14 +125,24 @@ private:
    */
   class WriterImpl : public Writer {
   public:
-    WriterImpl(UdpStatsdSink& parent);
+    /**
+     * @param address the statsd server address.
+     * @param connect whether to connect the socket to an IP address, so that sends use the
+     *        connected path. If connect() fails, the socket stays unconnected and every send names
+     *        the address. Unix datagram sockets are never connected.
+     */
+    WriterImpl(Network::Address::InstanceConstSharedPtr address, bool connect);
 
     // Writer
     void write(const std::string& message) override;
     void writeBuffer(Buffer::Instance& data) override;
 
+    bool connectedForTest() const { return io_handle_->wasConnected(); }
+
   private:
-    UdpStatsdSink& parent_;
+    // Owned here rather than referenced from the sink, so a writer that flushes from its thread's
+    // teardown never depends on the sink's lifetime.
+    const Network::Address::InstanceConstSharedPtr address_;
     const Network::IoHandlePtr io_handle_;
   };
 
@@ -121,6 +165,10 @@ private:
   // Whether histogram samples are scaled to milliseconds according to the histogram's unit before
   // being reported as timers.
   const bool scale_histogram_units_;
+  // Datagram size limit for the histogram samples batched per thread; 0 when batching is disabled.
+  const uint64_t sample_batch_bytes_;
+  // Whether each thread's writer connects its socket to the server address.
+  const bool connect_socket_;
 };
 
 /**

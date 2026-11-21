@@ -18,6 +18,7 @@
 #include "source/common/config/utility.h"
 #include "source/common/network/socket_interface.h"
 #include "source/common/network/utility.h"
+#include "source/common/runtime/runtime_features.h"
 #include "source/common/stats/symbol_table.h"
 
 #include "absl/strings/str_join.h"
@@ -28,19 +29,93 @@ namespace StatSinks {
 namespace Common {
 namespace Statsd {
 
-UdpStatsdSink::WriterImpl::WriterImpl(UdpStatsdSink& parent)
-    : parent_(parent), io_handle_(Network::ioHandleForAddr(Network::Socket::Type::Datagram,
-                                                           parent_.server_address_, {})) {}
+namespace {
+
+uint64_t sampleBatchBytes(uint64_t buffer_size) {
+  if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.statsd_batch_histogram_samples")) {
+    return 0;
+  }
+  return buffer_size > 0 ? buffer_size : UdpStatsdSink::DEFAULT_SAMPLE_BATCH_BYTES;
+}
+
+} // namespace
+
+UdpStatsdSink::WriterImpl::WriterImpl(Network::Address::InstanceConstSharedPtr address,
+                                      bool connect)
+    : address_(std::move(address)),
+      io_handle_(Network::ioHandleForAddr(Network::Socket::Type::Datagram, address_, {})) {
+  // Only IP sockets are connected. A connected Unix datagram socket is bound to one receiver socket
+  // and fails for good once that receiver restarts, while an unconnected one finds the new receiver
+  // at the same path.
+  if (connect && address_->type() == Network::Address::Type::Ip) {
+    // A connected datagram socket sends without naming the destination and reuses the route it
+    // resolved here, instead of looking it up for every datagram. writeToSocket() takes the
+    // connected path whenever connect() succeeded; on failure the socket stays unconnected and
+    // every send names the address, as before.
+    const Api::SysCallIntResult result = io_handle_->connect(address_);
+    if (result.return_value_ != 0) {
+      ENVOY_LOG_MISC(debug, "statsd: connect to {} failed ({}), sending unconnected",
+                     address_->asString(), result.errno_);
+    }
+  }
+}
 
 void UdpStatsdSink::WriterImpl::write(const std::string& message) {
   // TODO(mattklein123): We can avoid this const_cast pattern by having a constant variant of
   // RawSlice. This can be fixed elsewhere as well.
   Buffer::RawSlice slice{const_cast<char*>(message.c_str()), message.size()};
-  Network::Utility::writeToSocket(*io_handle_, &slice, 1, nullptr, *parent_.server_address_);
+  Network::Utility::writeToSocket(*io_handle_, &slice, 1, nullptr, *address_);
 }
 
 void UdpStatsdSink::WriterImpl::writeBuffer(Buffer::Instance& data) {
-  Network::Utility::writeToSocket(*io_handle_, data, nullptr, *parent_.server_address_);
+  Network::Utility::writeToSocket(*io_handle_, data, nullptr, *address_);
+}
+
+UdpStatsdSink::ThreadLocalWriter::ThreadLocalWriter(std::shared_ptr<Writer> writer,
+                                                    Event::Dispatcher& dispatcher,
+                                                    uint64_t batch_bytes)
+    : writer_(std::move(writer)), dispatcher_(dispatcher), batch_bytes_(batch_bytes) {
+  if (batch_bytes_ > 0) {
+    pending_.reserve(batch_bytes_);
+  }
+}
+
+UdpStatsdSink::ThreadLocalWriter::~ThreadLocalWriter() {
+  // The thread is going away (or the sink released its slot): send what is pending so that no
+  // sample recorded before this point is lost to batching.
+  flushSamples();
+}
+
+void UdpStatsdSink::ThreadLocalWriter::writeSample(const std::string& line) {
+  if (line.size() >= batch_bytes_) {
+    // Batching is disabled, or the line alone fills a datagram: send the pending batch first to
+    // keep the order of the samples, then the line on its own.
+    flushSamples();
+    writer_->write(line);
+    return;
+  }
+  if (!pending_.empty()) {
+    if (pending_.size() + 1 + line.size() > batch_bytes_) {
+      flushSamples();
+    } else {
+      pending_.push_back('\n');
+    }
+  }
+  pending_.append(line);
+  if (flush_cb_ == nullptr) {
+    // Created on first use, so a thread that never records a sample never allocates it.
+    flush_cb_ = dispatcher_.createSchedulableCallback([this]() { flushSamples(); });
+  }
+  // Runs after the events already queued in this iteration; a no-op when already scheduled.
+  flush_cb_->scheduleCallbackCurrentIteration();
+}
+
+void UdpStatsdSink::ThreadLocalWriter::flushSamples() {
+  if (pending_.empty()) {
+    return;
+  }
+  writer_->write(pending_);
+  pending_.clear();
 }
 
 std::optional<double> scaledTimerMilliseconds(const Stats::Histogram& histogram, uint64_t value,
@@ -70,14 +145,40 @@ UdpStatsdSink::UdpStatsdSink(ThreadLocal::SlotAllocator& tls,
     : tls_(tls.allocateSlot()), server_address_(std::move(address)), use_tag_(use_tag),
       prefix_(prefix.empty() ? Statsd::getDefaultPrefix() : prefix),
       buffer_size_(buffer_size.value_or(0)), tag_format_(tag_format),
-      scale_histogram_units_(scale_histogram_units) {
-  tls_->set([this](Event::Dispatcher&) -> ThreadLocal::ThreadLocalObjectSharedPtr {
-    return std::make_shared<WriterImpl>(*this);
+      scale_histogram_units_(scale_histogram_units),
+      sample_batch_bytes_(sampleBatchBytes(buffer_size_)),
+      connect_socket_(
+          Runtime::runtimeFeatureEnabled("envoy.reloadable_features.statsd_connect_udp_socket")) {
+  // Capture values, not the sink: the per-thread objects may be released after the sink.
+  tls_->set(
+      [address = server_address_, connect = connect_socket_, batch_bytes = sample_batch_bytes_](
+          Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectSharedPtr {
+        return std::make_shared<ThreadLocalWriter>(std::make_shared<WriterImpl>(address, connect),
+                                                   dispatcher, batch_bytes);
+      });
+}
+
+UdpStatsdSink::UdpStatsdSink(ThreadLocal::SlotAllocator& tls, const std::shared_ptr<Writer>& writer,
+                             const bool use_tag, const std::string& prefix,
+                             std::optional<uint64_t> buffer_size,
+                             const Statsd::TagFormat& tag_format, const bool scale_histogram_units)
+    : tls_(tls.allocateSlot()), use_tag_(use_tag),
+      prefix_(prefix.empty() ? getDefaultPrefix() : prefix), buffer_size_(buffer_size.value_or(0)),
+      tag_format_(tag_format), scale_histogram_units_(scale_histogram_units),
+      sample_batch_bytes_(sampleBatchBytes(buffer_size_)), connect_socket_(false) {
+  tls_->set([writer, batch_bytes = sample_batch_bytes_](
+                Event::Dispatcher& dispatcher) -> ThreadLocal::ThreadLocalObjectSharedPtr {
+    return std::make_shared<ThreadLocalWriter>(writer, dispatcher, batch_bytes);
   });
 }
 
+bool UdpStatsdSink::writerConnectedForTest() {
+  auto* writer = dynamic_cast<WriterImpl*>(&tls_->getTyped<ThreadLocalWriter>().writer());
+  return writer != nullptr && writer->connectedForTest();
+}
+
 void UdpStatsdSink::flush(Stats::MetricSnapshot& snapshot) {
-  Writer& writer = tls_->getTyped<Writer>();
+  Writer& writer = tls_->getTyped<ThreadLocalWriter>().writer();
   Buffer::OwnedImpl buffer;
 
   for (const auto& counter : snapshot.counters()) {
@@ -159,7 +260,7 @@ void UdpStatsdSink::onHistogramComplete(const Stats::Histogram& histogram, uint6
       message = buildMessage(histogram, value, "|ms");
     }
   }
-  tls_->getTyped<Writer>().write(message);
+  tls_->getTyped<ThreadLocalWriter>().writeSample(message);
 }
 
 template <class StatType, typename ValueType>
