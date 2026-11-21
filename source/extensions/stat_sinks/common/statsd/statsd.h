@@ -27,7 +27,7 @@ namespace StatSinks {
 namespace Common {
 namespace Statsd {
 
-static const std::string& getDefaultPrefix() { CONSTRUCT_ON_FIRST_USE(std::string, "envoy"); }
+inline const std::string& getDefaultPrefix() { CONSTRUCT_ON_FIRST_USE(std::string, "envoy"); }
 
 /**
  * Scales a histogram sample to the milliseconds reported for a statsd timer when the histogram's
