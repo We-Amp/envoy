@@ -46,6 +46,7 @@
 #include "test/test_common/threadsafe_singleton_injector.h"
 #include "test/test_common/utility.h"
 
+#include "absl/flags/reflection.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -270,6 +271,11 @@ protected:
   };
 
   ConnectionMocks createConnectionMocks(bool create_timer = true) {
+    // The tests that use these mocks drive the write to the socket through the mock file event,
+    // which is what the connection does without writing in the current iteration. That path is
+    // tested in ConnectionImplWriteInCurrentIterationTest and WriteInCurrentIterationTest.
+    Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.connection_write_in_current_iteration",
+                                  false);
     auto dispatcher = std::make_unique<NiceMock<Event::MockDispatcher>>();
     EXPECT_CALL(dispatcher->buffer_factory_, createBuffer_(_, _, _))
         .WillRepeatedly(
@@ -302,6 +308,8 @@ protected:
     return dynamic_cast<Network::TestClientConnectionImpl*>(client_connection_.get());
   }
 
+  // Restores the runtime guards that createConnectionMocks() changes.
+  absl::FlagSaver flag_saver_;
   Event::MockTimer* timer_{nullptr};
   bool timer_destroyed_{false};
   Event::FileReadyCb file_ready_cb_;
@@ -3340,7 +3348,13 @@ class MockTransportConnectionImplTest : public testing::Test {
 public:
   MockTransportConnectionImplTest()
       : stream_info_(dispatcher_.timeSource(), nullptr,
-                     StreamInfo::FilterState::LifeSpan::Connection) {}
+                     StreamInfo::FilterState::LifeSpan::Connection) {
+    // These tests drive the write to the socket through the mock file event, which is what the
+    // connection does without writing in the current iteration. That path is tested in
+    // ConnectionImplWriteInCurrentIterationTest and WriteInCurrentIterationTest.
+    Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.connection_write_in_current_iteration",
+                                  false);
+  }
 
   ~MockTransportConnectionImplTest() override { connection_->close(ConnectionCloseType::NoFlush); }
 
@@ -3380,6 +3394,8 @@ public:
     return {PostIoAction::KeepOpen, size, false};
   }
 
+  // Restores the runtime guards that the constructor changes.
+  absl::FlagSaver flag_saver_;
   std::unique_ptr<ConnectionImpl> connection_;
   Event::MockDispatcher dispatcher_;
   NiceMock<MockConnectionCallbacks> callbacks_;
@@ -4273,6 +4289,188 @@ TEST_F(MockTransportConnectionImplTest, UpdatingBufferHighWatermarkTimeoutToZero
 }
 
 // Fixture for validating behavior after a connection is closed.
+// envoy.reloadable_features.connection_write_in_current_iteration with a mock dispatcher: which of
+// the two ways to get the write buffer to the socket a write picks.
+class ConnectionImplWriteInCurrentIterationTest : public MockTransportConnectionImplTest {
+public:
+  ConnectionImplWriteInCurrentIterationTest() {
+    Runtime::maybeSetRuntimeGuard("envoy.reloadable_features.connection_write_in_current_iteration",
+                                  true);
+    EXPECT_CALL(dispatcher_, approximateMonotonicTime())
+        .Times(AnyNumber())
+        .WillRepeatedly(testing::ReturnPointee(&now_));
+  }
+
+  void initializeWithWriteCallback() {
+    initializeConnection();
+    // Handed to the connection by the first write.
+    write_cb_ = new NiceMock<Event::MockSchedulableCallback>(&dispatcher_);
+  }
+
+  void write(const std::string& data) {
+    Buffer::OwnedImpl buffer(data);
+    connection_->write(buffer, false);
+  }
+
+  // The start of another iteration of the event loop.
+  void nextIteration() { now_ += std::chrono::milliseconds(1); }
+
+  MonotonicTime now_{std::chrono::seconds(100)};
+  Event::MockSchedulableCallback* write_cb_{};
+};
+
+// A write on an idle connection is scheduled for the current iteration, and no write file event is
+// activated.
+TEST_F(ConnectionImplWriteInCurrentIterationTest, WriteIsScheduledForTheCurrentIteration) {
+  initializeWithWriteCallback();
+  EXPECT_CALL(*file_event_, activate(_)).Times(0);
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration());
+  EXPECT_CALL(*write_cb_, scheduleCallbackNextIteration()).Times(0);
+  write("hello");
+
+  uint64_t bytes_sent = 0;
+  connection_->addBytesSentCallback([&](uint64_t bytes) {
+    bytes_sent += bytes;
+    return true;
+  });
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("hello"), false))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  write_cb_->invokeCallback();
+  EXPECT_EQ(5, bytes_sent);
+}
+
+// Writes made before the scheduled write runs go out with it.
+TEST_F(ConnectionImplWriteInCurrentIterationTest, WritesOfOneIterationGoOutTogether) {
+  initializeWithWriteCallback();
+  EXPECT_CALL(*file_event_, activate(_)).Times(0);
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration());
+  write("hello ");
+  write("world");
+
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("hello world"), false))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  write_cb_->invokeCallback();
+}
+
+// A connection writes in the current iteration once per iteration. A write after that is left to
+// the write file event of the next iteration, so that writes that trigger each other cannot keep
+// the event loop from polling. In a later iteration the connection writes in the iteration again.
+TEST_F(ConnectionImplWriteInCurrentIterationTest, OncePerIteration) {
+  initializeWithWriteCallback();
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration());
+  write("one");
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("one"), false))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  write_cb_->invokeCallback();
+
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration()).Times(0);
+  EXPECT_CALL(*file_event_, activate(Event::FileReadyType::Write));
+  write("two");
+  testing::Mock::VerifyAndClearExpectations(file_event_);
+  testing::Mock::VerifyAndClearExpectations(write_cb_);
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("two"), false))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  EXPECT_OK(file_ready_cb_(Event::FileReadyType::Write));
+
+  nextIteration();
+  EXPECT_CALL(*file_event_, activate(_)).Times(0);
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration());
+  write("three");
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("three"), false))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  write_cb_->invokeCallback();
+}
+
+// A write made from a callback of the write itself is not run in the same iteration again.
+TEST_F(ConnectionImplWriteInCurrentIterationTest, WriteFromBytesSentCallback) {
+  initializeWithWriteCallback();
+  bool written_from_callback = false;
+  connection_->addBytesSentCallback([&](uint64_t) {
+    if (!written_from_callback) {
+      written_from_callback = true;
+      write("again");
+    }
+    return true;
+  });
+
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration());
+  write("first");
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("first"), false))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration()).Times(0);
+  EXPECT_CALL(*file_event_, activate(Event::FileReadyType::Write));
+  write_cb_->invokeCallback();
+  EXPECT_TRUE(written_from_callback);
+
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("again"), false))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  EXPECT_OK(file_ready_cb_(Event::FileReadyType::Write));
+}
+
+// If the socket did not take everything, the connection waits for the socket to become writable.
+// A write on top of what is left activates the write file event as before.
+TEST_F(ConnectionImplWriteInCurrentIterationTest, WriteBufferNotEmpty) {
+  initializeWithWriteCallback();
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration());
+  write("pending");
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("pending"), false))
+      .WillOnce(Return(IoResult{PostIoAction::KeepOpen, 0, false}));
+  write_cb_->invokeCallback();
+
+  nextIteration();
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration()).Times(0);
+  EXPECT_CALL(*file_event_, activate(Event::FileReadyType::Write));
+  write(" more");
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("pending more"), false))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  EXPECT_OK(file_ready_cb_(Event::FileReadyType::Write));
+}
+
+// Closing the connection cancels a write that is still scheduled. A close without flush writes
+// what it can on its own.
+TEST_F(ConnectionImplWriteInCurrentIterationTest, CloseCancelsScheduledWrite) {
+  initializeWithWriteCallback();
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration());
+  write("hello");
+
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("hello"), true))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  EXPECT_CALL(*write_cb_, cancel());
+  EXPECT_CALL(callbacks_, onEvent(ConnectionEvent::LocalClose));
+  connection_->close(ConnectionCloseType::NoFlush);
+  EXPECT_FALSE(write_cb_->enabled_);
+}
+
+// A close that waits for the write buffer to drain is completed by the scheduled write.
+TEST_F(ConnectionImplWriteInCurrentIterationTest, FlushWriteCloseCompletesInTheIteration) {
+  initializeWithWriteCallback();
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration());
+  EXPECT_CALL(*transport_socket_, canFlushClose()).WillRepeatedly(Return(true));
+  write("hello");
+  connection_->close(ConnectionCloseType::FlushWrite);
+  EXPECT_EQ(Connection::State::Closing, connection_->state());
+
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString("hello"), _))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  EXPECT_CALL(callbacks_, onEvent(ConnectionEvent::LocalClose));
+  write_cb_->invokeCallback();
+  EXPECT_EQ(Connection::State::Closed, connection_->state());
+}
+
+// The end of the stream without data is written the same way.
+TEST_F(ConnectionImplWriteInCurrentIterationTest, EndStreamWithoutData) {
+  initializeWithWriteCallback();
+  connection_->enableHalfClose(true);
+  EXPECT_CALL(*file_event_, activate(_)).Times(0);
+  EXPECT_CALL(*write_cb_, scheduleCallbackCurrentIteration());
+  Buffer::OwnedImpl empty;
+  connection_->write(empty, true);
+
+  EXPECT_CALL(*transport_socket_, doWrite(BufferString(""), true))
+      .WillOnce(Invoke(simulateSuccessfulWrite));
+  write_cb_->invokeCallback();
+}
+
 class PostCloseConnectionImplTest : public MockTransportConnectionImplTest {
 public:
   PostCloseConnectionImplTest() { MockTransportConnectionImplTest::initializeConnection(); }
@@ -4993,6 +5191,258 @@ TEST_P(ConnectionImplStopOnShortReadTest, CanStopReadingOnShortRead) {
   client_connection_->close(ConnectionCloseType::NoFlush);
 }
 #endif
+
+// Records every write system call on one socket in a log that the test also writes to, and
+// otherwise behaves like the real thing.
+class WriteRecordingOsSysCalls : public Api::OsSysCallsImpl {
+public:
+  Api::SysCallSizeResult writev(os_fd_t fd, const iovec* iov, int num_iov) override {
+    const Api::SysCallSizeResult result = Api::OsSysCallsImpl::writev(fd, iov, num_iov);
+    record(fd, result);
+    return result;
+  }
+  Api::SysCallSizeResult send(os_fd_t fd, void* buffer, size_t length, int flags) override {
+    const Api::SysCallSizeResult result = Api::OsSysCallsImpl::send(fd, buffer, length, flags);
+    record(fd, result);
+    return result;
+  }
+
+  os_fd_t fd_{-1};
+  std::vector<std::string> log_;
+
+private:
+  void record(os_fd_t fd, const Api::SysCallSizeResult& result) {
+    if (fd == fd_) {
+      log_.push_back(fmt::format("write {}", result.return_value_));
+    }
+  }
+};
+
+// envoy.reloadable_features.connection_write_in_current_iteration on a real event loop and real TCP
+// sockets, with the guard on and off. The peer must receive the same bytes either way; what
+// differs is when the write system call is made relative to other callbacks of the event loop.
+class WriteInCurrentIterationTest
+    : public ConnectionImplTestBase,
+      public testing::TestWithParam<std::tuple<Address::IpVersion, bool>> {
+protected:
+  WriteInCurrentIterationTest() {
+    scoped_runtime_.mergeValues({{"envoy.reloadable_features.connection_write_in_current_iteration",
+                                  writeInCurrentIteration() ? "true" : "false"}});
+  }
+
+  bool writeInCurrentIteration() const { return std::get<1>(GetParam()); }
+
+  void setUpAndConnect() {
+    setUpBasicConnectionWithAddress(
+        Network::Test::getCanonicalLoopbackAddress(std::get<0>(GetParam())));
+    connect();
+    ON_CALL(*read_filter_, onData(_, _))
+        .WillByDefault(Invoke([this](Buffer::Instance& data, bool) -> FilterStatus {
+          server_received_.append(data.toString());
+          data.drain(data.length());
+          return FilterStatus::StopIteration;
+        }));
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    os_sys_calls_.fd_ = client_connection_->getSocket()->ioHandle().fdDoNotUse();
+  }
+
+  // A callback that runs in the iteration of the event loop in which it is scheduled, after what
+  // was scheduled before it.
+  Event::SchedulableCallbackPtr inCurrentIteration(std::function<void()> cb) {
+    return dispatcher_->createSchedulableCallback(cb);
+  }
+
+  void clientWrite(const std::string& data) {
+    Buffer::OwnedImpl buffer(data);
+    client_connection_->write(buffer, false);
+  }
+
+  void runUntil(std::function<bool()> done) {
+    for (int i = 0; i < 2000 && !done(); i++) {
+      dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+      if (!done()) {
+        // The events come from the kernel, not from the simulated time system.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1)); // NO_CHECK_FORMAT(real_time)
+      }
+    }
+    ASSERT_TRUE(done());
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  std::vector<std::string>& log() { return os_sys_calls_.log_; }
+
+  TestScopedRuntime scoped_runtime_;
+  WriteRecordingOsSysCalls os_sys_calls_;
+  TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls_{&os_sys_calls_};
+  std::string server_received_;
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    IpVersionsAndGuard, WriteInCurrentIterationTest,
+    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool()));
+
+// A write made by a callback of the event loop reaches the socket before a callback that was
+// scheduled for the same iteration after it. Without the guard the write waits for the next
+// iteration, so that callback runs first.
+TEST_P(WriteInCurrentIterationTest, WriteRunsInTheIterationThatMadeIt) {
+  setUpAndConnect();
+
+  Event::SchedulableCallbackPtr after = inCurrentIteration([&]() { log().push_back("after"); });
+  Event::SchedulableCallbackPtr writer = inCurrentIteration([&]() {
+    clientWrite("hello");
+    after->scheduleCallbackCurrentIteration();
+  });
+  writer->scheduleCallbackCurrentIteration();
+  runUntil([&]() { return server_received_ == "hello"; });
+
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("write 5", "after"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("after", "write 5"));
+  }
+  disconnect(true);
+}
+
+// Writes made by different callbacks of one iteration before the scheduled write runs go out in
+// one system call, with and without the guard.
+TEST_P(WriteInCurrentIterationTest, WritesOfOneIterationGoOutTogether) {
+  setUpAndConnect();
+
+  Event::SchedulableCallbackPtr second = inCurrentIteration([&]() { clientWrite("world"); });
+  Event::SchedulableCallbackPtr first = inCurrentIteration([&]() { clientWrite("hello "); });
+  // Both are scheduled before the event loop runs, so the write that the first one schedules comes
+  // after the second one.
+  first->scheduleCallbackCurrentIteration();
+  second->scheduleCallbackCurrentIteration();
+  runUntil([&]() { return server_received_ == "hello world"; });
+
+  EXPECT_THAT(log(), ElementsAre("write 11"));
+  disconnect(true);
+}
+
+// A second write in an iteration in which the connection already wrote waits for the next
+// iteration, as every write does without the guard. In a later iteration the connection writes in
+// the iteration again.
+TEST_P(WriteInCurrentIterationTest, OncePerIteration) {
+  setUpAndConnect();
+
+  Event::SchedulableCallbackPtr last = inCurrentIteration([&]() { log().push_back("last"); });
+  Event::SchedulableCallbackPtr after = inCurrentIteration([&]() {
+    log().push_back("after");
+    clientWrite("world");
+    last->scheduleCallbackCurrentIteration();
+  });
+  Event::SchedulableCallbackPtr writer = inCurrentIteration([&]() {
+    clientWrite("hello ");
+    after->scheduleCallbackCurrentIteration();
+  });
+  writer->scheduleCallbackCurrentIteration();
+  runUntil([&]() { return server_received_ == "hello world"; });
+
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("write 6", "after", "last", "write 5"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("after", "last", "write 11"));
+  }
+
+  // The event loop's time only changes between iterations, and the test's time is simulated.
+  log().clear();
+  server_received_.clear();
+  time_system_.advanceTimeAsyncImpl(std::chrono::milliseconds(1));
+  Event::SchedulableCallbackPtr after2 = inCurrentIteration([&]() { log().push_back("after"); });
+  Event::SchedulableCallbackPtr writer2 = inCurrentIteration([&]() {
+    clientWrite("again");
+    after2->scheduleCallbackCurrentIteration();
+  });
+  writer2->scheduleCallbackCurrentIteration();
+  runUntil([&]() { return server_received_ == "again"; });
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("write 5", "after"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("after", "write 5"));
+  }
+  disconnect(true);
+}
+
+// A write followed by a close that flushes: the peer gets the data and then the close.
+TEST_P(WriteInCurrentIterationTest, WriteThenFlushWriteClose) {
+  setUpAndConnect();
+  bool server_closed = false;
+  EXPECT_CALL(server_callbacks_, onEvent(ConnectionEvent::RemoteClose))
+      .WillOnce(InvokeWithoutArgs([&]() { server_closed = true; }));
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+
+  Event::SchedulableCallbackPtr writer = inCurrentIteration([&]() {
+    clientWrite("hello");
+    client_connection_->close(ConnectionCloseType::FlushWrite);
+  });
+  writer->scheduleCallbackCurrentIteration();
+  runUntil([&]() { return server_closed; });
+
+  EXPECT_EQ("hello", server_received_);
+  EXPECT_THAT(log(), ElementsAre("write 5"));
+}
+
+// A write followed by a close without flush in the same callback: the close writes what it can,
+// and the scheduled write does not run on the closed socket.
+TEST_P(WriteInCurrentIterationTest, WriteThenNoFlushClose) {
+  setUpAndConnect();
+  bool server_closed = false;
+  EXPECT_CALL(server_callbacks_, onEvent(ConnectionEvent::RemoteClose))
+      .WillOnce(InvokeWithoutArgs([&]() { server_closed = true; }));
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+
+  Event::SchedulableCallbackPtr writer = inCurrentIteration([&]() {
+    clientWrite("hello");
+    client_connection_->close(ConnectionCloseType::NoFlush);
+  });
+  writer->scheduleCallbackCurrentIteration();
+  runUntil([&]() { return server_closed; });
+
+  EXPECT_EQ("hello", server_received_);
+  EXPECT_THAT(log(), ElementsAre("write 5"));
+}
+
+// The bytes sent callbacks and the write buffer statistics see the same numbers.
+TEST_P(WriteInCurrentIterationTest, BytesSentCallbackAndStats) {
+  setUpAndConnect();
+  NiceMockConnectionStats client_connection_stats;
+  client_connection_->setConnectionStats(client_connection_stats.toBufferStats());
+  uint64_t bytes_sent = 0;
+  client_connection_->addBytesSentCallback([&](uint64_t bytes) {
+    bytes_sent += bytes;
+    return true;
+  });
+  EXPECT_CALL(client_connection_stats.tx_total_, add(5));
+
+  Event::SchedulableCallbackPtr writer = inCurrentIteration([&]() { clientWrite("hello"); });
+  writer->scheduleCallbackCurrentIteration();
+  runUntil([&]() { return server_received_ == "hello"; });
+  EXPECT_EQ(5, bytes_sent);
+  disconnect(true);
+}
+
+// A large write that the socket does not take at once is completed through write file events, and
+// the watermark callbacks fire in the same order.
+TEST_P(WriteInCurrentIterationTest, LargeWriteWithWatermarks) {
+  setUpAndConnect();
+  client_connection_->setBufferLimits(64 * 1024);
+  std::vector<std::string> watermarks;
+  EXPECT_CALL(client_callbacks_, onAboveWriteBufferHighWatermark())
+      .Times(AnyNumber())
+      .WillRepeatedly(InvokeWithoutArgs([&]() { watermarks.push_back("high"); }));
+  EXPECT_CALL(client_callbacks_, onBelowWriteBufferLowWatermark())
+      .Times(AnyNumber())
+      .WillRepeatedly(InvokeWithoutArgs([&]() { watermarks.push_back("low"); }));
+
+  const std::string message(16 * 1024 * 1024, 'd');
+  Event::SchedulableCallbackPtr writer = inCurrentIteration([&]() { clientWrite(message); });
+  writer->scheduleCallbackCurrentIteration();
+  runUntil([&]() { return server_received_.size() == message.size(); });
+  EXPECT_EQ(message, server_received_);
+  EXPECT_THAT(watermarks, ElementsAre("high", "low"));
+  disconnect(true);
+}
 
 class TcpClientConnectionImplTest : public testing::TestWithParam<Address::IpVersion> {
 protected:

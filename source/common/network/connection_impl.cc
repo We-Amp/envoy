@@ -109,7 +109,9 @@ ConnectionImpl::ConnectionImpl(Event::Dispatcher& dispatcher, ConnectionSocketPt
           [this]() -> void { this->onReadBufferHighWatermark(); },
           []() -> void { /* TODO(adisuissa): Handle overflow watermark */ })),
       enable_close_through_filter_manager_(Runtime::runtimeFeatureEnabled(
-          "envoy.reloadable_features.connection_close_through_filter_manager")) {
+          "envoy.reloadable_features.connection_close_through_filter_manager")),
+      write_in_current_iteration_(Runtime::runtimeFeatureEnabled(
+          "envoy.reloadable_features.connection_write_in_current_iteration")) {
 
   if (!socket_->isOpen()) {
     IS_ENVOY_BUG("Client socket failure");
@@ -388,6 +390,11 @@ void ConnectionImpl::closeSocket(ConnectionEvent close_type) {
     delayed_close_timer_ = nullptr;
   }
 
+  // Nor for a write that is still scheduled for this iteration.
+  if (write_in_current_iteration_cb_ != nullptr) {
+    write_in_current_iteration_cb_->cancel();
+  }
+
   ENVOY_CONN_LOG(debug, "closing socket: {}", *this, static_cast<uint32_t>(close_type));
   const bool abort_reset = detected_close_type_ == StreamInfo::DetectedCloseType::RemoteReset ||
                            detected_close_type_ == StreamInfo::DetectedCloseType::LocalReset;
@@ -661,15 +668,56 @@ void ConnectionImpl::write(Buffer::Instance& data, bool end_stream, bool through
     // ever changed, read the comment in SslSocket::doWrite() VERY carefully. That code assumes that
     // we never change existing write_buffer_ chain elements between calls to SSL_write(). That code
     // might need to change if we ever copy here.
+    const bool write_buffer_was_empty = write_buffer_->length() == 0;
     write_buffer_->move(data);
 
     // Activating a write event before the socket is connected has the side-effect of tricking
     // doWriteReady into thinking the socket is connected. On macOS, the underlying write may fail
     // with a connection error if a call to write(2) occurs before the connection is completed.
     if (!connecting_) {
-      ioHandle().activateFileEvents(Event::FileReadyType::Write);
+      scheduleWrite(write_buffer_was_empty);
     }
   }
+}
+
+void ConnectionImpl::scheduleWrite(bool write_buffer_was_empty) {
+  if (write_in_current_iteration_) {
+    if (write_in_current_iteration_cb_ != nullptr && write_in_current_iteration_cb_->enabled()) {
+      // The write is already scheduled for this iteration and takes this data along.
+      return;
+    }
+    // A write file event runs in the next iteration of the event loop, which first polls for file
+    // events without waiting. When this write is the only work left, that poll finds nothing.
+    // Running the write at the end of the current iteration, after the events that are already
+    // scheduled, saves the poll and still puts everything written in this iteration into one
+    // system call.
+    //
+    // Only do this if the write buffer was empty. If it was not, either a write is already on its
+    // way, or the socket did not take the data and the connection waits for it to become
+    // writable. And only do it once per iteration for each connection, so that writes that
+    // trigger each other without going through the event loop cannot keep it from polling.
+    if (write_buffer_was_empty &&
+        last_write_in_current_iteration_ != dispatcher_.approximateMonotonicTime()) {
+      if (write_in_current_iteration_cb_ == nullptr) {
+        write_in_current_iteration_cb_ =
+            dispatcher_.createSchedulableCallback([this]() { onWriteInCurrentIteration(); });
+      }
+      write_in_current_iteration_cb_->scheduleCallbackCurrentIteration();
+      return;
+    }
+  }
+  ioHandle().activateFileEvents(Event::FileReadyType::Write);
+}
+
+void ConnectionImpl::onWriteInCurrentIteration() {
+  last_write_in_current_iteration_ = dispatcher_.approximateMonotonicTime();
+  // closeSocket() cancels the callback, so the socket is open.
+  if (!socket_->isOpen()) {
+    IS_ENVOY_BUG("write scheduled on a closed socket");
+    return;
+  }
+  // Same as the write file event that write() would have activated.
+  onFileEvent(Event::FileReadyType::Write);
 }
 
 void ConnectionImpl::setBufferLimits(uint32_t limit) {

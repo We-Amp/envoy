@@ -8,6 +8,8 @@
 #include <string>
 
 #include "envoy/common/scope_tracker.h"
+#include "envoy/common/time.h"
+#include "envoy/event/schedulable_cb.h"
 #include "envoy/network/transport_socket.h"
 
 #include "source/common/buffer/watermark_buffer.h"
@@ -244,6 +246,12 @@ private:
   // Write data to the connection bypassing filter chain (optionally).
   void write(Buffer::Instance& data, bool end_stream, bool through_filter_chain);
 
+  // Makes sure that the write buffer is written to the socket: in the current iteration of the
+  // event loop if write_in_current_iteration_ allows it, otherwise through a write file event in
+  // the next iteration.
+  void scheduleWrite(bool write_buffer_was_empty);
+  void onWriteInCurrentIteration();
+
   // Returns true iff end of stream has been both written and read.
   bool bothSidesHalfClosed();
 
@@ -271,6 +279,12 @@ private:
   StreamInfo::DetectedCloseType detected_close_type_{StreamInfo::DetectedCloseType::Normal};
   std::chrono::milliseconds buffer_high_watermark_timeout_{};
   Event::TimerPtr buffer_high_watermark_timer_{nullptr};
+  // Runs onWriteInCurrentIteration(). Created by the first write that uses it.
+  Event::SchedulableCallbackPtr write_in_current_iteration_cb_;
+  // The dispatcher's approximate monotonic time when onWriteInCurrentIteration() last ran. The
+  // dispatcher updates that time once per iteration of the event loop, so an equal value means
+  // that the connection already wrote in the current iteration.
+  std::optional<MonotonicTime> last_write_in_current_iteration_;
   bool detect_early_close_ : 1 = true;
   bool enable_half_close_ : 1 = false;
   bool read_end_stream_raised_ : 1 = false;
@@ -293,6 +307,10 @@ private:
   // hint to read until no more data is available instead of as an early close. Set at
   // construction and only for TCP sockets on Linux; see supportsStopOnShortRead().
   bool stop_on_short_read_ : 1 = false;
+  // True if write() schedules the write to the socket for the current iteration of the event loop
+  // instead of activating a write file event, which runs in the next iteration, after another
+  // poll for file events. See scheduleWrite().
+  bool write_in_current_iteration_ : 1;
   // True once the Closed file event was raised while reading. From then on the transport socket
   // has to read until no more data is available, as it does without stop_on_short_read_.
   bool read_until_no_more_data_ : 1 = false;

@@ -107,6 +107,8 @@ envoy_cc_library(
         ":default_socket_interface_lib",
         ":raw_buffer_socket_lib",
         ":utility_lib",
+        "//envoy/common:time_interface",
+        "//envoy/event:schedulable_cb_interface",
         "//envoy/event:timer_interface",
         "//envoy/network:connection_interface",
         "//envoy/network:filter_interface",
