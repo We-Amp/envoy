@@ -4,12 +4,16 @@
 #include "envoy/registry/registry.h"
 
 #include "source/common/tracing/http_tracer_impl.h"
+#include "source/common/tracing/tracer_impl.h"
 #include "source/common/version/version.h"
 #include "source/extensions/tracers/opentelemetry/opentelemetry_tracer_impl.h"
 #include "source/extensions/tracers/opentelemetry/span_context_extractor.h"
 #include "source/extensions/tracers/opentelemetry/trace_exporter.h"
 
 #include "test/mocks/common.h"
+#include "test/mocks/event/mocks.h"
+#include "test/mocks/local_info/mocks.h"
+#include "test/mocks/runtime/mocks.h"
 #include "test/mocks/server/tracer_factory_context.h"
 #include "test/mocks/stats/mocks.h"
 #include "test/mocks/stream_info/mocks.h"
@@ -1867,27 +1871,41 @@ TEST_F(OpenTelemetryDriverTest, DisableLocalDecisionWithSampledTrue) {
   EXPECT_EQ(1U, stats_.counter("tracing.opentelemetry.spans_sent").value());
 }
 
-// Spans that are not sampled, with the runtime guard for non-recording spans on and off. Every
+// Spans that are not sampled, with the runtime guard for deferred spans on and off. Every
 // expectation on ids, propagated headers and exported spans is the same for both values: only the
 // class of the span differs.
-class OpenTelemetryNonRecordingSpanTest : public OpenTelemetryDriverTest,
-                                          public testing::WithParamInterface<bool> {
+class OpenTelemetryDeferredSpanTest : public OpenTelemetryDriverTest,
+                                      public testing::WithParamInterface<bool> {
 public:
-  OpenTelemetryNonRecordingSpanTest() {
-    scoped_runtime_.mergeValues({{"envoy.reloadable_features.otel_tracer_non_recording_span",
-                                  GetParam() ? "true" : "false"}});
+  OpenTelemetryDeferredSpanTest() {
+    setGuard(GetParam());
     ON_CALL(stream_info_, startTime()).WillByDefault(Return(timestamp_));
   }
 
-  // Whether the span is a NonRecordingSpan.
-  static bool nonRecording(const Tracing::Span& span) {
-    return dynamic_cast<const NonRecordingSpan*>(&span) != nullptr;
+  void setGuard(bool enabled) {
+    scoped_runtime_.mergeValues(
+        {{"envoy.reloadable_features.otel_tracer_deferred_span", enabled ? "true" : "false"}});
   }
 
-  // Whether the span is a NonRecordingSpan that has not turned into a recording span.
-  static bool notRecordingYet(const Tracing::Span& span) {
-    const auto* non_recording_span = dynamic_cast<const NonRecordingSpan*>(&span);
-    return non_recording_span != nullptr && non_recording_span->recordingSpanForTest() == nullptr;
+  // Whether the span is a DeferredSpan.
+  static bool deferredSpan(const Tracing::Span& span) {
+    return dynamic_cast<const DeferredSpan*>(&span) != nullptr;
+  }
+
+  // Whether the span is a DeferredSpan that has not built its OTLP span.
+  static bool notBuilt(const Tracing::Span& span) {
+    const auto* deferred_span = dynamic_cast<const DeferredSpan*>(&span);
+    return deferred_span != nullptr && deferred_span->recordingSpanForTest() == nullptr;
+  }
+
+  // The OTLP span behind the span, with either class. Null while a DeferredSpan has not built it.
+  static const ::opentelemetry::proto::trace::v1::Span* otlpSpan(const Tracing::Span& span) {
+    if (const auto* deferred_span = dynamic_cast<const DeferredSpan*>(&span)) {
+      return deferred_span->recordingSpanForTest() != nullptr
+                 ? &deferred_span->recordingSpanForTest()->spanForTest()
+                 : nullptr;
+    }
+    return &dynamic_cast<const Span&>(span).spanForTest();
   }
 
   void expectRandom(std::vector<uint64_t> values) {
@@ -1906,10 +1924,10 @@ public:
     EXPECT_EQ(0U, stats_.counter("tracing.opentelemetry.spans_sent").value());
   }
 
-  // Finishes the span and expects one export request with one span that has the given fields.
-  void expectExportedOnFinish(Tracing::Span& span, const std::string& span_fields_yaml,
-                              absl::string_view trace_id_hex, absl::string_view span_id_hex,
-                              absl::string_view parent_span_id_hex, SystemTime start_time) {
+  // Expects one export request with one span that has the given fields.
+  void expectExport(const std::string& span_fields_yaml, absl::string_view trace_id_hex,
+                    absl::string_view span_id_hex, absl::string_view parent_span_id_hex,
+                    SystemTime start_time) {
     constexpr absl::string_view request_yaml = R"(
 resource_spans:
   resource:
@@ -1952,6 +1970,13 @@ resource_spans:
     EXPECT_CALL(
         *mock_client_,
         sendRaw(_, _, Grpc::ProtoBufferEqIgnoreRepeatedFieldOrdering(request_proto), _, _, _));
+  }
+
+  // Finishes the span and expects one export request with one span that has the given fields.
+  void expectExportedOnFinish(Tracing::Span& span, const std::string& span_fields_yaml,
+                              absl::string_view trace_id_hex, absl::string_view span_id_hex,
+                              absl::string_view parent_span_id_hex, SystemTime start_time) {
+    expectExport(span_fields_yaml, trace_id_hex, span_id_hex, parent_span_id_hex, start_time);
     span.finishSpan();
     EXPECT_EQ(1U, stats_.counter("tracing.opentelemetry.spans_sent").value());
   }
@@ -1973,16 +1998,32 @@ resource_spans:
     return injectedHeader(span, OpenTelemetryConstants::get().TRACE_STATE);
   }
 
+  // The generic tracer the connection manager uses, on top of the driver under test. It sets the
+  // node id and zone tags on every span it starts.
+  Tracing::TracerImpl& tracerImpl() {
+    if (tracer_impl_ == nullptr) {
+      ON_CALL(local_info_, nodeName()).WillByDefault(ReturnRef(node_name_));
+      ON_CALL(local_info_, zoneName()).WillByDefault(ReturnRef(zone_name_));
+      tracer_impl_ = std::make_unique<Tracing::TracerImpl>(
+          Tracing::DriverSharedPtr(std::move(driver_)), local_info_);
+    }
+    return *tracer_impl_;
+  }
+
 protected:
   TestScopedRuntime scoped_runtime_;
   const SystemTime timestamp_{time_system_.systemTime()};
+  NiceMock<LocalInfo::MockLocalInfo> local_info_;
+  const std::string node_name_{"node_name"};
+  const std::string zone_name_{"zone_name"};
+  std::unique_ptr<Tracing::TracerImpl> tracer_impl_;
 };
 
-INSTANTIATE_TEST_SUITE_P(NonRecordingSpanGuard, OpenTelemetryNonRecordingSpanTest, testing::Bool());
+INSTANTIATE_TEST_SUITE_P(DeferredSpanGuard, OpenTelemetryDeferredSpanTest, testing::Bool());
 
 // A root span that Envoy decides not to trace carries its ids and propagates them with the
 // sampled flag not set.
-TEST_P(OpenTelemetryNonRecordingSpanTest, RootSpanNotTraced) {
+TEST_P(OpenTelemetryDeferredSpanTest, RootSpanNotTraced) {
   setupValidDriver();
   Tracing::TestTraceContextImpl request_headers{
       {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
@@ -1993,7 +2034,7 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, RootSpanNotTraced) {
       driver_->startSpan(mock_tracing_config_, request_headers, stream_info_, operation_name_,
                          {Tracing::Reason::NotTraceable, false});
 
-  EXPECT_EQ(GetParam(), notRecordingYet(*span));
+  EXPECT_EQ(GetParam(), notBuilt(*span));
   EXPECT_TRUE(span->useLocalDecision());
   EXPECT_FALSE(span->exportedSpan());
   EXPECT_EQ("0123456789abcdeffedcba9876543210", span->getTraceId());
@@ -2001,20 +2042,154 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, RootSpanNotTraced) {
   EXPECT_EQ("00-0123456789abcdeffedcba9876543210-00000000000000ff-00", injectedTraceparent(*span));
   EXPECT_EQ("", injectedTracestate(*span));
 
-  // None of these records anything.
   span->reserveTags(4);
   span->log(SystemTime(), "");
   span->setBaggage("baggage_key", "baggage_value");
   EXPECT_EQ("", span->getBaggage("baggage_key"));
   span->setSampled(false);
-  EXPECT_EQ(GetParam(), notRecordingYet(*span));
+  EXPECT_EQ(GetParam(), notBuilt(*span));
   EXPECT_FALSE(span->exportedSpan());
 
   expectNothingExportedOnFinish(*span);
+  EXPECT_EQ(GetParam(), notBuilt(*span));
+}
+
+// The path of a real request: the generic tracer starts the span and sets its node id and zone
+// tags, the context is injected into a real request header map, and the span is finalized. With
+// the guard on no OTLP span is built at any point.
+TEST_P(OpenTelemetryDeferredSpanTest, RequestPathBuildsNoSpanWhenNotTraced) {
+  setupValidDriver();
+  expectRandom({0x0123456789abcdef, 0xfedcba9876543210, 0xff});
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}, {"x-request-id", "id"}};
+  Tracing::HttpTraceContext trace_context(request_headers);
+
+  Tracing::SpanPtr span = tracerImpl().startSpan(mock_tracing_config_, trace_context, stream_info_,
+                                                 {Tracing::Reason::NotTraceable, false});
+  EXPECT_EQ(GetParam(), deferredSpan(*span));
+  EXPECT_EQ(GetParam(), notBuilt(*span));
+
+  // What the router does for the upstream request.
+  Http::TestRequestHeaderMapImpl upstream_headers{
+      {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
+  Tracing::HttpTraceContext upstream_trace_context(upstream_headers);
+  span->injectContext(upstream_trace_context, Tracing::UpstreamContext());
+  EXPECT_EQ("00-0123456789abcdeffedcba9876543210-00000000000000ff-00",
+            upstream_headers.get_("traceparent"));
+  // The tracestate header is set, and empty, as with a recording span.
+  ASSERT_FALSE(upstream_headers.get(Http::LowerCaseString("tracestate")).empty());
+  EXPECT_EQ("", upstream_headers.get_("tracestate"));
+  EXPECT_EQ(GetParam(), notBuilt(*span));
+
+  // What the connection manager does when the request is done.
+  Http::TestResponseHeaderMapImpl response_headers{{":status", "200"}};
+  EXPECT_CALL(runtime_.snapshot_, getInteger("tracing.opentelemetry.min_flush_spans", 5U)).Times(0);
+  EXPECT_CALL(*mock_client_, sendRaw(_, _, _, _, _, _)).Times(0);
+  Tracing::HttpTracerUtility::finalizeDownstreamSpan(*span, &request_headers, &response_headers,
+                                                     nullptr, stream_info_, mock_tracing_config_);
+  EXPECT_EQ(0U, stats_.counter("tracing.opentelemetry.spans_sent").value());
+  EXPECT_EQ(GetParam(), notBuilt(*span));
+}
+
+// The same request path, with the span set to sampled later, as the connection manager does on a
+// route refresh. The exported span has the ids that were propagated, the tags the generic tracer
+// set before the span was sampled, and the name set before it was sampled.
+TEST_P(OpenTelemetryDeferredSpanTest, RequestPathSetToSampledLater) {
+  setupValidDriver();
+  expectRandom({0x0123456789abcdef, 0xfedcba9876543210, 0xff});
+  Http::TestRequestHeaderMapImpl request_headers{
+      {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
+  Tracing::HttpTraceContext trace_context(request_headers);
+
+  Tracing::SpanPtr span = tracerImpl().startSpan(mock_tracing_config_, trace_context, stream_info_,
+                                                 {Tracing::Reason::NotTraceable, false});
+  span->setOperation("renamed");
+  span->setTypedTag("typed_tag_name", "7", Tracing::TagValueType::Int);
+  span->log(SystemTime(SystemTime::duration(Event::TimeSystem::Milliseconds(1))), "event1");
+  EXPECT_EQ(GetParam(), notBuilt(*span));
+  EXPECT_FALSE(span->exportedSpan());
+
+  EXPECT_TRUE(span->useLocalDecision());
+  span->setSampled(true);
+
+  EXPECT_EQ(GetParam(), deferredSpan(*span));
+  EXPECT_FALSE(notBuilt(*span));
+  EXPECT_TRUE(span->exportedSpan());
+  EXPECT_TRUE(span->useLocalDecision());
+  EXPECT_EQ("0123456789abcdeffedcba9876543210", span->getTraceId());
+  EXPECT_EQ("00000000000000ff", span->getSpanId());
+  Http::TestRequestHeaderMapImpl upstream_headers{
+      {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
+  Tracing::HttpTraceContext upstream_trace_context(upstream_headers);
+  span->injectContext(upstream_trace_context, Tracing::UpstreamContext());
+  EXPECT_EQ("00-0123456789abcdeffedcba9876543210-00000000000000ff-01",
+            upstream_headers.get_("traceparent"));
+
+  // Set after the span was sampled: it follows the earlier tags.
+  span->setTag("late_tag_name", "late_tag_value");
+
+  const std::string span_fields = R"(
+      name: "renamed"
+      kind: SPAN_KIND_SERVER
+      flags: 257
+      attributes:
+        - key: "node_id"
+          value:
+            string_value: "node_name"
+        - key: "zone"
+          value:
+            string_value: "zone_name"
+        - key: "typed_tag_name"
+          value:
+            int_value: 7
+        - key: "late_tag_name"
+          value:
+            string_value: "late_tag_value"
+      events:
+        - name: event1
+          time_unix_nano: 1000000)";
+  expectExportedOnFinish(*span, span_fields, "0123456789abcdeffedcba9876543210", "00000000000000ff",
+                         "", timestamp_);
+}
+
+// The repeated fields of the exported span keep the order in which they were set, also for what
+// was set before the span was sampled.
+TEST_P(OpenTelemetryDeferredSpanTest, RecordsKeepTheirOrder) {
+  setupValidDriver();
+  Tracing::TestTraceContextImpl request_headers{
+      {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
+
+  Tracing::SpanPtr span =
+      driver_->startSpan(mock_tracing_config_, request_headers, stream_info_, operation_name_,
+                         {Tracing::Reason::NotTraceable, false});
+  span->setTag("a", "1");
+  span->setTypedTag("b", "true", Tracing::TagValueType::Bool);
+  span->setTag("", "ignored");
+  span->setTag("a", "2");
+  span->setTag(Tracing::Tags::get().HttpStatusCode, "503");
+  span->log(SystemTime(SystemTime::duration(Event::TimeSystem::Milliseconds(2))), "event2");
+  span->log(SystemTime(SystemTime::duration(Event::TimeSystem::Milliseconds(1))), "event1");
+  span->setSampled(true);
+  span->setTag("c", "3");
+
+  const auto* otlp_span = otlpSpan(*span);
+  ASSERT_NE(nullptr, otlp_span);
+  ASSERT_EQ(4, otlp_span->attributes_size());
+  EXPECT_EQ("a", otlp_span->attributes(0).key());
+  EXPECT_EQ("2", otlp_span->attributes(0).value().string_value());
+  EXPECT_EQ("b", otlp_span->attributes(1).key());
+  EXPECT_TRUE(otlp_span->attributes(1).value().bool_value());
+  EXPECT_EQ(Tracing::Tags::get().HttpStatusCode, otlp_span->attributes(2).key());
+  EXPECT_EQ("c", otlp_span->attributes(3).key());
+  EXPECT_EQ(::opentelemetry::proto::trace::v1::Status::STATUS_CODE_ERROR,
+            otlp_span->status().code());
+  ASSERT_EQ(2, otlp_span->events_size());
+  EXPECT_EQ("event2", otlp_span->events(0).name());
+  EXPECT_EQ("event1", otlp_span->events(1).name());
 }
 
 // A span whose remote parent is not sampled keeps the parent's trace id and tracestate.
-TEST_P(OpenTelemetryNonRecordingSpanTest, ParentNotSampled) {
+TEST_P(OpenTelemetryDeferredSpanTest, ParentNotSampled) {
   setupValidDriver();
   // The trace id is in upper case: it is propagated in lower case.
   Tracing::TestTraceContextImpl request_headers{
@@ -2029,7 +2204,7 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, ParentNotSampled) {
   Tracing::SpanPtr span = driver_->startSpan(mock_tracing_config_, request_headers, stream_info_,
                                              operation_name_, {Tracing::Reason::Sampling, true});
 
-  EXPECT_EQ(GetParam(), notRecordingYet(*span));
+  EXPECT_EQ(GetParam(), notBuilt(*span));
   EXPECT_FALSE(span->useLocalDecision());
   EXPECT_FALSE(span->exportedSpan());
   EXPECT_EQ("0af7651916cd43dd8448eb211c80319c", span->getTraceId());
@@ -2041,7 +2216,7 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, ParentNotSampled) {
 }
 
 // The Envoy tracing decision vetoes a sampled parent: the span is not sampled either.
-TEST_P(OpenTelemetryNonRecordingSpanTest, SampledParentNotTracedByEnvoy) {
+TEST_P(OpenTelemetryDeferredSpanTest, SampledParentNotTracedByEnvoy) {
   setupValidDriver();
   Tracing::TestTraceContextImpl request_headers{
       {":authority", "test.com"},
@@ -2055,7 +2230,7 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, SampledParentNotTracedByEnvoy) {
       driver_->startSpan(mock_tracing_config_, request_headers, stream_info_, operation_name_,
                          {Tracing::Reason::NotTraceable, false});
 
-  EXPECT_EQ(GetParam(), notRecordingYet(*span));
+  EXPECT_EQ(GetParam(), notBuilt(*span));
   EXPECT_FALSE(span->useLocalDecision());
   EXPECT_FALSE(span->exportedSpan());
   EXPECT_EQ("00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-00", injectedTraceparent(*span));
@@ -2065,7 +2240,7 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, SampledParentNotTracedByEnvoy) {
 }
 
 // A sampled parent that Envoy traces takes a recording span, whatever the guard says.
-TEST_P(OpenTelemetryNonRecordingSpanTest, SampledParentIsRecordingSpan) {
+TEST_P(OpenTelemetryDeferredSpanTest, SampledParentIsRecordingSpan) {
   setupValidDriver();
   Tracing::TestTraceContextImpl request_headers{
       {":authority", "test.com"},
@@ -2077,14 +2252,14 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, SampledParentIsRecordingSpan) {
   Tracing::SpanPtr span = driver_->startSpan(mock_tracing_config_, request_headers, stream_info_,
                                              operation_name_, {Tracing::Reason::Sampling, true});
 
-  EXPECT_FALSE(nonRecording(*span));
+  EXPECT_FALSE(deferredSpan(*span));
   EXPECT_TRUE(span->exportedSpan());
   EXPECT_EQ("00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01", injectedTraceparent(*span));
 }
 
 // With a sampler configured the sampler decides, so the span is a recording span even when Envoy
 // does not trace the request.
-TEST_P(OpenTelemetryNonRecordingSpanTest, SamplerConfiguredIsRecordingSpan) {
+TEST_P(OpenTelemetryDeferredSpanTest, SamplerConfiguredIsRecordingSpan) {
   setupValidDriverWithAlwaysOnSampler();
   Tracing::TestTraceContextImpl request_headers{
       {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
@@ -2093,58 +2268,14 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, SamplerConfiguredIsRecordingSpan) {
       driver_->startSpan(mock_tracing_config_, request_headers, stream_info_, operation_name_,
                          {Tracing::Reason::NotTraceable, false});
 
-  EXPECT_FALSE(nonRecording(*span));
+  EXPECT_FALSE(deferredSpan(*span));
   EXPECT_FALSE(span->exportedSpan());
   expectNothingExportedOnFinish(*span);
 }
 
-// A root span that is set to sampled later (as the connection manager does on a route refresh) is
-// exported with the ids it already propagated, its start time and its latest name.
-TEST_P(OpenTelemetryNonRecordingSpanTest, RootSpanSetToSampledLater) {
-  setupValidDriver();
-  Tracing::TestTraceContextImpl request_headers{
-      {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
-  expectRandom({0x0123456789abcdef, 0xfedcba9876543210, 0xff});
-
-  Tracing::SpanPtr span =
-      driver_->startSpan(mock_tracing_config_, request_headers, stream_info_, operation_name_,
-                         {Tracing::Reason::NotTraceable, false});
-  EXPECT_EQ("00-0123456789abcdeffedcba9876543210-00000000000000ff-00", injectedTraceparent(*span));
-  span->setOperation("renamed");
-  EXPECT_EQ(GetParam(), notRecordingYet(*span));
-
-  span->setSampled(true);
-
-  EXPECT_EQ(GetParam(), nonRecording(*span));
-  EXPECT_FALSE(notRecordingYet(*span));
-  EXPECT_TRUE(span->exportedSpan());
-  EXPECT_TRUE(span->useLocalDecision());
-  EXPECT_EQ("0123456789abcdeffedcba9876543210", span->getTraceId());
-  EXPECT_EQ("00000000000000ff", span->getSpanId());
-  EXPECT_EQ("00-0123456789abcdeffedcba9876543210-00000000000000ff-01", injectedTraceparent(*span));
-  EXPECT_EQ("", injectedTracestate(*span));
-
-  span->setTag("first_tag_name", "first_tag_value");
-  span->setTypedTag("typed_tag_name", "7", Tracing::TagValueType::Int);
-
-  const std::string span_fields = R"(
-      name: "renamed"
-      kind: SPAN_KIND_SERVER
-      flags: 257
-      attributes:
-        - key: "first_tag_name"
-          value:
-            string_value: "first_tag_value"
-        - key: "typed_tag_name"
-          value:
-            int_value: 7)";
-  expectExportedOnFinish(*span, span_fields, "0123456789abcdeffedcba9876543210", "00000000000000ff",
-                         "", timestamp_);
-}
-
-// What is recorded on a span while it is not sampled is kept, and exported when the span is set
-// to sampled later. The parent span id, the remote-parent flag and the tracestate are kept too.
-TEST_P(OpenTelemetryNonRecordingSpanTest, RecordedWhileNotSampledIsKept) {
+// What is set on a span with a remote parent while it is not sampled is exported when the span is
+// set to sampled later. The parent span id, the remote-parent flag and the tracestate are kept.
+TEST_P(OpenTelemetryDeferredSpanTest, ParentNotSampledSetToSampledLater) {
   setupValidDriver();
   Tracing::TestTraceContextImpl request_headers{
       {":authority", "test.com"},
@@ -2156,24 +2287,23 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, RecordedWhileNotSampledIsKept) {
 
   Tracing::SpanPtr span = driver_->startSpan(mock_tracing_config_, request_headers, stream_info_,
                                              operation_name_, {Tracing::Reason::Sampling, true});
-  EXPECT_EQ(GetParam(), notRecordingYet(*span));
 
   span->setTag("first_tag_name", "first_tag_value");
   span->log(SystemTime(SystemTime::duration(Event::TimeSystem::Milliseconds(1))), "event1");
 
-  // Recording does not make the span sampled.
-  EXPECT_EQ(GetParam(), nonRecording(*span));
-  EXPECT_FALSE(notRecordingYet(*span));
+  // Setting a tag or an event does not make the span sampled, and builds nothing.
+  EXPECT_EQ(GetParam(), notBuilt(*span));
   EXPECT_FALSE(span->exportedSpan());
   EXPECT_FALSE(span->useLocalDecision());
-  EXPECT_EQ("0af7651916cd43dd8448eb211c80319c", span->getTraceId());
-  EXPECT_EQ("00f067aa0ba902b7", span->getSpanId());
   EXPECT_EQ("00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-00", injectedTraceparent(*span));
-  EXPECT_EQ("congo=t61rcWkgMzE", injectedTracestate(*span));
 
   span->setSampled(true);
   EXPECT_TRUE(span->exportedSpan());
+  EXPECT_FALSE(span->useLocalDecision());
+  EXPECT_EQ("0af7651916cd43dd8448eb211c80319c", span->getTraceId());
+  EXPECT_EQ("00f067aa0ba902b7", span->getSpanId());
   EXPECT_EQ("00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01", injectedTraceparent(*span));
+  EXPECT_EQ("congo=t61rcWkgMzE", injectedTracestate(*span));
 
   const std::string span_fields = R"(
       name: "test"
@@ -2191,8 +2321,8 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, RecordedWhileNotSampledIsKept) {
                          "b7ad6b7169203331", timestamp_);
 }
 
-// A span that recorded something and stayed not sampled is not exported.
-TEST_P(OpenTelemetryNonRecordingSpanTest, RecordedAndNeverSampledIsNotExported) {
+// A span that was given tags and stayed not sampled is not exported.
+TEST_P(OpenTelemetryDeferredSpanTest, TaggedAndNeverSampledIsNotExported) {
   setupValidDriver();
   Tracing::TestTraceContextImpl request_headers{
       {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
@@ -2213,8 +2343,8 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, RecordedAndNeverSampledIsNotExported) 
   expectNothingExportedOnFinish(*span);
 }
 
-// Switching off the local decision before anything is recorded.
-TEST_P(OpenTelemetryNonRecordingSpanTest, DisableLocalDecisionBeforeRecording) {
+// Switching off the local decision before the span is sampled.
+TEST_P(OpenTelemetryDeferredSpanTest, DisableLocalDecisionBeforeSampled) {
   setupValidDriver();
   Tracing::TestTraceContextImpl request_headers{
       {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
@@ -2225,17 +2355,20 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, DisableLocalDecisionBeforeRecording) {
   EXPECT_TRUE(span->useLocalDecision());
   span->disableLocalDecision();
   EXPECT_FALSE(span->useLocalDecision());
-  EXPECT_EQ(GetParam(), notRecordingYet(*span));
+  EXPECT_EQ(GetParam(), notBuilt(*span));
 
-  // The setting is kept when the span starts to record.
+  // The setting is kept when the span is sampled, and the span can be set back to not sampled.
   span->setSampled(true);
   EXPECT_FALSE(span->useLocalDecision());
   EXPECT_TRUE(span->exportedSpan());
+  span->setSampled(false);
+  EXPECT_FALSE(span->exportedSpan());
+  expectNothingExportedOnFinish(*span);
 }
 
 // The child of a span that is not sampled is not sampled, shares the trace id and tracestate, and
 // has the span as its parent when it is set to sampled later.
-TEST_P(OpenTelemetryNonRecordingSpanTest, ChildOfSpanNotSampled) {
+TEST_P(OpenTelemetryDeferredSpanTest, ChildOfSpanNotSampled) {
   setupValidDriver();
   Tracing::TestTraceContextImpl request_headers{
       {":authority", "test.com"},
@@ -2251,10 +2384,12 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, ChildOfSpanNotSampled) {
   const SystemTime child_start_time =
       timestamp_ + SystemTime::duration(Event::TimeSystem::Milliseconds(5));
   Tracing::SpanPtr child_span = span->spawnChild(mock_tracing_config_, "child", child_start_time);
+  // What the router sets on an upstream span.
+  child_span->setTag(Tracing::Tags::get().UpstreamCluster, "cluster");
 
-  // Spawning a child records nothing on the parent.
-  EXPECT_EQ(GetParam(), notRecordingYet(*span));
-  EXPECT_EQ(GetParam(), notRecordingYet(*child_span));
+  // Neither span has built anything.
+  EXPECT_EQ(GetParam(), notBuilt(*span));
+  EXPECT_EQ(GetParam(), notBuilt(*child_span));
   EXPECT_FALSE(child_span->useLocalDecision());
   EXPECT_FALSE(child_span->exportedSpan());
   EXPECT_EQ("0af7651916cd43dd8448eb211c80319c", child_span->getTraceId());
@@ -2268,24 +2403,125 @@ TEST_P(OpenTelemetryNonRecordingSpanTest, ChildOfSpanNotSampled) {
       name: "child"
       kind: SPAN_KIND_CLIENT
       trace_state: "congo=t61rcWkgMzE"
-      flags: 257)";
+      flags: 257
+      attributes:
+        - key: "upstream_cluster"
+          value:
+            string_value: "cluster")";
   expectExportedOnFinish(*child_span, span_fields, "0af7651916cd43dd8448eb211c80319c",
                          "0000000000000004", "00f067aa0ba902b7", child_start_time);
 }
 
-// The guard is read when the tracer is created: changing it later changes nothing.
-TEST_P(OpenTelemetryNonRecordingSpanTest, GuardIsReadWhenTheTracerIsCreated) {
+// A child spawned after its parent was set to sampled is a sampled recording span.
+TEST_P(OpenTelemetryDeferredSpanTest, ChildOfSpanSetToSampledLater) {
   setupValidDriver();
-  scoped_runtime_.mergeValues({{"envoy.reloadable_features.otel_tracer_non_recording_span",
-                                GetParam() ? "false" : "true"}});
   Tracing::TestTraceContextImpl request_headers{
       {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
+  expectRandom({0x0123456789abcdef, 0xfedcba9876543210, 0xff, 0x4});
 
   Tracing::SpanPtr span =
       driver_->startSpan(mock_tracing_config_, request_headers, stream_info_, operation_name_,
                          {Tracing::Reason::NotTraceable, false});
+  span->setSampled(true);
+  Tracing::SpanPtr child_span = span->spawnChild(mock_tracing_config_, "child", timestamp_);
 
-  EXPECT_EQ(GetParam(), notRecordingYet(*span));
+  EXPECT_FALSE(deferredSpan(*child_span));
+  EXPECT_TRUE(child_span->exportedSpan());
+  EXPECT_EQ("00-0123456789abcdeffedcba9876543210-0000000000000004-01",
+            injectedTraceparent(*child_span));
+  const std::string span_fields = R"(
+      name: "child"
+      kind: SPAN_KIND_CLIENT
+      flags: 257)";
+  expectExportedOnFinish(*child_span, span_fields, "0123456789abcdeffedcba9876543210",
+                         "0000000000000004", "00000000000000ff", timestamp_);
+}
+
+// The guard is read for each span: a change applies to the next span of the same tracer.
+TEST_P(OpenTelemetryDeferredSpanTest, GuardChangeAppliesToTheNextSpan) {
+  setupValidDriver();
+  Tracing::TestTraceContextImpl request_headers{
+      {":authority", "test.com"}, {":path", "/"}, {":method", "GET"}};
+
+  Tracing::SpanPtr first_span =
+      driver_->startSpan(mock_tracing_config_, request_headers, stream_info_, operation_name_,
+                         {Tracing::Reason::NotTraceable, false});
+  setGuard(!GetParam());
+  Tracing::SpanPtr second_span =
+      driver_->startSpan(mock_tracing_config_, request_headers, stream_info_, operation_name_,
+                         {Tracing::Reason::NotTraceable, false});
+
+  EXPECT_EQ(GetParam(), deferredSpan(*first_span));
+  EXPECT_EQ(!GetParam(), deferredSpan(*second_span));
+}
+
+// The tracer itself, without the driver in front of it, for parent contexts the driver's header
+// parsing never produces.
+class OpenTelemetryTracerDeferredSpanTest : public testing::TestWithParam<bool> {
+public:
+  OpenTelemetryTracerDeferredSpanTest()
+      : stats_{OPENTELEMETRY_TRACER_STATS(
+            POOL_COUNTER_PREFIX(*store_.rootScope(), "tracing.opentelemetry."))} {
+    scoped_runtime_.mergeValues(
+        {{"envoy.reloadable_features.otel_tracer_deferred_span", GetParam() ? "true" : "false"}});
+    tracer_ = std::make_unique<Tracer>(nullptr, time_system_, random_, runtime_, dispatcher_,
+                                       stats_, std::make_shared<Resource>(), nullptr, 16);
+  }
+
+  Tracing::SpanPtr startSpan(const SpanContext& parent_context) {
+    return tracer_->startSpan("test", stream_info_, time_system_.systemTime(), parent_context,
+                              {Tracing::Reason::Sampling, true}, {},
+                              ::opentelemetry::proto::trace::v1::Span::SPAN_KIND_SERVER);
+  }
+
+protected:
+  TestScopedRuntime scoped_runtime_;
+  Event::SimulatedTimeSystem time_system_;
+  NiceMock<Random::MockRandomGenerator> random_;
+  NiceMock<Runtime::MockLoader> runtime_;
+  NiceMock<Event::MockDispatcher> dispatcher_;
+  NiceMock<Stats::MockIsolatedStatsStore> store_;
+  OpenTelemetryTracerStats stats_;
+  NiceMock<StreamInfo::MockStreamInfo> stream_info_;
+  TracerPtr tracer_;
+};
+
+INSTANTIATE_TEST_SUITE_P(DeferredSpanGuard, OpenTelemetryTracerDeferredSpanTest, testing::Bool());
+
+// A parent context without a span id: the span has no parent span id, before and after it is
+// sampled.
+TEST_P(OpenTelemetryTracerDeferredSpanTest, ParentWithoutSpanId) {
+  EXPECT_CALL(random_, random()).WillOnce(Return(0x4));
+  const SpanContext parent_context("00", "0af7651916cd43dd8448eb211c80319c", "", false,
+                                   "congo=t61rcWkgMzE", true);
+
+  Tracing::SpanPtr span = startSpan(parent_context);
+
+  EXPECT_EQ(GetParam(), OpenTelemetryDeferredSpanTest::notBuilt(*span));
+  EXPECT_EQ("0af7651916cd43dd8448eb211c80319c", span->getTraceId());
+  EXPECT_EQ("0000000000000004", span->getSpanId());
+
+  span->setSampled(true);
+  const auto* otlp_span = OpenTelemetryDeferredSpanTest::otlpSpan(*span);
+  ASSERT_NE(nullptr, otlp_span);
+  EXPECT_EQ(absl::HexStringToBytes("0af7651916cd43dd8448eb211c80319c"), otlp_span->trace_id());
+  EXPECT_EQ(absl::HexStringToBytes("0000000000000004"), otlp_span->span_id());
+  EXPECT_TRUE(otlp_span->parent_span_id().empty());
+  EXPECT_EQ("congo=t61rcWkgMzE", otlp_span->trace_state());
+}
+
+// Ids that are not 32 and 16 hex digits take a recording span from the start, with the guard on
+// and off, and the ids come out as they always did.
+TEST_P(OpenTelemetryTracerDeferredSpanTest, MalformedParentIdsTakeRecordingSpan) {
+  for (const auto& [trace_id, span_id] : std::vector<std::pair<std::string, std::string>>{
+           {"0af7651916cd43dd8448eb211c8031", "b7ad6b7169203331"},
+           {"0af7651916cd43dd8448eb211c80319c", "b7ad6b71692033"},
+           {"0xf7651916cd43dd8448eb211c80319c", "b7ad6b7169203331"},
+           {"0af7651916cd43dd8448eb211c80319c", "+7ad6b7169203331"}}) {
+    const SpanContext parent_context("00", trace_id, span_id, false, "", true);
+    Tracing::SpanPtr span = startSpan(parent_context);
+    EXPECT_FALSE(OpenTelemetryDeferredSpanTest::deferredSpan(*span)) << trace_id << " " << span_id;
+  }
 }
 
 // Verifies tracer throws exception when no exporter is configured

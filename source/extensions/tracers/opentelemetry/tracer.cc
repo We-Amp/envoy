@@ -16,6 +16,7 @@
 #include "source/common/version/version.h"
 #include "source/extensions/tracers/opentelemetry/otlp_utils.h"
 
+#include "absl/strings/ascii.h"
 #include "absl/strings/numbers.h"
 #include "opentelemetry/proto/collector/trace/v1/trace_service.pb.h"
 #include "opentelemetry/proto/trace/v1/trace.pb.h"
@@ -42,57 +43,11 @@ const Tracing::TraceContextHandler& traceStateHeader() {
   CONSTRUCT_ON_FIRST_USE(Tracing::TraceContextHandler, "tracestate");
 }
 
-constexpr absl::string_view kHexDigits = "0123456789abcdef";
-
-// Writes the lowercase hex form of `bytes` to `out`, which must have room for twice its size.
-template <size_t N> void writeHex(const std::array<uint8_t, N>& bytes, char* out) {
-  for (const uint8_t byte : bytes) {
-    *out++ = kHexDigits[byte >> 4];
-    *out++ = kHexDigits[byte & 0xf];
-  }
-}
-
-template <size_t N> std::string toHex(const std::array<uint8_t, N>& bytes) {
-  std::string hex(2 * N, '0');
-  writeHex(bytes, hex.data());
-  return hex;
-}
-
-int hexDigitValue(char c) {
-  if (c >= '0' && c <= '9') {
-    return c - '0';
-  }
-  if (c >= 'a' && c <= 'f') {
-    return c - 'a' + 10;
-  }
-  if (c >= 'A' && c <= 'F') {
-    return c - 'A' + 10;
-  }
-  return -1;
-}
-
-// Reads exactly 2 * N hex digits. Returns false, with `bytes` unspecified, for any other input.
-template <size_t N> bool fromHex(absl::string_view hex, std::array<uint8_t, N>& bytes) {
-  if (hex.size() != 2 * N) {
-    return false;
-  }
-  for (size_t i = 0; i < N; i++) {
-    const int high = hexDigitValue(hex[2 * i]);
-    const int low = hexDigitValue(hex[2 * i + 1]);
-    if (high < 0 || low < 0) {
-      return false;
-    }
-    bytes[i] = static_cast<uint8_t>((high << 4) | low);
-  }
-  return true;
-}
-
-// Stores `value` at `out` in big-endian order, the byte order Hex::uint64ToHex() prints.
-void storeBigEndian(uint64_t value, uint8_t* out) {
-  for (int i = 7; i >= 0; i--) {
-    out[i] = static_cast<uint8_t>(value & 0xff);
-    value >>= 8;
-  }
+// Reads exactly 16 hex digits as a big-endian number.
+bool parseHex64(absl::string_view hex, uint64_t& value) {
+  return hex.size() == 16 &&
+         std::all_of(hex.begin(), hex.end(), [](char c) { return absl::ascii_isxdigit(c); }) &&
+         absl::SimpleHexAtoi(hex, &value);
 }
 
 void callSampler(SamplerSharedPtr sampler, const StreamInfo::StreamInfo& stream_info,
@@ -137,7 +92,8 @@ Tracing::SpanPtr Span::spawnChild(const Tracing::Config&, const std::string& nam
   // Build span_context from the current span, then generate the child span from that context.
   SpanContext span_context(kDefaultVersion, getTraceId(), spanId(), sampled(),
                            std::string(tracestate()), /*is_remote=*/false);
-  return parent_tracer_.startSpan(name, stream_info_, start_time, span_context, {},
+  return parent_tracer_.startSpan(name, stream_info_, start_time, span_context,
+                                  {Tracing::Reason::Sampling, true}, {},
                                   ::opentelemetry::proto::trace::v1::Span::SPAN_KIND_CLIENT);
 }
 
@@ -315,35 +271,49 @@ void Span::log(SystemTime timestamp, const std::string& event) {
   *span_.add_events() = span_event;
 }
 
-NonRecordingSpan::NonRecordingSpan(const std::string& name,
-                                   const StreamInfo::StreamInfo& stream_info, SystemTime start_time,
-                                   Envoy::TimeSource& time_source, Tracer& parent_tracer,
-                                   OTelSpanKind span_kind, bool use_local_decision,
-                                   const TraceId& trace_id, const SpanId& span_id)
+DeferredSpan::DeferredSpan(const std::string& name, const StreamInfo::StreamInfo& stream_info,
+                           SystemTime start_time, Envoy::TimeSource& time_source,
+                           Tracer& parent_tracer, OTelSpanKind span_kind, bool use_local_decision,
+                           uint64_t trace_id_high, uint64_t trace_id_low, uint64_t span_id)
     : stream_info_(stream_info), parent_tracer_(parent_tracer), time_source_(time_source),
-      start_time_(start_time), span_kind_(span_kind), trace_id_(trace_id), span_id_(span_id),
-      name_(name), use_local_decision_(use_local_decision) {}
+      start_time_(start_time), span_kind_(span_kind), trace_id_high_(trace_id_high),
+      trace_id_low_(trace_id_low), span_id_(span_id), name_(name),
+      use_local_decision_(use_local_decision) {}
 
-OpenTelemetry::Span& NonRecordingSpan::recordingSpan() {
-  if (recording_span_ == nullptr) {
-    recording_span_ =
-        std::make_unique<OpenTelemetry::Span>(name_, stream_info_, start_time_, time_source_,
-                                              parent_tracer_, span_kind_, use_local_decision_);
-    recording_span_->setTraceId(toHex(trace_id_));
-    recording_span_->setId(toHex(span_id_));
-    if (has_parent_span_id_) {
-      recording_span_->setParentId(toHex(parent_span_id_));
-    }
-    recording_span_->setParentContextIsRemote(parent_context_is_remote_);
-    if (!tracestate_.empty()) {
-      recording_span_->setTracestate(tracestate_);
-    }
-    recording_span_->setSampled(false);
+void DeferredSpan::startRecording() {
+  ASSERT(recording_span_ == nullptr);
+  const std::string trace_id_hex = getTraceId();
+  recording_span_ =
+      std::make_unique<OpenTelemetry::Span>(name_, stream_info_, start_time_, time_source_,
+                                            parent_tracer_, span_kind_, use_local_decision_);
+  recording_span_->setTraceId(trace_id_hex);
+  recording_span_->setId(Hex::uint64ToHex(span_id_));
+  if (parent_span_id_.has_value()) {
+    recording_span_->setParentId(Hex::uint64ToHex(parent_span_id_.value()));
   }
-  return *recording_span_;
+  recording_span_->setParentContextIsRemote(parent_context_is_remote_);
+  if (!tracestate_.empty()) {
+    recording_span_->setTracestate(tracestate_);
+  }
+  recording_span_->setSampled(false);
+  // Replay, in order, what was set on the span before it recorded.
+  for (const PendingRecord& record : pending_records_) {
+    switch (record.kind_) {
+    case PendingRecord::Kind::Tag:
+      recording_span_->setTag(record.name_, record.value_);
+      break;
+    case PendingRecord::Kind::TypedTag:
+      recording_span_->setTypedTag(record.name_, record.value_, record.type_);
+      break;
+    case PendingRecord::Kind::Event:
+      recording_span_->log(record.timestamp_, record.name_);
+      break;
+    }
+  }
+  pending_records_.clear();
 }
 
-void NonRecordingSpan::setOperation(absl::string_view operation) {
+void DeferredSpan::setOperation(absl::string_view operation) {
   if (recording_span_ != nullptr) {
     recording_span_->setOperation(operation);
     return;
@@ -351,88 +321,95 @@ void NonRecordingSpan::setOperation(absl::string_view operation) {
   name_ = std::string{operation};
 }
 
-void NonRecordingSpan::setTag(absl::string_view name, absl::string_view value) {
-  recordingSpan().setTag(name, value);
+void DeferredSpan::setTag(absl::string_view name, absl::string_view value) {
+  if (recording_span_ != nullptr) {
+    recording_span_->setTag(name, value);
+    return;
+  }
+  pending_records_.push_back({PendingRecord::Kind::Tag, std::string{name}, std::string{value},
+                              Tracing::TagValueType::String, SystemTime()});
 }
 
-void NonRecordingSpan::setTypedTag(absl::string_view name, absl::string_view value,
-                                   Tracing::TagValueType type) {
-  recordingSpan().setTypedTag(name, value, type);
+void DeferredSpan::setTypedTag(absl::string_view name, absl::string_view value,
+                               Tracing::TagValueType type) {
+  if (recording_span_ != nullptr) {
+    recording_span_->setTypedTag(name, value, type);
+    return;
+  }
+  pending_records_.push_back(
+      {PendingRecord::Kind::TypedTag, std::string{name}, std::string{value}, type, SystemTime()});
 }
 
-void NonRecordingSpan::reserveTags(size_t size) {
-  // Only a capacity hint: there is nothing to reserve until something is recorded.
+void DeferredSpan::reserveTags(size_t size) {
+  // Only a capacity hint: there is nothing to reserve until the span records.
   if (recording_span_ != nullptr) {
     recording_span_->reserveTags(size);
   }
 }
 
-void NonRecordingSpan::log(SystemTime timestamp, const std::string& event) {
-  // A recording span ignores an empty event as well.
-  if (recording_span_ == nullptr && event.empty()) {
+void DeferredSpan::log(SystemTime timestamp, const std::string& event) {
+  if (recording_span_ != nullptr) {
+    recording_span_->log(timestamp, event);
     return;
   }
-  recordingSpan().log(timestamp, event);
+  // A recording span ignores an empty event as well.
+  if (event.empty()) {
+    return;
+  }
+  pending_records_.push_back(
+      {PendingRecord::Kind::Event, event, std::string(), Tracing::TagValueType::String, timestamp});
 }
 
-void NonRecordingSpan::finishSpan() {
+void DeferredSpan::finishSpan() {
   if (recording_span_ != nullptr) {
     recording_span_->finishSpan();
   }
 }
 
-void NonRecordingSpan::injectContext(Tracing::TraceContext& trace_context,
-                                     const Tracing::UpstreamContext& upstream) {
+void DeferredSpan::injectContext(Tracing::TraceContext& trace_context,
+                                 const Tracing::UpstreamContext& upstream) {
   if (recording_span_ != nullptr) {
     recording_span_->injectContext(trace_context, upstream);
     return;
   }
-  // version "-" trace id "-" span id "-" trace flags, with the sampled flag not set. See
-  // https://www.w3.org/TR/trace-context/#traceparent-header.
-  std::array<char, 55> traceparent;
-  char* out = traceparent.data();
-  *out++ = kDefaultVersion[0];
-  *out++ = kDefaultVersion[1];
-  *out++ = '-';
-  writeHex(trace_id_, out);
-  out += 2 * trace_id_.size();
-  *out++ = '-';
-  writeHex(span_id_, out);
-  out += 2 * span_id_.size();
-  *out++ = '-';
-  *out++ = '0';
-  *out++ = '0';
-  ASSERT(out == traceparent.data() + traceparent.size());
-  traceParentHeader().setRefKey(trace_context,
-                                absl::string_view(traceparent.data(), traceparent.size()));
+  // The sampled flag is not set. See https://www.w3.org/TR/trace-context/#traceparent-header.
+  const std::string traceparent_header_value =
+      absl::StrCat(kDefaultVersion, "-", Hex::uint64ToHex(trace_id_high_),
+                   Hex::uint64ToHex(trace_id_low_), "-", Hex::uint64ToHex(span_id_), "-00");
+  // Set the traceparent in the trace_context.
+  traceParentHeader().setRefKey(trace_context, traceparent_header_value);
   // Also set the tracestate.
   traceStateHeader().setRefKey(trace_context, tracestate_);
 }
 
-Tracing::SpanPtr NonRecordingSpan::spawnChild(const Tracing::Config& config,
-                                              const std::string& name, SystemTime start_time) {
+Tracing::SpanPtr DeferredSpan::spawnChild(const Tracing::Config& config, const std::string& name,
+                                          SystemTime start_time) {
   if (recording_span_ != nullptr) {
     return recording_span_->spawnChild(config, name, start_time);
   }
-  // The same span context a recording span that is not sampled would hand to the tracer.
-  SpanContext span_context(kDefaultVersion, toHex(trace_id_), toHex(span_id_), /*sampled=*/false,
+  // The same span context a recording span that is not sampled hands to the tracer.
+  SpanContext span_context(kDefaultVersion, getTraceId(), getSpanId(), /*sampled=*/false,
                            tracestate_, /*is_remote=*/false);
-  return parent_tracer_.startSpan(name, stream_info_, start_time, span_context, {},
+  return parent_tracer_.startSpan(name, stream_info_, start_time, span_context,
+                                  {Tracing::Reason::Sampling, true}, {},
                                   ::opentelemetry::proto::trace::v1::Span::SPAN_KIND_CLIENT);
 }
 
-void NonRecordingSpan::setSampled(bool sampled) {
-  if (recording_span_ == nullptr && !sampled) {
-    return;
+void DeferredSpan::setSampled(bool sampled) {
+  if (recording_span_ == nullptr) {
+    if (!sampled) {
+      return;
+    }
+    startRecording();
   }
-  recordingSpan().setSampled(sampled);
+  recording_span_->setSampled(sampled);
 }
 
-bool NonRecordingSpan::useLocalDecision() const {
+bool DeferredSpan::useLocalDecision() const {
   return recording_span_ != nullptr ? recording_span_->useLocalDecision() : use_local_decision_;
 }
 
-void NonRecordingSpan::disableLocalDecision() {
+void DeferredSpan::disableLocalDecision() {
   if (recording_span_ != nullptr) {
     recording_span_->disableLocalDecision();
     return;
@@ -440,16 +417,18 @@ void NonRecordingSpan::disableLocalDecision() {
   use_local_decision_ = false;
 }
 
-bool NonRecordingSpan::exportedSpan() const {
+bool DeferredSpan::exportedSpan() const {
   return recording_span_ != nullptr && recording_span_->exportedSpan();
 }
 
-std::string NonRecordingSpan::getTraceId() const {
-  return recording_span_ != nullptr ? recording_span_->getTraceId() : toHex(trace_id_);
+std::string DeferredSpan::getTraceId() const {
+  return recording_span_ != nullptr
+             ? recording_span_->getTraceId()
+             : absl::StrCat(Hex::uint64ToHex(trace_id_high_), Hex::uint64ToHex(trace_id_low_));
 }
 
-std::string NonRecordingSpan::getSpanId() const {
-  return recording_span_ != nullptr ? recording_span_->getSpanId() : toHex(span_id_);
+std::string DeferredSpan::getSpanId() const {
+  return recording_span_ != nullptr ? recording_span_->getSpanId() : Hex::uint64ToHex(span_id_);
 }
 
 Tracer::Tracer(OpenTelemetryTraceExporterPtr exporter, Envoy::TimeSource& time_source,
@@ -459,9 +438,7 @@ Tracer::Tracer(OpenTelemetryTraceExporterPtr exporter, Envoy::TimeSource& time_s
                uint64_t max_cache_size, bool set_instrumentation_scope)
     : exporter_(std::move(exporter)), time_source_(time_source), random_(random), runtime_(runtime),
       tracing_stats_(tracing_stats), resource_(resource), sampler_(sampler),
-      max_cache_size_(max_cache_size), set_instrumentation_scope_(set_instrumentation_scope),
-      non_recording_spans_(Runtime::runtimeFeatureEnabled(
-          "envoy.reloadable_features.otel_tracer_non_recording_span")) {
+      max_cache_size_(max_cache_size), set_instrumentation_scope_(set_instrumentation_scope) {
   flush_timer_ = dispatcher.createTimer([this]() -> void {
     tracing_stats_.timer_flushed_.inc();
     flushSpans();
@@ -555,20 +532,16 @@ Tracing::SpanPtr Tracer::startSpan(const std::string& operation_name,
   // should make a sampling decision, otherwise the local Envoy tracing decision is used.
   const bool use_local_decision = sampler_ == nullptr;
 
-  if (non_recording_spans_ && use_local_decision && !tracing_decision.traced) {
-    // Not sampled, and no sampler to ask: the span only has to carry the ids. They come from the
-    // same three random numbers, in the same order, as the ids of a recording span.
+  if (use_local_decision && !tracing_decision.traced &&
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.otel_tracer_deferred_span")) {
+    // Not sampled, and no sampler to ask: defer building the span. The ids come from the same
+    // three random numbers, in the same order, as the ids of a recording span.
     const uint64_t trace_id_high = random_.random();
     const uint64_t trace_id_low = random_.random();
     const uint64_t span_id = random_.random();
-    NonRecordingSpan::TraceId trace_id_bytes;
-    storeBigEndian(trace_id_high, trace_id_bytes.data());
-    storeBigEndian(trace_id_low, trace_id_bytes.data() + 8);
-    NonRecordingSpan::SpanId span_id_bytes;
-    storeBigEndian(span_id, span_id_bytes.data());
-    return std::make_unique<NonRecordingSpan>(operation_name, stream_info, start_time, time_source_,
-                                              *this, span_kind, use_local_decision, trace_id_bytes,
-                                              span_id_bytes);
+    return std::make_unique<DeferredSpan>(operation_name, stream_info, start_time, time_source_,
+                                          *this, span_kind, use_local_decision, trace_id_high,
+                                          trace_id_low, span_id);
   }
 
   // Create an Tracers::OpenTelemetry::Span class that will contain the OTel span.
@@ -590,30 +563,33 @@ Tracing::SpanPtr Tracer::startSpan(const std::string& operation_name,
 Tracing::SpanPtr Tracer::startSpan(const std::string& operation_name,
                                    const StreamInfo::StreamInfo& stream_info, SystemTime start_time,
                                    const SpanContext& parent_context,
+                                   Tracing::Decision tracing_decision,
                                    OptRef<const Tracing::TraceContext> trace_context,
-                                   OTelSpanKind span_kind, bool not_traced_by_envoy) {
+                                   OTelSpanKind span_kind) {
   // If reached here, then this is main span for request with a parent context or this is
-  // subsequent spans. Ignore the Envoy tracing decision anyway.
+  // subsequent spans. The Envoy tracing decision does not make the span sampled; when it is "not
+  // traced", the caller sets the span to not sampled afterwards.
 
-  if (non_recording_spans_ && sampler_ == nullptr &&
-      (not_traced_by_envoy || !parent_context.sampled())) {
-    // Not sampled, and no sampler to ask: the span only has to carry the ids and the tracestate.
-    // Ids that are not exactly 32 and 16 hex digits take the recording span below.
-    NonRecordingSpan::TraceId trace_id_bytes;
-    NonRecordingSpan::SpanId parent_span_id_bytes;
+  if (sampler_ == nullptr && (!tracing_decision.traced || !parent_context.sampled()) &&
+      Runtime::runtimeFeatureEnabled("envoy.reloadable_features.otel_tracer_deferred_span")) {
+    // Not sampled, and no sampler to ask: defer building the span. A trace id or a parent span id
+    // that is not 32 or 16 hex digits takes the recording span below.
+    uint64_t trace_id_high = 0;
+    uint64_t trace_id_low = 0;
+    uint64_t parent_span_id = 0;
+    const absl::string_view trace_id = parent_context.traceId();
     const bool has_parent_span_id = !parent_context.spanId().empty();
-    if (fromHex(parent_context.traceId(), trace_id_bytes) &&
-        (!has_parent_span_id || fromHex(parent_context.spanId(), parent_span_id_bytes))) {
+    if (trace_id.size() == 32 && parseHex64(trace_id.substr(0, 16), trace_id_high) &&
+        parseHex64(trace_id.substr(16), trace_id_low) &&
+        (!has_parent_span_id || parseHex64(parent_context.spanId(), parent_span_id))) {
       // Generate a new identifier for the span id.
-      NonRecordingSpan::SpanId span_id_bytes;
-      storeBigEndian(random_.random(), span_id_bytes.data());
-      auto new_span = std::make_unique<NonRecordingSpan>(
+      const uint64_t span_id = random_.random();
+      auto new_span = std::make_unique<DeferredSpan>(
           operation_name, stream_info, start_time, time_source_, *this, span_kind,
-          /*use_local_decision=*/false, trace_id_bytes, span_id_bytes);
+          /*use_local_decision=*/false, trace_id_high, trace_id_low, span_id);
+      new_span->setParentContextIsRemote(parent_context.isRemote());
       if (has_parent_span_id) {
-        new_span->setParent(parent_span_id_bytes, parent_context.isRemote());
-      } else {
-        new_span->setParentContextIsRemote(parent_context.isRemote());
+        new_span->setParentId(parent_span_id);
       }
       if (!parent_context.tracestate().empty()) {
         new_span->setTracestate(parent_context.tracestate());

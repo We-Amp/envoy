@@ -1,7 +1,7 @@
 #pragma once
 
-#include <array>
 #include <cstdint>
+#include <optional>
 
 #include "envoy/api/api.h"
 #include "envoy/common/optref.h"
@@ -17,6 +17,7 @@
 #include "source/extensions/tracers/opentelemetry/samplers/sampler.h"
 #include "source/extensions/tracers/opentelemetry/span_context.h"
 
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/escaping.h"
 
 namespace Envoy {
@@ -53,14 +54,15 @@ public:
 
   /**
    * Starts a span that continues the trace of a parent span context.
-   * @param not_traced_by_envoy whether the caller will set the span to not sampled whatever the
-   *        parent context and the sampler say, because the Envoy tracing decision is "not traced".
+   * @param tracing_decision the Envoy tracing decision. When it is "not traced" the caller sets
+   *        the span to not sampled, whatever the parent context and the sampler say.
    */
   Tracing::SpanPtr startSpan(const std::string& operation_name,
                              const StreamInfo::StreamInfo& stream_info, SystemTime start_time,
                              const SpanContext& previous_span_context,
+                             Tracing::Decision tracing_decision,
                              OptRef<const Tracing::TraceContext> trace_context,
-                             OTelSpanKind span_kind, bool not_traced_by_envoy = false);
+                             OTelSpanKind span_kind);
 
 private:
   /**
@@ -83,9 +85,6 @@ private:
   SamplerSharedPtr sampler_;
   uint64_t max_cache_size_;
   const bool set_instrumentation_scope_{true};
-  // Whether a span that is not sampled is started as a NonRecordingSpan. Read once from the
-  // runtime guard when the tracer is created.
-  const bool non_recording_spans_;
 };
 
 /**
@@ -208,32 +207,36 @@ private:
 };
 
 /**
- * The span of a request that is not sampled, for a tracer without a custom sampler.
+ * The span of a request that is not sampled, for a tracer without a custom sampler. It defers
+ * building the OTLP span until the span is set to sampled, which for most such requests never
+ * happens.
  *
- * It holds what context propagation needs (the trace id, the span id and the tracestate) and what
- * a recording span would need later, and it does not build an OTLP span. The first time something
- * is recorded on it, or it is set to sampled, it creates a recording Span with the same ids, name,
- * kind, start time, parent and tracestate, and from then on forwards every call to that span. So
+ * Until then it holds what context propagation needs (the trace id, the span id and the
+ * tracestate), what a recording span needs later (name, kind, start time, parent), and a list of
+ * the tags and events set on it. When it is set to sampled it creates a recording Span with the
+ * same ids and replays the list in order, and from then on forwards every call to that span. So
  * what is propagated and what is exported are the same as with a recording Span from the start.
+ *
+ * This is not the non-recording span of the OpenTelemetry API, which drops attributes and events
+ * and never becomes recording: Envoy allows a span to be set to sampled after it has started (the
+ * connection manager does so on a route refresh), and such a span must be exported in full.
  */
-class NonRecordingSpan : public Tracing::Span {
+class DeferredSpan final : public Tracing::Span {
 public:
-  using TraceId = std::array<uint8_t, 16>;
-  using SpanId = std::array<uint8_t, 8>;
-
-  NonRecordingSpan(const std::string& name, const StreamInfo::StreamInfo& stream_info,
-                   SystemTime start_time, Envoy::TimeSource& time_source, Tracer& parent_tracer,
-                   OTelSpanKind span_kind, bool use_local_decision, const TraceId& trace_id,
-                   const SpanId& span_id);
+  /**
+   * @param trace_id_high the first 8 bytes of the trace id, as a big-endian number.
+   * @param trace_id_low the last 8 bytes of the trace id, as a big-endian number.
+   * @param span_id the span id, as a big-endian number.
+   */
+  DeferredSpan(const std::string& name, const StreamInfo::StreamInfo& stream_info,
+               SystemTime start_time, Envoy::TimeSource& time_source, Tracer& parent_tracer,
+               OTelSpanKind span_kind, bool use_local_decision, uint64_t trace_id_high,
+               uint64_t trace_id_low, uint64_t span_id);
 
   /**
-   * Sets the id of the parent span and whether the parent context came from a remote parent.
+   * Sets the id of the parent span.
    */
-  void setParent(const SpanId& parent_span_id, bool is_remote) {
-    parent_span_id_ = parent_span_id;
-    has_parent_span_id_ = true;
-    parent_context_is_remote_ = is_remote;
-  }
+  void setParentId(uint64_t parent_span_id) { parent_span_id_ = parent_span_id; }
 
   /**
    * Records whether the span's parent context was propagated from a remote parent.
@@ -267,31 +270,43 @@ public:
   std::string getSpanId() const override;
 
   /**
-   * @return the recording span this span has turned into, or nullptr when nothing was recorded
-   *         and the span was never set to sampled. For testing.
+   * @return the recording span this span has turned into, or nullptr while the span has not been
+   *         set to sampled. For testing.
    */
   const OpenTelemetry::Span* recordingSpanForTest() const { return recording_span_.get(); }
 
 private:
+  // A tag or an event set on the span before it records.
+  struct PendingRecord {
+    enum class Kind { Tag, TypedTag, Event };
+    Kind kind_;
+    std::string name_;
+    std::string value_;
+    Tracing::TagValueType type_{Tracing::TagValueType::String};
+    SystemTime timestamp_;
+  };
+
   /**
-   * @return the recording span, created on the first call.
+   * Creates the recording span and replays the pending tags and events on it.
    */
-  OpenTelemetry::Span& recordingSpan();
+  void startRecording();
 
   const StreamInfo::StreamInfo& stream_info_;
   Tracer& parent_tracer_;
   Envoy::TimeSource& time_source_;
   const SystemTime start_time_;
   const OTelSpanKind span_kind_;
-  const TraceId trace_id_;
-  const SpanId span_id_;
-  SpanId parent_span_id_{};
+  const uint64_t trace_id_high_;
+  const uint64_t trace_id_low_;
+  const uint64_t span_id_;
+  std::optional<uint64_t> parent_span_id_;
   std::string name_;
   std::string tracestate_;
-  bool has_parent_span_id_{false};
   bool parent_context_is_remote_{false};
   bool use_local_decision_;
-  // Set once the span records. All calls are forwarded to it from then on.
+  // The connection manager sets two tags on every span it starts.
+  absl::InlinedVector<PendingRecord, 2> pending_records_;
+  // Set once the span is set to sampled. All calls are forwarded to it from then on.
   std::unique_ptr<OpenTelemetry::Span> recording_span_;
 };
 

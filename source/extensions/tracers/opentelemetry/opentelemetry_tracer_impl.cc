@@ -226,9 +226,9 @@ Tracing::SpanPtr Driver::startSpan(const Tracing::Config& config,
     // Try to extract the span context. If we can't, just return a null span.
     absl::StatusOr<SpanContext> span_context = extractor.extractSpanContext();
     if (span_context.ok()) {
-      return applyTracingDecision(tracer.startSpan(
-          operation_name, stream_info, stream_info.startTime(), span_context.value(), trace_context,
-          span_kind, !tracing_decision.traced));
+      return applyTracingDecision(tracer.startSpan(operation_name, stream_info,
+                                                   stream_info.startTime(), span_context.value(),
+                                                   tracing_decision, trace_context, span_kind));
     } else {
       ENVOY_LOG(trace, "Unable to extract span context: ", span_context.status());
       return std::make_unique<Tracing::NullSpan>();
