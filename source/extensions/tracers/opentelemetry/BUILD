@@ -45,6 +45,7 @@ envoy_cc_library(
         "//envoy/thread_local:thread_local_interface",
         "//source/common/config:utility_lib",
         "//source/common/http:http_service_headers_lib",
+        "//source/common/runtime:runtime_features_lib",
         "//source/common/tracing:http_tracer_lib",
         "//source/common/tracing:tracer_config_lib",
         "//source/extensions/tracers/common:factory_base_lib",

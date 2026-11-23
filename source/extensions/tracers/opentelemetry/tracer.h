@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "envoy/api/api.h"
@@ -50,11 +51,16 @@ public:
                              OptRef<const Tracing::TraceContext> trace_context,
                              OTelSpanKind span_kind);
 
+  /**
+   * Starts a span that continues the trace of a parent span context.
+   * @param not_traced_by_envoy whether the caller will set the span to not sampled whatever the
+   *        parent context and the sampler say, because the Envoy tracing decision is "not traced".
+   */
   Tracing::SpanPtr startSpan(const std::string& operation_name,
                              const StreamInfo::StreamInfo& stream_info, SystemTime start_time,
                              const SpanContext& previous_span_context,
                              OptRef<const Tracing::TraceContext> trace_context,
-                             OTelSpanKind span_kind);
+                             OTelSpanKind span_kind, bool not_traced_by_envoy = false);
 
 private:
   /**
@@ -77,6 +83,9 @@ private:
   SamplerSharedPtr sampler_;
   uint64_t max_cache_size_;
   const bool set_instrumentation_scope_{true};
+  // Whether a span that is not sampled is started as a NonRecordingSpan. Read once from the
+  // runtime guard when the tracer is created.
+  const bool non_recording_spans_;
 };
 
 /**
@@ -196,6 +205,94 @@ private:
   bool sampled_;
   bool use_local_decision_{false};
   bool parent_context_is_remote_{false};
+};
+
+/**
+ * The span of a request that is not sampled, for a tracer without a custom sampler.
+ *
+ * It holds what context propagation needs (the trace id, the span id and the tracestate) and what
+ * a recording span would need later, and it does not build an OTLP span. The first time something
+ * is recorded on it, or it is set to sampled, it creates a recording Span with the same ids, name,
+ * kind, start time, parent and tracestate, and from then on forwards every call to that span. So
+ * what is propagated and what is exported are the same as with a recording Span from the start.
+ */
+class NonRecordingSpan : public Tracing::Span {
+public:
+  using TraceId = std::array<uint8_t, 16>;
+  using SpanId = std::array<uint8_t, 8>;
+
+  NonRecordingSpan(const std::string& name, const StreamInfo::StreamInfo& stream_info,
+                   SystemTime start_time, Envoy::TimeSource& time_source, Tracer& parent_tracer,
+                   OTelSpanKind span_kind, bool use_local_decision, const TraceId& trace_id,
+                   const SpanId& span_id);
+
+  /**
+   * Sets the id of the parent span and whether the parent context came from a remote parent.
+   */
+  void setParent(const SpanId& parent_span_id, bool is_remote) {
+    parent_span_id_ = parent_span_id;
+    has_parent_span_id_ = true;
+    parent_context_is_remote_ = is_remote;
+  }
+
+  /**
+   * Records whether the span's parent context was propagated from a remote parent.
+   */
+  void setParentContextIsRemote(bool is_remote) { parent_context_is_remote_ = is_remote; }
+
+  /**
+   * Sets the tracestate that is propagated with the span.
+   */
+  void setTracestate(absl::string_view tracestate) { tracestate_ = std::string{tracestate}; }
+
+  // Tracing::Span functions
+  void setOperation(absl::string_view operation) override;
+  void setTag(absl::string_view name, absl::string_view value) override;
+  void setTypedTag(absl::string_view name, absl::string_view value,
+                   Tracing::TagValueType type) override;
+  void reserveTags(size_t size) override;
+  void log(SystemTime timestamp, const std::string& event) override;
+  void finishSpan() override;
+  void injectContext(Envoy::Tracing::TraceContext& trace_context,
+                     const Tracing::UpstreamContext& upstream) override;
+  Tracing::SpanPtr spawnChild(const Tracing::Config& config, const std::string& name,
+                              SystemTime start_time) override;
+  void setSampled(bool sampled) override;
+  bool useLocalDecision() const override;
+  void disableLocalDecision() override;
+  bool exportedSpan() const override;
+  std::string getBaggage(absl::string_view /*key*/) override { return EMPTY_STRING; };
+  void setBaggage(absl::string_view /*key*/, absl::string_view /*value*/) override{};
+  std::string getTraceId() const override;
+  std::string getSpanId() const override;
+
+  /**
+   * @return the recording span this span has turned into, or nullptr when nothing was recorded
+   *         and the span was never set to sampled. For testing.
+   */
+  const OpenTelemetry::Span* recordingSpanForTest() const { return recording_span_.get(); }
+
+private:
+  /**
+   * @return the recording span, created on the first call.
+   */
+  OpenTelemetry::Span& recordingSpan();
+
+  const StreamInfo::StreamInfo& stream_info_;
+  Tracer& parent_tracer_;
+  Envoy::TimeSource& time_source_;
+  const SystemTime start_time_;
+  const OTelSpanKind span_kind_;
+  const TraceId trace_id_;
+  const SpanId span_id_;
+  SpanId parent_span_id_{};
+  std::string name_;
+  std::string tracestate_;
+  bool has_parent_span_id_{false};
+  bool parent_context_is_remote_{false};
+  bool use_local_decision_;
+  // Set once the span records. All calls are forwarded to it from then on.
+  std::unique_ptr<OpenTelemetry::Span> recording_span_;
 };
 
 using TracerPtr = std::unique_ptr<Tracer>;
