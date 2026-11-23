@@ -96,6 +96,16 @@ public:
   virtual bool shouldDrainReadBuffer() PURE;
 
   /**
+   * @return bool whether a transport socket that reads straight from the IoHandle may stop reading
+   *         after a read that returned fewer bytes than it asked for. If true, the owner of the
+   *         callbacks guarantees that the transport socket is asked to read again whenever there
+   *         is something left to learn from the socket: more data, the end of the stream or an
+   *         error. If false, the transport socket has to keep reading until the IoHandle reports
+   *         that no more data is available.
+   */
+  virtual bool canStopReadingOnShortRead() { return false; }
+
+  /**
    * Mark the transport socket as readable in order to force a read in a future iteration of the
    * event loop. This is used when yielding following shouldDrainReadBuffer().
    */

@@ -156,6 +156,14 @@ single_version_override(
     version = "3.5.9.envoy",
 )
 
+# Report EV_CLOSED together with an error or urgent data to a file event that is enabled for read,
+# write and early close. Needed by envoy.reloadable_features.raw_buffer_socket_stop_on_short_read.
+single_version_override(
+    module_name = "libevent",
+    patch_strip = 1,
+    patches = ["//bazel:libevent_epoll_closed_with_error.patch"],
+)
+
 # testing/debugging
 # local_path_override(
 #     module_name = "envoy_toolshed",

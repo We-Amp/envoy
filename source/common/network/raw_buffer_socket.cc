@@ -8,6 +8,26 @@
 namespace Envoy {
 namespace Network {
 
+namespace {
+
+// Does what IoSocketHandleImpl::read() does for a read without a length limit, and also reports
+// whether the read returned fewer bytes than it asked for. IoHandle::read() cannot tell, because
+// only the IoHandle knows how large the reservation was.
+Api::IoCallUint64Result readAndDetectShortRead(IoHandle& io_handle, Buffer::Instance& buffer,
+                                               bool& short_read) {
+  Buffer::Reservation reservation = buffer.reserveForRead();
+  const uint64_t bytes_requested = reservation.length();
+  Api::IoCallUint64Result result =
+      io_handle.readv(bytes_requested, reservation.slices(), reservation.numSlices());
+  const uint64_t bytes_to_commit = result.ok() ? result.return_value_ : 0;
+  ASSERT(bytes_to_commit <= bytes_requested);
+  reservation.commit(bytes_to_commit);
+  short_read = bytes_to_commit > 0 && bytes_to_commit < bytes_requested;
+  return result;
+}
+
+} // namespace
+
 void RawBufferSocket::setTransportSocketCallbacks(TransportSocketCallbacks& callbacks) {
   ASSERT(!callbacks_);
   callbacks_ = &callbacks;
@@ -18,8 +38,15 @@ IoResult RawBufferSocket::doRead(Buffer::Instance& buffer) {
   uint64_t bytes_read = 0;
   bool end_stream = false;
   std::optional<Api::IoError::IoErrorCode> err = std::nullopt;
+  // When the connection allows it, a read that returns fewer bytes than it asked for ends the
+  // loop: the socket had no more data at that moment, so the read that would only return "no data
+  // available" is skipped. See TransportSocketCallbacks::canStopReadingOnShortRead().
+  const bool stop_on_short_read = callbacks_->canStopReadingOnShortRead();
   do {
-    Api::IoCallUint64Result result = callbacks_->ioHandle().read(buffer, std::nullopt);
+    bool short_read = false;
+    Api::IoCallUint64Result result =
+        stop_on_short_read ? readAndDetectShortRead(callbacks_->ioHandle(), buffer, short_read)
+                           : callbacks_->ioHandle().read(buffer, std::nullopt);
 
     if (result.ok()) {
       ENVOY_CONN_LOG(trace, "read returns: {}", callbacks_->connection(), result.return_value_);
@@ -31,6 +58,9 @@ IoResult RawBufferSocket::doRead(Buffer::Instance& buffer) {
       bytes_read += result.return_value_;
       if (callbacks_->shouldDrainReadBuffer()) {
         callbacks_->setTransportSocketIsReadable();
+        break;
+      }
+      if (short_read) {
         break;
       }
     } else {

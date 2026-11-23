@@ -104,6 +104,7 @@ envoy_cc_library(
     deps = [
         ":address_lib",
         ":connection_base_lib",
+        ":default_socket_interface_lib",
         ":raw_buffer_socket_lib",
         ":utility_lib",
         "//envoy/event:timer_interface",

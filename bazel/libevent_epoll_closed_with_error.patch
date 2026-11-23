@@ -1,0 +1,53 @@
+--- a/epoll.c	2026-11-23 19:24:08
++++ b/epoll.c	2026-11-23 19:34:33
+@@ -323,6 +323,17 @@
+ 	if ((ch->read_change|ch->write_change|ch->close_change) & EV_CHANGE_ET)
+ 		events |= EPOLLET;
+ 
++	/* Envoy: a reader that stops at a short read (see epoll_dispatch()) also
++	 * has to hear about urgent data, because a read stops at the urgent
++	 * mark with data left behind it. Urgent data is only asked for when
++	 * the fd is watched for read, write and early close at the same time,
++	 * so nothing changes for other events: every arrival of data wakes up
++	 * a waiter for EPOLLPRI, which a waiter for EPOLLIN gets anyway. */
++	if (EPOLLRDHUP != 0 &&
++	    (events & (EPOLLIN|EPOLLOUT|EPOLLRDHUP)) ==
++	    (EPOLLIN|EPOLLOUT|EPOLLRDHUP))
++		events |= EPOLLPRI;
++
+ 	memset(&epev, 0, sizeof(epev));
+ #ifdef EVENT__HAVE_WEPOLL
+ 	epev.data.sock = ch->fd;
+@@ -543,6 +554,17 @@
+ 
+ 		if (what & EPOLLERR) {
+ 			ev = EV_READ | EV_WRITE;
++			/* Envoy: an fd that is watched for read, write and early
++			 * close at the same time gets EV_CLOSED with the error
++			 * too. A reset sets EPOLLERR and EPOLLRDHUP together, and
++			 * without this the reader cannot tell a reset that came
++			 * with data from data alone. Events that do not ask for
++			 * all three see no change: the kernel only reports the
++			 * three bits together when all three were asked for. */
++			if (EPOLLRDHUP != 0 &&
++			    (what & (EPOLLIN|EPOLLOUT|EPOLLRDHUP)) ==
++			    (EPOLLIN|EPOLLOUT|EPOLLRDHUP))
++				ev |= EV_CLOSED;
+ 		} else if ((what & EPOLLHUP) && !(what & EPOLLRDHUP)) {
+ 			ev = EV_READ | EV_WRITE;
+ 		} else {
+@@ -552,6 +574,14 @@
+ 				ev |= EV_WRITE;
+ 			if (what & EPOLLRDHUP)
+ 				ev |= EV_CLOSED;
++			/* Envoy: urgent data is reported as EV_CLOSED to an fd
++			 * watched for read, write and early close, for the same
++			 * reason. EPOLLPRI is only asked for such an fd, see
++			 * epoll_apply_one_change(). */
++			else if (EPOLLRDHUP != 0 &&
++			    (what & (EPOLLIN|EPOLLOUT|EPOLLPRI)) ==
++			    (EPOLLIN|EPOLLOUT|EPOLLPRI))
++				ev |= EV_CLOSED;
+ 		}
+ 
+ 		if (!ev)

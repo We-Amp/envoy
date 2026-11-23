@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <typeinfo>
 
 #include "envoy/common/exception.h"
 #include "envoy/common/platform.h"
@@ -19,6 +20,7 @@
 #include "source/common/common/scope_tracker.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/network/connection_socket_impl.h"
+#include "source/common/network/io_socket_handle_impl.h"
 #include "source/common/network/raw_buffer_socket.h"
 #include "source/common/network/socket_option_factory.h"
 #include "source/common/network/socket_option_impl.h"
@@ -42,6 +44,32 @@ std::ostream& operator<<(std::ostream& os, Connection::State connection_state) {
     return os << "Closed";
   }
   return os;
+}
+
+// Whether a short read on this socket means that the receive queue was emptied, and whether the
+// connection can learn about the exceptions (peer close, reset, urgent data) from the Closed file
+// event. This holds for a TCP socket that is read with plain system calls and watched through an
+// edge-triggered epoll registration: Linux. Other IoHandle implementations, including the ones
+// derived from IoSocketHandleImpl, may read from somewhere else or raise their events differently,
+// so only the exact type qualifies.
+bool supportsStopOnShortRead(const ConnectionSocket& socket) {
+#if defined(__linux__)
+  if (Event::PlatformDefaultTriggerType != Event::FileTriggerType::Edge ||
+      socket.socketType() != Socket::Type::Stream) {
+    return false;
+  }
+  const ConnectionInfoProvider& info = socket.connectionInfoProvider();
+  const Address::InstanceConstSharedPtr& address =
+      info.remoteAddress() != nullptr ? info.remoteAddress() : info.localAddress();
+  if (address == nullptr || address->type() != Address::Type::Ip) {
+    return false;
+  }
+  const IoHandle& io_handle = socket.ioHandle();
+  return typeid(io_handle) == typeid(IoSocketHandleImpl);
+#else
+  UNREFERENCED_PARAMETER(socket);
+  return false;
+#endif
 }
 
 } // namespace
@@ -91,17 +119,22 @@ ConnectionImpl::ConnectionImpl(Event::Dispatcher& dispatcher, ConnectionSocketPt
     connecting_ = true;
   }
 
+  stop_on_short_read_ = Runtime::runtimeFeatureEnabled(
+                            "envoy.reloadable_features.raw_buffer_socket_stop_on_short_read") &&
+                        supportsStopOnShortRead(*socket_);
+
   Event::FileTriggerType trigger = Event::PlatformDefaultTriggerType;
 
   // We never ask for both early close and read at the same time. If we are reading, we want to
-  // consume all available data.
+  // consume all available data. With stop_on_short_read_ the Closed event is enabled as well, but
+  // as a hint to keep reading, not as an early close. See readEnabledFileEvents().
   socket_->ioHandle().initializeFileEvent(
       dispatcher_,
       [this](uint32_t events) {
         onFileEvent(events);
         return absl::OkStatus();
       },
-      trigger, Event::FileReadyType::Read | Event::FileReadyType::Write);
+      trigger, readEnabledFileEvents());
 
   transport_socket_->setTransportSocketCallbacks(*this);
 
@@ -528,7 +561,7 @@ Connection::ReadDisableStatus ConnectionImpl::readDisable(bool disable) {
     if (read_disable_count_ == 0) {
       // We never ask for both early close and read at the same time. If we are reading, we want to
       // consume all available data.
-      ioHandle().enableFileEvents(Event::FileReadyType::Read | Event::FileReadyType::Write);
+      ioHandle().enableFileEvents(readEnabledFileEvents());
       read_disable_status = ReadDisableStatus::TransitionedToReadEnabled;
     }
 
@@ -550,6 +583,14 @@ Connection::ReadDisableStatus ConnectionImpl::readDisable(bool disable) {
 
     return read_disable_status;
   }
+}
+
+uint32_t ConnectionImpl::readEnabledFileEvents() const {
+  // With stop_on_short_read_ the transport socket does not read until the socket reports that no
+  // more data is available, so a peer close or a reset that arrived together with the last data
+  // is not found by reading. The Closed event reports them (and urgent data) instead.
+  return Event::FileReadyType::Read | Event::FileReadyType::Write |
+         (stop_on_short_read_ ? Event::FileReadyType::Closed : 0);
 }
 
 void ConnectionImpl::raiseEvent(ConnectionEvent event) {
@@ -727,6 +768,19 @@ void ConnectionImpl::onFileEvent(uint32_t events) {
     }
     closeSocket(immediate_error_event_);
     return;
+  }
+
+  if ((events & Event::FileReadyType::Closed) && stop_on_short_read_ && read_disable_count_ == 0 &&
+      !inDelayedClose()) {
+    // The connection is reading and enabled the Closed event through readEnabledFileEvents(): the
+    // peer closed its side, the connection was reset, or urgent data arrived. This is not an early
+    // close. Whatever is left in the socket has to be read first, and a short read no longer means
+    // that there is nothing more to learn, so from now on the transport socket reads until no more
+    // data is available. That read finds the end of the stream or the error, as it does without
+    // stop_on_short_read_.
+    ENVOY_CONN_LOG(trace, "remote close, reset or urgent data while reading", *this);
+    read_until_no_more_data_ = true;
+    events = (events & ~Event::FileReadyType::Closed) | Event::FileReadyType::Read;
   }
 
   if (events & Event::FileReadyType::Closed) {

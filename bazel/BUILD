@@ -95,6 +95,7 @@ exports_files([
     "deps.yaml",
     "gazelle.patch",
     "googleapis.patch",
+    "libevent_epoll_closed_with_error.patch",
     "rules_go.patch",
     "exported_symbols.txt",
     "exported_symbols_apple.txt",

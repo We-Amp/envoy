@@ -156,6 +156,11 @@ public:
   // fair sharing of CPU resources, the underlying event loop does not make any fairness guarantees.
   // Reconsider how to make fairness happen.
   void setTransportSocketIsReadable() override;
+  // The transport socket may stop reading after a short read as long as the socket has not
+  // reported a peer close, a reset or urgent data. See stop_on_short_read_.
+  bool canStopReadingOnShortRead() override {
+    return stop_on_short_read_ && !read_until_no_more_data_;
+  }
   void flushWriteBuffer() override;
   TransportSocketPtr& transportSocket() { return transport_socket_; }
 
@@ -248,6 +253,9 @@ private:
   void scheduleBufferHighWatermarkTimeout();
   void maybeCancelBufferHighWatermarkTimeout();
 
+  // The file events to enable while the connection reads from the socket.
+  uint32_t readEnabledFileEvents() const;
+
   static std::atomic<uint64_t> next_global_id_;
 
   std::list<BytesSentCb> bytes_sent_callbacks_;
@@ -277,6 +285,17 @@ private:
   // in transport socket internal buffers.
   bool transport_wants_read_ : 1 = false;
   bool enable_close_through_filter_manager_ : 1;
+  // True if the transport socket may stop reading after a read that returned fewer bytes than it
+  // asked for, instead of reading until the socket reports that no more data is available. A short
+  // read means that the kernel's receive queue was emptied, with three exceptions: the peer closed
+  // its side, the connection was reset, or the read stopped at TCP urgent data. To learn about
+  // those the connection also enables the Closed file event while it reads, and treats it as a
+  // hint to read until no more data is available instead of as an early close. Set at
+  // construction and only for TCP sockets on Linux; see supportsStopOnShortRead().
+  bool stop_on_short_read_ : 1 = false;
+  // True once the Closed file event was raised while reading. From then on the transport socket
+  // has to read until no more data is available, as it does without stop_on_short_read_.
+  bool read_until_no_more_data_ : 1 = false;
 };
 
 class ServerConnectionImpl : public ConnectionImpl, virtual public ServerConnection {

@@ -1,6 +1,10 @@
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
+#include <tuple>
+#include <vector>
 
 #include "envoy/common/platform.h"
 #include "envoy/config/core/v3/base.pb.h"
@@ -4653,6 +4657,342 @@ TEST_P(ReadBufferLimitTest, SomeLimit_ShortRead_2048) {
   readBufferLimitTest(read_buffer_limit, read_buffer_limit + Buffer::Slice::default_slice_size_,
                       2048);
 }
+
+#if defined(__linux__)
+// Records the result of every read system call, and otherwise behaves like the real thing.
+class ReadRecordingOsSysCalls : public Api::OsSysCallsImpl {
+public:
+  struct Read {
+    os_fd_t fd_;
+    ssize_t return_value_;
+    int errno_;
+  };
+
+  Api::SysCallSizeResult readv(os_fd_t fd, const iovec* iov, int num_iov) override {
+    const Api::SysCallSizeResult result = Api::OsSysCallsImpl::readv(fd, iov, num_iov);
+    reads_.push_back({fd, result.return_value_, result.errno_});
+    return result;
+  }
+  Api::SysCallSizeResult recv(os_fd_t fd, void* buffer, size_t length, int flags) override {
+    const Api::SysCallSizeResult result = Api::OsSysCallsImpl::recv(fd, buffer, length, flags);
+    reads_.push_back({fd, result.return_value_, result.errno_});
+    return result;
+  }
+
+  // The results of the reads on `fd`, in order: the number of bytes, or the negated errno.
+  std::vector<ssize_t> readsOn(os_fd_t fd) const {
+    std::vector<ssize_t> results;
+    for (const Read& read : reads_) {
+      if (read.fd_ == fd) {
+        results.push_back(read.return_value_ >= 0 ? read.return_value_ : -read.errno_);
+      }
+    }
+    return results;
+  }
+
+  std::vector<Read> reads_;
+};
+
+// envoy.reloadable_features.raw_buffer_socket_stop_on_short_read on real TCP sockets. Every test
+// runs with the guard on and off. What the read filter and the connection callbacks see must be the
+// same; only the number of read system calls differs.
+class ConnectionImplStopOnShortReadTest
+    : public ConnectionImplTestBase,
+      public testing::TestWithParam<std::tuple<Address::IpVersion, bool>> {
+protected:
+  ConnectionImplStopOnShortReadTest() {
+    scoped_runtime_.mergeValues({{"envoy.reloadable_features.raw_buffer_socket_stop_on_short_read",
+                                  stopOnShortRead() ? "true" : "false"}});
+  }
+
+  bool stopOnShortRead() const { return std::get<1>(GetParam()); }
+
+  void setUpAndConnect() {
+    setUpBasicConnectionWithAddress(
+        Network::Test::getCanonicalLoopbackAddress(std::get<0>(GetParam())));
+    connect();
+    // The data the server connection reads is collected here.
+    ON_CALL(*read_filter_, onData(_, _))
+        .WillByDefault(Invoke([this](Buffer::Instance& data, bool end_stream) -> FilterStatus {
+          server_received_.append(data.toString());
+          data.drain(data.length());
+          server_end_stream_ |= end_stream;
+          return FilterStatus::StopIteration;
+        }));
+    server_fd_ = server_connection_->getSocket()->ioHandle().fdDoNotUse();
+    client_fd_ = client_connection_->getSocket()->ioHandle().fdDoNotUse();
+  }
+
+  // Runs the event loop until `done` returns true. A connection that waits for an event that never
+  // comes fails the test here instead of blocking it.
+  void runUntil(std::function<bool()> done) {
+    for (int i = 0; i < 2000 && !done(); i++) {
+      dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+      if (!done()) {
+        // The events come from the kernel, not from the simulated time system.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1)); // NO_CHECK_FORMAT(real_time)
+      }
+    }
+    ASSERT_TRUE(done());
+    // Let whatever is still scheduled run.
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  // Writes to the client socket directly, so that the bytes are in the server socket before the
+  // event loop runs again.
+  void sendFromClient(absl::string_view data, int flags = 0) {
+    const Api::SysCallSizeResult result =
+        os_sys_calls_.send(client_fd_, const_cast<char*>(data.data()), data.size(), flags);
+    ASSERT_EQ(static_cast<ssize_t>(data.size()), result.return_value_);
+  }
+
+  void expectServerRemoteClose() {
+    EXPECT_CALL(server_callbacks_, onEvent(ConnectionEvent::RemoteClose))
+        .WillOnce(InvokeWithoutArgs([this]() { server_closed_ = true; }));
+  }
+
+  TestScopedRuntime scoped_runtime_;
+  ReadRecordingOsSysCalls os_sys_calls_;
+  TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls_{&os_sys_calls_};
+  os_fd_t server_fd_{-1};
+  os_fd_t client_fd_{-1};
+  std::string server_received_;
+  bool server_end_stream_{false};
+  bool server_closed_{false};
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    IpVersionsAndGuard, ConnectionImplStopOnShortReadTest,
+    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool()));
+
+// A message that fits in one read costs one read with the guard on, and a second read that returns
+// "no data available" with the guard off. Every later message raises its own read event.
+TEST_P(ConnectionImplStopOnShortReadTest, SmallMessages) {
+  setUpAndConnect();
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  os_sys_calls_.reads_.clear();
+
+  const std::string message(100, 'a');
+  for (int i = 1; i <= 3; i++) {
+    sendFromClient(message);
+    runUntil([&]() { return server_received_.size() == message.size() * i; });
+  }
+
+  if (stopOnShortRead()) {
+    EXPECT_THAT(os_sys_calls_.readsOn(server_fd_), ElementsAre(100, 100, 100));
+  } else {
+    EXPECT_THAT(os_sys_calls_.readsOn(server_fd_),
+                ElementsAre(100, -EAGAIN, 100, -EAGAIN, 100, -EAGAIN));
+  }
+  disconnect(true);
+}
+
+// More data than one read asks for: the read that fills its space is followed by another one in
+// both variants, and nothing is left behind.
+TEST_P(ConnectionImplStopOnShortReadTest, LargeMessage) {
+  setUpAndConnect();
+  const std::string message(1024 * 1024, 'b');
+  Buffer::OwnedImpl data(message);
+  client_connection_->write(data, false);
+  runUntil([&]() { return server_received_.size() == message.size(); });
+  EXPECT_EQ(message, server_received_);
+  disconnect(true);
+}
+
+// The peer sends data and closes, and both are in the socket before the connection reads. The
+// read of the data is a short read; the close must still be found without another event.
+TEST_P(ConnectionImplStopOnShortReadTest, DataThenClose) {
+  setUpAndConnect();
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  os_sys_calls_.reads_.clear();
+
+  sendFromClient("hello");
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  client_connection_->close(ConnectionCloseType::NoFlush);
+  expectServerRemoteClose();
+  runUntil([&]() { return server_closed_; });
+
+  EXPECT_EQ("hello", server_received_);
+  EXPECT_EQ(DetectedCloseType::Normal, server_connection_->detectedCloseType());
+  // The read of the data, then the read that finds the end of the stream, in both variants.
+  EXPECT_THAT(os_sys_calls_.readsOn(server_fd_), ElementsAre(5, 0));
+}
+
+// Same with half close enabled: the end of the stream reaches the read filter.
+TEST_P(ConnectionImplStopOnShortReadTest, DataThenHalfClose) {
+  setUpAndConnect();
+  server_connection_->enableHalfClose(true);
+  client_connection_->enableHalfClose(true);
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  os_sys_calls_.reads_.clear();
+
+  sendFromClient("hello");
+  ASSERT_EQ(0, os_sys_calls_.shutdown(client_fd_, ENVOY_SHUT_WR).return_value_);
+  runUntil([&]() { return server_end_stream_; });
+
+  EXPECT_EQ("hello", server_received_);
+  EXPECT_FALSE(server_closed_);
+  EXPECT_THAT(os_sys_calls_.readsOn(server_fd_), ElementsAre(5, 0));
+
+  // The other direction still works.
+  std::shared_ptr<MockReadFilter> client_read_filter(new NiceMock<MockReadFilter>());
+  client_connection_->addReadFilter(client_read_filter);
+  bool client_got_data = false;
+  EXPECT_CALL(*client_read_filter, onData(BufferString("world"), false))
+      .WillOnce(Invoke([&](Buffer::Instance& buffer, bool) -> FilterStatus {
+        buffer.drain(buffer.length());
+        client_got_data = true;
+        return FilterStatus::StopIteration;
+      }));
+  Buffer::OwnedImpl reply("world");
+  server_connection_->write(reply, false);
+  runUntil([&]() { return client_got_data; });
+
+  EXPECT_CALL(server_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  server_connection_->close(ConnectionCloseType::NoFlush);
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  client_connection_->close(ConnectionCloseType::NoFlush);
+}
+
+// The peer closes after an earlier message was read with a short read: the close raises its own
+// event.
+TEST_P(ConnectionImplStopOnShortReadTest, CloseAfterShortRead) {
+  setUpAndConnect();
+  sendFromClient("hello");
+  runUntil([&]() { return server_received_ == "hello"; });
+
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  client_connection_->close(ConnectionCloseType::NoFlush);
+  expectServerRemoteClose();
+  runUntil([&]() { return server_closed_; });
+  EXPECT_EQ("hello", server_received_);
+}
+
+#if ENVOY_PLATFORM_ENABLE_SEND_RST
+// The peer sends data and resets the connection, and both are in the socket before the connection
+// reads. The data is delivered and the reset is detected, without another event.
+TEST_P(ConnectionImplStopOnShortReadTest, DataThenReset) {
+  setUpAndConnect();
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  os_sys_calls_.reads_.clear();
+
+  sendFromClient("hello");
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  client_connection_->close(ConnectionCloseType::AbortReset);
+  expectServerRemoteClose();
+  runUntil([&]() { return server_closed_; });
+
+  EXPECT_EQ("hello", server_received_);
+  EXPECT_EQ(DetectedCloseType::RemoteReset, server_connection_->detectedCloseType());
+  EXPECT_THAT(os_sys_calls_.readsOn(server_fd_), ElementsAre(5, -ECONNRESET));
+}
+
+// The reset arrives after an earlier message was read with a short read.
+TEST_P(ConnectionImplStopOnShortReadTest, ResetAfterShortRead) {
+  setUpAndConnect();
+  sendFromClient("hello");
+  runUntil([&]() { return server_received_ == "hello"; });
+
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  client_connection_->close(ConnectionCloseType::AbortReset);
+  expectServerRemoteClose();
+  runUntil([&]() { return server_closed_; });
+  EXPECT_EQ(DetectedCloseType::RemoteReset, server_connection_->detectedCloseType());
+}
+#endif
+
+// A read stops at TCP urgent data even though more data follows it, so a short read does not
+// mean that the socket is empty. The data behind the urgent byte must not be left in the socket.
+TEST_P(ConnectionImplStopOnShortReadTest, DataAroundUrgentData) {
+  setUpAndConnect();
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  sendFromClient("before");
+  sendFromClient("!", MSG_OOB);
+  sendFromClient("after");
+  runUntil([&]() { return server_received_.size() >= 11; });
+  // The urgent byte itself is not part of the stream (the socket does not set SO_OOBINLINE).
+  EXPECT_EQ("beforeafter", server_received_);
+
+  // The connection keeps working afterwards.
+  sendFromClient("more");
+  runUntil([&]() { return server_received_.size() >= 15; });
+  EXPECT_EQ("beforeaftermore", server_received_);
+  disconnect(true);
+}
+
+// Data and a close that arrive while reading is disabled (without early close detection) are
+// found when reading is enabled again.
+TEST_P(ConnectionImplStopOnShortReadTest, DataThenCloseWhileReadDisabled) {
+  setUpAndConnect();
+  server_connection_->detectEarlyCloseWhenReadDisabled(false);
+  EXPECT_EQ(Connection::ReadDisableStatus::TransitionedToReadDisabled,
+            server_connection_->readDisable(true));
+
+  sendFromClient("hello");
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  client_connection_->close(ConnectionCloseType::NoFlush);
+  for (int i = 0; i < 10; i++) {
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+  EXPECT_EQ("", server_received_);
+  EXPECT_FALSE(server_closed_);
+
+  expectServerRemoteClose();
+  EXPECT_EQ(Connection::ReadDisableStatus::TransitionedToReadEnabled,
+            server_connection_->readDisable(false));
+  runUntil([&]() { return server_closed_; });
+  EXPECT_EQ("hello", server_received_);
+}
+
+// With early close detection, a close while reading is disabled still closes the connection at
+// once: the Closed event keeps its meaning when the connection is not reading.
+TEST_P(ConnectionImplStopOnShortReadTest, EarlyCloseWhileReadDisabled) {
+  setUpAndConnect();
+  EXPECT_EQ(Connection::ReadDisableStatus::TransitionedToReadDisabled,
+            server_connection_->readDisable(true));
+
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  client_connection_->close(ConnectionCloseType::NoFlush);
+  expectServerRemoteClose();
+  runUntil([&]() { return server_closed_; });
+  EXPECT_EQ("", server_received_);
+}
+
+// The read buffer limit pauses and resumes reading in the middle of a large transfer; nothing is
+// lost and the transfer completes.
+TEST_P(ConnectionImplStopOnShortReadTest, LargeMessageWithReadBufferLimit) {
+  setUpAndConnect();
+  server_connection_->setBufferLimits(32 * 1024);
+  const std::string message(1024 * 1024, 'c');
+  Buffer::OwnedImpl data(message);
+  client_connection_->write(data, false);
+  runUntil([&]() { return server_received_.size() == message.size(); });
+  EXPECT_EQ(message, server_received_);
+  disconnect(true);
+}
+
+// The connection only tells the transport socket that it may stop at a short read while no peer
+// close, reset or urgent data was reported, and never with the guard off.
+TEST_P(ConnectionImplStopOnShortReadTest, CanStopReadingOnShortRead) {
+  setUpAndConnect();
+  auto* server = dynamic_cast<ConnectionImpl*>(server_connection_.get());
+  ASSERT_NE(nullptr, server);
+  EXPECT_EQ(stopOnShortRead(), server->canStopReadingOnShortRead());
+
+  server_connection_->enableHalfClose(true);
+  client_connection_->enableHalfClose(true);
+  sendFromClient("hello");
+  ASSERT_EQ(0, os_sys_calls_.shutdown(client_fd_, ENVOY_SHUT_WR).return_value_);
+  runUntil([&]() { return server_end_stream_; });
+  EXPECT_FALSE(server->canStopReadingOnShortRead());
+
+  EXPECT_CALL(server_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  server_connection_->close(ConnectionCloseType::NoFlush);
+  EXPECT_CALL(client_callbacks_, onEvent(ConnectionEvent::LocalClose));
+  client_connection_->close(ConnectionCloseType::NoFlush);
+}
+#endif
 
 class TcpClientConnectionImplTest : public testing::TestWithParam<Address::IpVersion> {
 protected:
