@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -1067,9 +1068,15 @@ void UdpListenerImplRecvMmsgTest::burst(bool reuse_buffers) {
       client_.write(std::string(50 + i, 'a' + round), *send_to_addr_);
     }
     runUntilReceived((round + 1) * datagrams);
+    // The datagrams of a burst are not always queued in the order they were sent, so what is
+    // compared is which datagrams were handed over, not their order.
+    std::vector<std::string> sent;
     for (uint32_t i = 0; i < datagrams; i++) {
-      EXPECT_EQ(std::string(50 + i, 'a' + round), received_[round * datagrams + i]);
+      sent.push_back(std::string(50 + i, 'a' + round));
     }
+    std::vector<std::string> handed_over(received_.begin() + round * datagrams, received_.end());
+    std::sort(handed_over.begin(), handed_over.end());
+    EXPECT_EQ(sent, handed_over);
   }
   GTEST_LOG_(INFO) << "bursts, " << guardName(reuse_buffers) << ": " << 3 * datagrams
                    << " datagrams, recvmmsg calls " << counting_sys_calls_.calls_
@@ -1107,8 +1114,9 @@ void UdpListenerImplRecvMmsgTest::disableAndEnable(bool reuse_buffers) {
   ASSERT_EQ(12, received_.size());
   for (uint32_t round = 0; round < 3; round++) {
     EXPECT_EQ("before", received_[round * 4]);
-    EXPECT_EQ("disabled 1", received_[round * 4 + 1]);
-    EXPECT_EQ("disabled 2", received_[round * 4 + 2]);
+    // The two datagrams that were sent one right after the other can be queued in either order.
+    EXPECT_THAT((std::vector<std::string>{received_[round * 4 + 1], received_[round * 4 + 2]}),
+                testing::UnorderedElementsAre("disabled 1", "disabled 2"));
     EXPECT_EQ("after", received_[round * 4 + 3]);
   }
   EXPECT_EQ(expected, counting_sys_calls_.datagrams_);
