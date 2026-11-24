@@ -746,6 +746,21 @@ TEST_P(FileEventImplWriteActivationTest, ActivatedOutsideTheEventLoop) {
   EXPECT_THAT(log_, ElementsAre("poll", "write", "poll"));
 }
 
+// A Write event that was scheduled before the event loop ran is the injected Write event of the
+// iteration that delivers it: an activation made while it is handled waits for the next iteration.
+TEST_P(FileEventImplWriteActivationTest, ActivatedOutsideTheEventLoopAndAgainByTheDelivery) {
+  int deliveries = 0;
+  createFileEvent(FileTriggerType::Edge, FileReadyType::Read | FileReadyType::Write, [&](uint32_t) {
+    if (++deliveries < 3) {
+      file_event_->activate(FileReadyType::Write);
+    }
+  });
+
+  file_event_->activate(FileReadyType::Write);
+  dispatcher_->run(Dispatcher::RunType::NonBlock);
+  EXPECT_THAT(log_, ElementsAre("poll", "write", "poll", "write", "poll", "write", "poll"));
+}
+
 // The event loop exits after the iteration in which exit() was called. A Write event scheduled for
 // that iteration is still delivered.
 TEST_P(FileEventImplWriteActivationTest, DeliveredBeforeTheEventLoopExits) {

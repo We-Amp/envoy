@@ -53,9 +53,10 @@ private:
   // True while current_iteration_write_cb_ is scheduled and has not run.
   bool current_iteration_write_pending_{false};
   // The last event loop iteration in which an injected Write event was scheduled on
-  // current_iteration_write_cb_ or delivered by activation_cb_; 0 if none. A Write activation is
-  // only scheduled for the current iteration if this is not the current iteration, so activations
-  // that trigger each other cannot keep the event loop from polling.
+  // current_iteration_write_cb_ or delivered; 0 if none. A Write activation is only scheduled for
+  // the current iteration if this is not the current iteration, so a file event gets at most one
+  // injected Write event per iteration and activations that trigger each other cannot keep the
+  // event loop from polling.
   uint64_t current_iteration_write_iteration_{0};
   // Delivers an injected Write event in the event loop iteration that injected it. Created by the
   // first activation that uses it.

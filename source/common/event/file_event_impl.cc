@@ -99,6 +99,9 @@ void FileEventImpl::runWriteInCurrentIteration() {
   ASSERT(dispatcher_.isThreadSafe());
   ASSERT(current_iteration_write_pending_);
   current_iteration_write_pending_ = false;
+  // The event may have been scheduled before the event loop ran, which is before the iteration that
+  // delivers it.
+  current_iteration_write_iteration_ = dispatcher_.event_loop_iteration_;
   // The callback may destroy this file event.
   THROW_IF_NOT_OK(cb_(FileReadyType::Write));
 }
@@ -212,6 +215,7 @@ void FileEventImpl::mergeInjectedEventsAndRunCb(uint32_t events) {
     // This callback also delivers the Write event that is scheduled for the current iteration.
     events |= FileReadyType::Write;
     current_iteration_write_pending_ = false;
+    current_iteration_write_iteration_ = dispatcher_.event_loop_iteration_;
     current_iteration_write_cb_->cancel();
   }
 

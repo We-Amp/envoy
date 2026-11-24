@@ -5162,6 +5162,30 @@ TEST_P(WriteInCurrentIterationTest, LargeWriteWithWatermarks) {
   closeAndWaitForPeer();
 }
 
+// A write made from the low watermark callback, which runs while a write file event is handled:
+// the peer gets everything, in order.
+TEST_P(WriteInCurrentIterationTest, WriteFromLowWatermarkCallback) {
+  setUpAndConnect();
+  client_connection_->setBufferLimits(64 * 1024);
+  bool written_from_callback = false;
+  EXPECT_CALL(client_callbacks_, onAboveWriteBufferHighWatermark()).Times(AnyNumber());
+  EXPECT_CALL(client_callbacks_, onBelowWriteBufferLowWatermark())
+      .Times(AnyNumber())
+      .WillRepeatedly(InvokeWithoutArgs([&]() {
+        if (!written_from_callback) {
+          written_from_callback = true;
+          clientWrite("tail");
+        }
+      }));
+
+  const std::string message(4 * 1024 * 1024, 'd');
+  runInLoop([&]() { clientWrite(message); });
+  runUntil([&]() { return server_received_.size() == message.size() + 4; });
+  EXPECT_TRUE(written_from_callback);
+  EXPECT_EQ(message + "tail", server_received_);
+  closeAndWaitForPeer();
+}
+
 // A write to a connection whose socket did not take everything: the connection waits for the
 // socket to become writable, and the write file event of the new write makes one attempt that the
 // socket refuses, with and without the guard.
