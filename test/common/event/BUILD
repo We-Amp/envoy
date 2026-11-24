@@ -56,6 +56,7 @@ envoy_cc_test(
         "//envoy/event:file_event_interface",
         "//source/common/event:dispatcher_includes",
         "//source/common/event:dispatcher_lib",
+        "//source/common/runtime:runtime_features_lib",
         "//source/common/stats:isolated_store_lib",
         "//test/test_common:environment_lib",
         "//test/test_common:test_runtime_lib",

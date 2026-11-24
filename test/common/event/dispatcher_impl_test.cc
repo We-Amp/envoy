@@ -1,4 +1,6 @@
 #include <functional>
+#include <string>
+#include <vector>
 
 #include "envoy/common/scope_tracker.h"
 #include "envoy/thread/thread.h"
@@ -824,6 +826,138 @@ TEST_F(DispatcherMonotonicTimeTest, ApproximateMonotonicTime) {
 
   dispatcher_->run(Dispatcher::RunType::Block);
 }
+
+#ifndef WIN32 // Libevent on Windows doesn't support edge trigger.
+// The dispatcher counts its event loop iterations for
+// envoy.reloadable_features.connection_write_in_current_iteration: a file event delivers at most
+// one injected Write event per iteration, and delivers the first one in the iteration that
+// injected it. The counter is private, so these tests watch what an edge-triggered file event does
+// with it.
+class DispatcherEventLoopIterationTest : public testing::Test {
+protected:
+  DispatcherEventLoopIterationTest() : os_sys_calls_(Api::OsSysCallsSingleton::get()) {
+    runtime_.mergeValues(
+        {{"envoy.reloadable_features.connection_write_in_current_iteration", "true"}});
+  }
+
+  ~DispatcherEventLoopIterationTest() override {
+    file_event_.reset();
+    if (dispatcher_ != nullptr) {
+      os_sys_calls_.close(fds_[0]);
+      os_sys_calls_.close(fds_[1]);
+    }
+  }
+
+  static void logPoll(evwatch*, const evwatch_prepare_cb_info*, void* arg) {
+    static_cast<std::vector<std::string>*>(arg)->push_back("poll");
+  }
+
+  void initialize(Api::ApiPtr&& api) {
+    api_ = std::move(api);
+    dispatcher_ = api_->allocateDispatcher("test_thread");
+    evwatch_prepare_new(&static_cast<DispatcherImpl*>(dispatcher_.get())->base(), logPoll, &log_);
+    ASSERT_EQ(0, os_sys_calls_.socketpair(AF_UNIX, SOCK_STREAM, 0, fds_).return_value_);
+    file_event_ = dispatcher_->createFileEvent(
+        fds_[0],
+        [this](uint32_t events) {
+          EXPECT_EQ(FileReadyType::Write, events);
+          log_.push_back("write");
+          if (on_write_ != nullptr) {
+            on_write_();
+          }
+          return absl::OkStatus();
+        },
+        FileTriggerType::Edge, FileReadyType::Read | FileReadyType::Write);
+    // Consume the Write event that the registration of a writable fd produces.
+    dispatcher_->run(Dispatcher::RunType::NonBlock);
+    log_.clear();
+  }
+
+  // Runs the event loop until it has nothing left to do, with `in_loop` as the first event of the
+  // first iteration.
+  void runInLoop(std::function<void()> in_loop) {
+    SchedulableCallbackPtr first = dispatcher_->createSchedulableCallback(in_loop);
+    first->scheduleCallbackCurrentIteration();
+    dispatcher_->run(Dispatcher::RunType::NonBlock);
+  }
+
+  TestScopedRuntime runtime_;
+  Api::OsSysCalls& os_sys_calls_;
+  // Created by the tests that run on simulated time. Must outlive the dispatcher.
+  std::unique_ptr<Event::SimulatedTimeSystem> simulated_time_;
+  Api::ApiPtr api_;
+  DispatcherPtr dispatcher_;
+  os_fd_t fds_[2];
+  std::vector<std::string> log_;
+  std::function<void()> on_write_;
+  FileEventPtr file_event_;
+};
+
+// updateApproximateMonotonicTime() is public and is called in the middle of an iteration, for
+// example by the QUIC clock. It changes the approximate time and must not start a new iteration: a
+// second Write activation in the same iteration still waits for the next one.
+TEST_F(DispatcherEventLoopIterationTest, UpdateApproximateMonotonicTimeIsNotAnIteration) {
+  initialize(Api::createApiForTest());
+
+  bool first_delivery = true;
+  on_write_ = [&]() {
+    if (!first_delivery) {
+      return;
+    }
+    first_delivery = false;
+    const MonotonicTime before = dispatcher_->approximateMonotonicTime();
+    // The clock is real: wait until it has moved.
+    while (api_->timeSource().monotonicTime() == before) {
+    }
+    dispatcher_->updateApproximateMonotonicTime();
+    dispatcher_->updateApproximateMonotonicTime();
+    EXPECT_LT(before, dispatcher_->approximateMonotonicTime());
+    file_event_->activate(FileReadyType::Write);
+  };
+
+  runInLoop([&]() { file_event_->activate(FileReadyType::Write); });
+
+  EXPECT_THAT(log_, testing::ElementsAre("poll", "write", "poll", "write", "poll"));
+}
+
+// Under simulated time the approximate time does not change from one iteration to the next. The
+// iterations are counted all the same: every iteration delivers its own Write activation.
+TEST_F(DispatcherEventLoopIterationTest, IterationsAreCountedUnderSimulatedTime) {
+  simulated_time_ = std::make_unique<Event::SimulatedTimeSystem>();
+  initialize(Api::createApiForTest(*simulated_time_));
+
+  const MonotonicTime start = dispatcher_->approximateMonotonicTime();
+  for (int i = 0; i < 3; i++) {
+    log_.clear();
+    SchedulableCallbackPtr after =
+        dispatcher_->createSchedulableCallback([&]() { log_.push_back("after"); });
+    runInLoop([&]() {
+      file_event_->activate(FileReadyType::Write);
+      after->scheduleCallbackCurrentIteration();
+    });
+    EXPECT_THAT(log_, testing::ElementsAre("poll", "write", "after", "poll"));
+    EXPECT_EQ(start, dispatcher_->approximateMonotonicTime());
+  }
+}
+
+// Several iterations inside one run of the event loop, under simulated time: a callback that
+// activates Write whenever it runs is called once per poll.
+TEST_F(DispatcherEventLoopIterationTest, OneInjectedWritePerIterationUnderSimulatedTime) {
+  simulated_time_ = std::make_unique<Event::SimulatedTimeSystem>();
+  initialize(Api::createApiForTest(*simulated_time_));
+
+  int deliveries = 0;
+  on_write_ = [&]() {
+    if (++deliveries < 3) {
+      file_event_->activate(FileReadyType::Write);
+    }
+  };
+  runInLoop([&]() { file_event_->activate(FileReadyType::Write); });
+
+  EXPECT_THAT(log_,
+              testing::ElementsAre("poll", "write", "poll", "write", "poll", "write", "poll"));
+}
+#endif
 
 class TimerImplTest : public testing::Test {
 protected:

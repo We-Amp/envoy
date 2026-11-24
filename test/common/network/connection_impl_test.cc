@@ -1,6 +1,10 @@
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <tuple>
+#include <vector>
 
 #include "envoy/common/platform.h"
 #include "envoy/config/core/v3/base.pb.h"
@@ -4652,6 +4656,542 @@ TEST_P(ReadBufferLimitTest, SomeLimit_ShortRead_2048) {
   const uint32_t read_buffer_limit = 32 * 1024;
   readBufferLimitTest(read_buffer_limit, read_buffer_limit + Buffer::Slice::default_slice_size_,
                       2048);
+}
+
+// Records every write system call on one socket in a log that the test also writes to, and
+// otherwise behaves like the real thing.
+class WriteRecordingOsSysCalls : public Api::OsSysCallsImpl {
+public:
+  Api::SysCallSizeResult writev(os_fd_t fd, const iovec* iov, int num_iov) override {
+    const Api::SysCallSizeResult result = Api::OsSysCallsImpl::writev(fd, iov, num_iov);
+    record(fd, result);
+    return result;
+  }
+  Api::SysCallSizeResult send(os_fd_t fd, void* buffer, size_t length, int flags) override {
+    const Api::SysCallSizeResult result = Api::OsSysCallsImpl::send(fd, buffer, length, flags);
+    record(fd, result);
+    return result;
+  }
+
+  os_fd_t fd_{-1};
+  std::vector<std::string> log_;
+
+private:
+  void record(os_fd_t fd, const Api::SysCallSizeResult& result) {
+    if (fd == fd_) {
+      log_.push_back(fmt::format("write {}", result.return_value_));
+    }
+  }
+};
+
+// envoy.reloadable_features.connection_write_in_current_iteration on a real event loop and real TCP
+// sockets, with the guard on and off. The peer must receive the same bytes either way; what
+// differs is when the write system call is made relative to other callbacks of the event loop, and
+// that data written in two consecutive iterations is written in two system calls.
+class WriteInCurrentIterationTest
+    : public ConnectionImplTestBase,
+      public testing::TestWithParam<std::tuple<Address::IpVersion, bool>> {
+protected:
+  WriteInCurrentIterationTest() {
+    scoped_runtime_.mergeValues({{"envoy.reloadable_features.connection_write_in_current_iteration",
+                                  std::get<1>(GetParam()) ? "true" : "false"}});
+  }
+
+  // The write file event is only delivered in the iteration that activated it if the file event is
+  // edge-triggered.
+  bool writeInCurrentIteration() const {
+    return std::get<1>(GetParam()) &&
+           Event::PlatformDefaultTriggerType == Event::FileTriggerType::Edge;
+  }
+
+  void setUpAndConnect() {
+    setUpBasicConnectionWithAddress(
+        Network::Test::getCanonicalLoopbackAddress(std::get<0>(GetParam())));
+    connect();
+    ON_CALL(*read_filter_, onData(_, _))
+        .WillByDefault(Invoke([this](Buffer::Instance& data, bool) -> FilterStatus {
+          server_received_.append(data.toString());
+          data.drain(data.length());
+          exitIfDone();
+          return FilterStatus::StopIteration;
+        }));
+    ON_CALL(server_callbacks_, onEvent(_))
+        .WillByDefault(Invoke([this](ConnectionEvent event) {
+          server_events_.push_back(event);
+          exitIfDone();
+        }));
+    ON_CALL(client_callbacks_, onEvent(_))
+        .WillByDefault(Invoke([this](ConnectionEvent event) {
+          client_events_.push_back(event);
+          exitIfDone();
+        }));
+    EXPECT_CALL(server_callbacks_, onEvent(_)).Times(AnyNumber());
+    EXPECT_CALL(client_callbacks_, onEvent(_)).Times(AnyNumber());
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    os_sys_calls_.fd_ = client_connection_->getSocket()->ioHandle().fdDoNotUse();
+  }
+
+  // Runs `cb` as an event of the event loop: scheduled before the event loop runs, it is the first
+  // event of the first iteration.
+  void runInLoop(std::function<void()> cb) {
+    in_loop_.push_back(dispatcher_->createSchedulableCallback(cb));
+    in_loop_.back()->scheduleCallbackCurrentIteration();
+  }
+
+  // A callback that logs "after" when it runs.
+  Event::SchedulableCallbackPtr afterLogger() {
+    return dispatcher_->createSchedulableCallback([this]() { log().push_back("after"); });
+  }
+
+  void clientWrite(const std::string& data) {
+    Buffer::OwnedImpl buffer(data);
+    client_connection_->write(buffer, false);
+  }
+
+  // Runs the event loop until `done` holds, which is checked whenever the server connection gets
+  // data and whenever a connection event is raised, and then until the event loop has nothing left
+  // to do.
+  void runUntil(std::function<bool()> done) {
+    done_ = done;
+    if (!done_()) {
+      dispatcher_->run(Event::Dispatcher::RunType::Block);
+    }
+    done_ = nullptr;
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  void exitIfDone() {
+    if (done_ != nullptr && done_()) {
+      dispatcher_->exit();
+    }
+  }
+
+  bool sawEvent(const std::vector<ConnectionEvent>& events, ConnectionEvent event) const {
+    return std::find(events.begin(), events.end(), event) != events.end();
+  }
+
+  void closeAndWaitForPeer() {
+    client_connection_->close(ConnectionCloseType::NoFlush);
+    runUntil([this]() { return sawEvent(server_events_, ConnectionEvent::RemoteClose); });
+    EXPECT_TRUE(sawEvent(client_events_, ConnectionEvent::LocalClose));
+  }
+
+  std::vector<std::string>& log() { return os_sys_calls_.log_; }
+
+  TestScopedRuntime scoped_runtime_;
+  WriteRecordingOsSysCalls os_sys_calls_;
+  TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls_{&os_sys_calls_};
+  std::string server_received_;
+  std::vector<ConnectionEvent> server_events_;
+  std::vector<ConnectionEvent> client_events_;
+  std::function<bool()> done_;
+  std::vector<Event::SchedulableCallbackPtr> in_loop_;
+};
+
+INSTANTIATE_TEST_SUITE_P(
+    IpVersionsAndGuard, WriteInCurrentIterationTest,
+    testing::Combine(testing::ValuesIn(TestEnvironment::getIpVersionsForTest()), testing::Bool()));
+
+// A write made by a callback of the event loop reaches the socket before a callback that was
+// scheduled for the same iteration after it, and not inside write() itself. Without the guard the
+// write waits for the next iteration, so that callback runs first.
+TEST_P(WriteInCurrentIterationTest, WriteRunsInTheIterationThatMadeIt) {
+  setUpAndConnect();
+
+  Event::SchedulableCallbackPtr after = afterLogger();
+  runInLoop([&]() {
+    clientWrite("hello");
+    log().push_back("written");
+    after->scheduleCallbackCurrentIteration();
+  });
+  runUntil([&]() { return server_received_ == "hello"; });
+
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("written", "write 5", "after"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("written", "after", "write 5"));
+  }
+  closeAndWaitForPeer();
+}
+
+// Writes made by different callbacks of one iteration before the write file event runs go out in
+// one system call, with and without the guard.
+TEST_P(WriteInCurrentIterationTest, WritesOfOneIterationGoOutTogether) {
+  setUpAndConnect();
+
+  // Both are scheduled before the event loop runs, so the write file event that the first one
+  // activates comes after the second one.
+  runInLoop([&]() {
+    clientWrite("one ");
+    clientWrite("two ");
+  });
+  runInLoop([&]() { clientWrite("three"); });
+  runUntil([&]() { return server_received_ == "one two three"; });
+
+  EXPECT_THAT(log(), ElementsAre("write 13"));
+  closeAndWaitForPeer();
+}
+
+// A second write in an iteration in which the write file event already ran waits for the next
+// iteration, as every write does without the guard. In a later iteration the connection writes in
+// the iteration again.
+TEST_P(WriteInCurrentIterationTest, OncePerIteration) {
+  setUpAndConnect();
+
+  Event::SchedulableCallbackPtr last =
+      dispatcher_->createSchedulableCallback([&]() { log().push_back("last"); });
+  Event::SchedulableCallbackPtr after = dispatcher_->createSchedulableCallback([&]() {
+    log().push_back("after");
+    clientWrite("world");
+    last->scheduleCallbackCurrentIteration();
+  });
+  runInLoop([&]() {
+    clientWrite("hello ");
+    after->scheduleCallbackCurrentIteration();
+  });
+  runUntil([&]() { return server_received_ == "hello world"; });
+
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("write 6", "after", "last", "write 5"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("after", "last", "write 11"));
+  }
+
+  // The simulated time of this test does not advance; the iterations are counted all the same.
+  log().clear();
+  server_received_.clear();
+  Event::SchedulableCallbackPtr after2 = afterLogger();
+  runInLoop([&]() {
+    clientWrite("again");
+    after2->scheduleCallbackCurrentIteration();
+  });
+  runUntil([&]() { return server_received_ == "again"; });
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("write 5", "after"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("after", "write 5"));
+  }
+  closeAndWaitForPeer();
+}
+
+#ifndef WIN32
+// Data written in two consecutive iterations. Without the guard the write file event of the first
+// write runs in the second iteration after its fd events, so data written by one of those goes out
+// in the same system call. With the guard every iteration writes its own data: this is the cost of
+// the change, an extra system call (and for TLS an extra record) when two consecutive iterations
+// write to the same connection.
+TEST_P(WriteInCurrentIterationTest, WritesInConsecutiveIterations) {
+  setUpAndConnect();
+
+  os_fd_t fds[2];
+  ASSERT_EQ(0, os_sys_calls_.socketpair(AF_UNIX, SOCK_STREAM, 0, fds).return_value_);
+  // An fd event of the iteration after the one that makes the first write.
+  Event::FileEventPtr second_writer = dispatcher_->createFileEvent(
+      fds[0],
+      [&](uint32_t) {
+        log().push_back("second iteration");
+        clientWrite("world");
+        return absl::OkStatus();
+      },
+      Event::FileTriggerType::Edge, Event::FileReadyType::Read);
+
+  runInLoop([&]() {
+    clientWrite("hello ");
+    const char wake = 'x';
+    ASSERT_EQ(1, os_sys_calls_.write(fds[1], &wake, 1).return_value_);
+  });
+  runUntil([&]() { return server_received_ == "hello world"; });
+
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("write 6", "second iteration", "write 5"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("second iteration", "write 11"));
+  }
+
+  second_writer.reset();
+  os_sys_calls_.close(fds[0]);
+  os_sys_calls_.close(fds[1]);
+  closeAndWaitForPeer();
+}
+#endif
+
+// A write made from a bytes sent callback, which runs while the write file event is handled, is
+// not written in the same iteration again.
+TEST_P(WriteInCurrentIterationTest, WriteFromBytesSentCallback) {
+  setUpAndConnect();
+  bool written_from_callback = false;
+  client_connection_->addBytesSentCallback([&](uint64_t bytes) {
+    log().push_back(fmt::format("sent {}", bytes));
+    if (!written_from_callback) {
+      written_from_callback = true;
+      clientWrite("again");
+    }
+    return true;
+  });
+
+  Event::SchedulableCallbackPtr after = afterLogger();
+  runInLoop([&]() {
+    clientWrite("first");
+    after->scheduleCallbackCurrentIteration();
+  });
+  runUntil([&]() { return server_received_ == "firstagain"; });
+
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("write 5", "sent 5", "after", "write 5", "sent 5"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("after", "write 5", "sent 5", "write 5", "sent 5"));
+  }
+  closeAndWaitForPeer();
+}
+
+// Disabling reads between a write and the delivery of its write file event registers the socket
+// again, which drops the scheduled event. The registration reports the socket writable, so the
+// data is written after the next poll, with and without the guard.
+TEST_P(WriteInCurrentIterationTest, ReadDisableBetweenWriteAndDelivery) {
+  setUpAndConnect();
+
+  Event::SchedulableCallbackPtr after = afterLogger();
+  runInLoop([&]() {
+    clientWrite("hello");
+    client_connection_->readDisable(true);
+    after->scheduleCallbackCurrentIteration();
+  });
+  runUntil([&]() { return server_received_ == "hello"; });
+  EXPECT_THAT(log(), ElementsAre("after", "write 5"));
+
+  // The same when reads are enabled again right away, and for a write that follows the
+  // registration in the same iteration.
+  log().clear();
+  server_received_.clear();
+  Event::SchedulableCallbackPtr after2 = afterLogger();
+  runInLoop([&]() {
+    clientWrite("one ");
+    client_connection_->readDisable(false);
+    clientWrite("two");
+    after2->scheduleCallbackCurrentIteration();
+  });
+  runUntil([&]() { return server_received_ == "one two"; });
+  EXPECT_THAT(log(), ElementsAre("after", "write 7"));
+
+  // Afterwards the connection writes in the iteration again.
+  log().clear();
+  server_received_.clear();
+  Event::SchedulableCallbackPtr after3 = afterLogger();
+  runInLoop([&]() {
+    clientWrite("again");
+    after3->scheduleCallbackCurrentIteration();
+  });
+  runUntil([&]() { return server_received_ == "again"; });
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("write 5", "after"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("after", "write 5"));
+  }
+  closeAndWaitForPeer();
+}
+
+// A write followed by a close that flushes: the peer gets the data and then the close.
+TEST_P(WriteInCurrentIterationTest, WriteThenFlushWriteClose) {
+  setUpAndConnect();
+
+  runInLoop([&]() {
+    clientWrite("hello");
+    client_connection_->close(ConnectionCloseType::FlushWrite);
+  });
+  runUntil([&]() { return sawEvent(server_events_, ConnectionEvent::RemoteClose); });
+
+  EXPECT_EQ("hello", server_received_);
+  EXPECT_THAT(log(), ElementsAre("write 5"));
+  EXPECT_TRUE(sawEvent(client_events_, ConnectionEvent::LocalClose));
+}
+
+// A write followed by a close without flush in the same callback: the close writes what it can,
+// and the write file event does not run on the closed socket.
+TEST_P(WriteInCurrentIterationTest, WriteThenNoFlushClose) {
+  setUpAndConnect();
+
+  Event::SchedulableCallbackPtr after = afterLogger();
+  runInLoop([&]() {
+    clientWrite("hello");
+    client_connection_->close(ConnectionCloseType::NoFlush);
+    after->scheduleCallbackCurrentIteration();
+  });
+  runUntil([&]() { return sawEvent(server_events_, ConnectionEvent::RemoteClose); });
+
+  EXPECT_EQ("hello", server_received_);
+  EXPECT_THAT(log(), ElementsAre("write 5", "after"));
+  EXPECT_TRUE(sawEvent(client_events_, ConnectionEvent::LocalClose));
+}
+
+// The connection is destroyed between a write and the delivery of its write file event.
+TEST_P(WriteInCurrentIterationTest, ConnectionDestroyedBeforeDelivery) {
+  setUpAndConnect();
+
+  Event::SchedulableCallbackPtr after = afterLogger();
+  runInLoop([&]() {
+    clientWrite("hello");
+    client_connection_.reset();
+    after->scheduleCallbackCurrentIteration();
+  });
+  runUntil([&]() { return sawEvent(server_events_, ConnectionEvent::RemoteClose); });
+
+  // The destructor closes without flush, which writes what the socket takes.
+  EXPECT_EQ("hello", server_received_);
+  EXPECT_THAT(log(), ElementsAre("write 5", "after"));
+  EXPECT_TRUE(sawEvent(client_events_, ConnectionEvent::LocalClose));
+}
+
+#if !defined(__APPLE__) && !defined(WIN32)
+// A write followed by a close that flushes and then waits for the peer to close: the data is
+// flushed, the delayed close timer does not fire, and the peer's close ends the connection.
+TEST_P(WriteInCurrentIterationTest, WriteThenFlushWriteAndDelayClose) {
+  setUpAndConnect();
+  time_system_.setMonotonicTime(std::chrono::milliseconds(0));
+  client_connection_->setDelayedCloseTimeout(std::chrono::milliseconds(100));
+  NiceMockConnectionStats stats;
+  client_connection_->setConnectionStats(stats.toBufferStats());
+  EXPECT_CALL(stats.delayed_close_timeouts_, inc()).Times(0);
+
+  runInLoop([&]() {
+    clientWrite("hello");
+    client_connection_->close(ConnectionCloseType::FlushWriteAndDelay);
+  });
+  runUntil([&]() { return server_received_ == "hello"; });
+  EXPECT_THAT(log(), ElementsAre("write 5"));
+  EXPECT_EQ(Connection::State::Closing, client_connection_->state());
+  EXPECT_TRUE(client_events_.empty());
+
+  server_connection_->close(ConnectionCloseType::NoFlush);
+  runUntil([&]() { return !client_events_.empty(); });
+  EXPECT_EQ(Connection::State::Closed, client_connection_->state());
+}
+#endif
+
+// A write followed by a close that flushes and then waits for the peer, which does not close: the
+// data is flushed and the delayed close timer closes the connection.
+TEST_P(WriteInCurrentIterationTest, WriteThenDelayedCloseTimeout) {
+  setUpAndConnect();
+  time_system_.setMonotonicTime(std::chrono::milliseconds(0));
+  client_connection_->setDelayedCloseTimeout(std::chrono::milliseconds(50));
+  NiceMockConnectionStats stats;
+  client_connection_->setConnectionStats(stats.toBufferStats());
+  EXPECT_CALL(stats.delayed_close_timeouts_, inc());
+
+  runInLoop([&]() {
+    clientWrite("hello");
+    client_connection_->close(ConnectionCloseType::FlushWriteAndDelay);
+  });
+  runUntil([&]() { return server_received_ == "hello"; });
+  EXPECT_THAT(log(), ElementsAre("write 5"));
+  EXPECT_EQ(Connection::State::Closing, client_connection_->state());
+
+  time_system_.setMonotonicTime(std::chrono::milliseconds(100));
+  runUntil([&]() { return sawEvent(server_events_, ConnectionEvent::RemoteClose); });
+  EXPECT_TRUE(sawEvent(client_events_, ConnectionEvent::LocalClose));
+  EXPECT_EQ(Connection::State::Closed, client_connection_->state());
+}
+
+// A write that the socket cannot take, followed by a close that flushes: the peer does not read,
+// so the flush does not complete and the delayed close timer closes the connection.
+TEST_P(WriteInCurrentIterationTest, FlushWriteCloseTimesOutWhenThePeerDoesNotRead) {
+  setUpAndConnect();
+  time_system_.setMonotonicTime(std::chrono::milliseconds(0));
+  server_connection_->readDisable(true);
+  client_connection_->setDelayedCloseTimeout(std::chrono::milliseconds(50));
+  NiceMockConnectionStats stats;
+  client_connection_->setConnectionStats(stats.toBufferStats());
+  EXPECT_CALL(stats.delayed_close_timeouts_, inc());
+
+  const std::string message(64 * 1024 * 1024, 'd');
+  runInLoop([&]() {
+    clientWrite(message);
+    client_connection_->close(ConnectionCloseType::FlushWrite);
+  });
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  EXPECT_FALSE(log().empty());
+  EXPECT_EQ(Connection::State::Closing, client_connection_->state());
+
+  time_system_.setMonotonicTime(std::chrono::milliseconds(100));
+  runUntil([&]() { return sawEvent(client_events_, ConnectionEvent::LocalClose); });
+  EXPECT_EQ(Connection::State::Closed, client_connection_->state());
+  server_connection_->close(ConnectionCloseType::NoFlush);
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+}
+
+// The bytes sent callbacks and the write buffer statistics see the same numbers.
+TEST_P(WriteInCurrentIterationTest, BytesSentCallbackAndStats) {
+  setUpAndConnect();
+  NiceMockConnectionStats client_connection_stats;
+  client_connection_->setConnectionStats(client_connection_stats.toBufferStats());
+  uint64_t bytes_sent = 0;
+  client_connection_->addBytesSentCallback([&](uint64_t bytes) {
+    bytes_sent += bytes;
+    return true;
+  });
+  EXPECT_CALL(client_connection_stats.tx_total_, add(5));
+
+  runInLoop([&]() { clientWrite("hello"); });
+  runUntil([&]() { return server_received_ == "hello"; });
+  EXPECT_EQ(5, bytes_sent);
+  closeAndWaitForPeer();
+}
+
+// A large write that the socket does not take at once is completed through write file events, and
+// the watermark callbacks fire in the same order.
+TEST_P(WriteInCurrentIterationTest, LargeWriteWithWatermarks) {
+  setUpAndConnect();
+  client_connection_->setBufferLimits(64 * 1024);
+  std::vector<std::string> watermarks;
+  EXPECT_CALL(client_callbacks_, onAboveWriteBufferHighWatermark())
+      .Times(AnyNumber())
+      .WillRepeatedly(InvokeWithoutArgs([&]() { watermarks.push_back("high"); }));
+  EXPECT_CALL(client_callbacks_, onBelowWriteBufferLowWatermark())
+      .Times(AnyNumber())
+      .WillRepeatedly(InvokeWithoutArgs([&]() { watermarks.push_back("low"); }));
+
+  const std::string message(16 * 1024 * 1024, 'd');
+  runInLoop([&]() {
+    clientWrite(message);
+    // The high watermark is raised inside write(), before anything is written to the socket.
+    EXPECT_THAT(watermarks, ElementsAre("high"));
+    EXPECT_TRUE(log().empty());
+  });
+  runUntil([&]() { return server_received_.size() == message.size(); });
+  EXPECT_EQ(message, server_received_);
+  EXPECT_THAT(watermarks, ElementsAre("high", "low"));
+  closeAndWaitForPeer();
+}
+
+// A write to a connection whose socket did not take everything: the connection waits for the
+// socket to become writable, and the write file event of the new write makes one attempt that the
+// socket refuses, with and without the guard.
+TEST_P(WriteInCurrentIterationTest, WriteWhileTheSocketIsBlocked) {
+  setUpAndConnect();
+  server_connection_->readDisable(true);
+
+  const std::string message(64 * 1024 * 1024, 'd');
+  runInLoop([&]() { clientWrite(message); });
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  // The socket took a part and then refused.
+  ASSERT_GE(log().size(), 2U);
+  EXPECT_EQ("write -1", log().back());
+
+  log().clear();
+  Event::SchedulableCallbackPtr after = afterLogger();
+  runInLoop([&]() {
+    clientWrite("more");
+    after->scheduleCallbackCurrentIteration();
+  });
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  if (writeInCurrentIteration()) {
+    EXPECT_THAT(log(), ElementsAre("write -1", "after"));
+  } else {
+    EXPECT_THAT(log(), ElementsAre("after", "write -1"));
+  }
+
+  server_connection_->readDisable(false);
+  runUntil([&]() { return server_received_.size() == message.size() + 4; });
+  closeAndWaitForPeer();
 }
 
 class TcpClientConnectionImplTest : public testing::TestWithParam<Address::IpVersion> {

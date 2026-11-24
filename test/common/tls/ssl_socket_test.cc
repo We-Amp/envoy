@@ -8392,6 +8392,88 @@ protected:
     disconnect();
   }
 
+  // envoy.reloadable_features.connection_write_in_current_iteration with a TLS transport socket:
+  // data written while the handshake is in progress, then writes made by two callbacks of one
+  // event loop iteration.
+  void writeInCurrentIterationTest(bool guard) {
+    TestScopedRuntime scoped_runtime;
+    scoped_runtime.mergeValues({{"envoy.reloadable_features.connection_write_in_current_iteration",
+                                 guard ? "true" : "false"}});
+    const bool write_in_current_iteration =
+        guard && Event::PlatformDefaultTriggerType == Event::FileTriggerType::Edge;
+    initialize();
+
+    std::string received;
+    std::string expected = "early ";
+    EXPECT_CALL(listener_callbacks_, onAccept_(_))
+        .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+          server_connection_ = dispatcher_->createServerConnection(
+              std::move(socket), server_ssl_socket_factory_->createDownstreamTransportSocket(),
+              stream_info_);
+          server_connection_->addConnectionCallbacks(server_callbacks_);
+          server_connection_->addReadFilter(read_filter_);
+        }));
+    EXPECT_CALL(listener_callbacks_, recordConnectionsAcceptedOnSocketEvent(_));
+    EXPECT_CALL(client_callbacks_, onEvent(Network::ConnectionEvent::Connected));
+    EXPECT_CALL(*read_filter_, onNewConnection());
+    EXPECT_CALL(*read_filter_, onData(_, _))
+        .WillRepeatedly(Invoke([&](Buffer::Instance& data, bool) -> Network::FilterStatus {
+          received.append(data.toString());
+          data.drain(data.length());
+          if (received == expected) {
+            dispatcher_->exit();
+          }
+          return Network::FilterStatus::StopIteration;
+        }));
+
+    std::vector<std::string> log;
+    client_connection_->addBytesSentCallback([&](uint64_t bytes) {
+      log.push_back(fmt::format("sent {}", bytes));
+      return true;
+    });
+
+    // The connection is not connected yet: the data stays in the write buffer until the handshake
+    // has completed.
+    Buffer::OwnedImpl early("early ");
+    client_connection_->write(early, false);
+    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    EXPECT_EQ("early ", received);
+    EXPECT_THAT(log, testing::ElementsAre("sent 6"));
+
+    // Both callbacks are scheduled before the event loop runs, so the write file event that the
+    // first one activates comes after the second one, and everything goes out in one write.
+    log.clear();
+    expected = "early one two three";
+    Event::SchedulableCallbackPtr after =
+        dispatcher_->createSchedulableCallback([&]() { log.push_back("after"); });
+    Event::SchedulableCallbackPtr first = dispatcher_->createSchedulableCallback([&]() {
+      Buffer::OwnedImpl one("one ");
+      client_connection_->write(one, false);
+      Buffer::OwnedImpl two("two ");
+      client_connection_->write(two, false);
+    });
+    Event::SchedulableCallbackPtr second = dispatcher_->createSchedulableCallback([&]() {
+      Buffer::OwnedImpl three("three");
+      client_connection_->write(three, false);
+      after->scheduleCallbackCurrentIteration();
+    });
+    first->scheduleCallbackCurrentIteration();
+    second->scheduleCallbackCurrentIteration();
+    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    EXPECT_EQ(expected, received);
+    if (write_in_current_iteration) {
+      EXPECT_THAT(log, testing::ElementsAre("sent 13", "after"));
+    } else {
+      EXPECT_THAT(log, testing::ElementsAre("after", "sent 13"));
+    }
+
+    disconnect();
+    EXPECT_EQ(0UL, server_stats_store_.counter("ssl.connection_error").value());
+    EXPECT_EQ(0UL, client_stats_store_.counter("ssl.connection_error").value());
+  }
+
   void disconnect() {
     EXPECT_CALL(client_callbacks_, onEvent(Network::ConnectionEvent::LocalClose));
     EXPECT_CALL(server_callbacks_, onEvent(Network::ConnectionEvent::RemoteClose))
@@ -8462,6 +8544,10 @@ TEST_P(SslReadBufferLimitTest, SomeLimit) {
 }
 
 TEST_P(SslReadBufferLimitTest, WritesSmallerThanBufferLimit) { singleWriteTest(5 * 1024, 1024); }
+
+TEST_P(SslReadBufferLimitTest, WriteInCurrentIteration) { writeInCurrentIterationTest(true); }
+
+TEST_P(SslReadBufferLimitTest, WriteInNextIteration) { writeInCurrentIterationTest(false); }
 
 TEST_P(SslReadBufferLimitTest, WritesLargerThanBufferLimit) { singleWriteTest(1024, 5 * 1024); }
 
