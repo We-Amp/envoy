@@ -710,7 +710,8 @@ TEST_P(FileEventImplWriteActivationTest, DestroyedBeforeTheDelivery) {
     file_event_.reset();
   });
 
-  EXPECT_THAT(log_, ElementsAre("poll", "after", "poll"));
+  // With the file event gone nothing is registered with the event loop, so it does not poll again.
+  EXPECT_THAT(log_, ElementsAre("poll", "after"));
 }
 
 // The callback may destroy the file event while it handles the Write event.
@@ -720,10 +721,11 @@ TEST_P(FileEventImplWriteActivationTest, DestroyedByTheDelivery) {
 
   runInLoop([&]() { file_event_->activate(FileReadyType::Write); });
 
+  // With the file event gone nothing is registered with the event loop, so it does not poll again.
   if (guardEnabled()) {
-    EXPECT_THAT(log_, ElementsAre("poll", "write", "poll"));
+    EXPECT_THAT(log_, ElementsAre("poll", "write"));
   } else {
-    EXPECT_THAT(log_, ElementsAre("poll", "poll", "write", "poll"));
+    EXPECT_THAT(log_, ElementsAre("poll", "poll", "write"));
   }
   EXPECT_EQ(nullptr, file_event_);
 }
