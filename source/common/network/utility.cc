@@ -1,10 +1,12 @@
 #include "source/common/network/utility.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -35,6 +37,83 @@
 
 namespace Envoy {
 namespace Network {
+
+// The receive buffers of a socket that is read with recvmmsg, kept between calls.
+//
+// Every entry holds an empty buffer with a reservation of one slice, which is what the kernel
+// writes a datagram to. A call that returns n datagrams commits and hands over the first n
+// buffers, except those of truncated datagrams. Their entries are left empty and are given a new
+// buffer before the next call. The entries that the kernel did not fill are not touched, so their
+// buffers and reservations are used by the next call as they are. A buffer that was handed over is
+// owned by whoever got it and is never referenced from here again.
+class UdpRecvMmsgBuffers {
+public:
+  // Buffers are not kept for datagram sizes above this one, so that an idle socket holds at most
+  // NUM_DATAGRAMS_PER_RECEIVE times this much memory.
+  static constexpr uint64_t MaxDatagramSize = 16 * 1024;
+
+  struct Entry {
+    Buffer::InstancePtr buffer_;
+    // Refers to buffer_ and owns the memory of the slice until it is committed.
+    std::optional<Buffer::ReservationSingleSlice> reservation_;
+  };
+
+  struct State {
+    State()
+        : slices_(NUM_DATAGRAMS_PER_RECEIVE, absl::FixedArray<Buffer::RawSlice>(1)),
+          output_(NUM_DATAGRAMS_PER_RECEIVE, nullptr) {}
+
+    std::array<Entry, NUM_DATAGRAMS_PER_RECEIVE> entries_;
+    // The slice of the reservation of every entry, in the form that IoHandle::recvmmsg() takes.
+    RawSliceArrays slices_;
+    // Every element is in its initial state between calls.
+    IoHandle::RecvMsgOutput output_;
+  };
+
+  // Makes every entry ready to receive a datagram of up to `datagram_size` bytes.
+  State& prepare(uint64_t datagram_size) {
+    if (state_ == nullptr) {
+      state_ = std::make_unique<State>();
+    }
+    if (datagram_size != datagram_size_) {
+      for (Entry& entry : state_->entries_) {
+        entry.reservation_.reset();
+        entry.buffer_.reset();
+      }
+      datagram_size_ = datagram_size;
+    }
+    for (uint64_t i = 0; i < NUM_DATAGRAMS_PER_RECEIVE; i++) {
+      Entry& entry = state_->entries_[i];
+      if (entry.buffer_ == nullptr) {
+        entry.buffer_ = std::make_unique<Buffer::OwnedImpl>();
+        entry.reservation_.emplace(entry.buffer_->reserveSingleSlice(datagram_size, true));
+        state_->slices_[i][0] = entry.reservation_->slice();
+        buffers_allocated_++;
+      }
+    }
+    return *state_;
+  }
+
+  // Frees everything that is kept.
+  void clear() {
+    state_.reset();
+    datagram_size_ = 0;
+  }
+
+  // Created by the first read.
+  std::unique_ptr<State> state_;
+  uint64_t datagram_size_{0};
+  uint64_t buffers_allocated_{0};
+  // Set while a read uses the entries. A read that is started from inside the processing of a
+  // packet of that read must not use them.
+  bool in_use_{false};
+};
+
+void UdpRecvMmsgBuffersDeleter::operator()(UdpRecvMmsgBuffers* buffers) const {
+  ASSERT(!buffers->in_use_);
+  delete buffers;
+}
+
 namespace {
 
 Address::InstanceConstSharedPtr instanceOrNull(StatusOr<Address::InstanceConstSharedPtr> address) {
@@ -628,6 +707,61 @@ Api::IoCallUint64Result readFromSocketRecvGro(IoHandle& handle,
   return result;
 }
 
+// readFromSocketRecvMmsg() with receive buffers that are kept between calls. It hands the same
+// packets to the processor, in the same order and with the same receive time.
+Api::IoCallUint64Result readFromSocketRecvMmsgKeepingBuffers(
+    IoHandle& handle, const Address::Instance& local_address,
+    UdpPacketProcessor& udp_packet_processor, TimeSource& time_source, uint32_t* packets_dropped,
+    uint32_t* num_packets_read, UdpRecvMmsgBuffers& kept, uint64_t max_rx_datagram_size) {
+  UdpRecvMmsgBuffers::State& state = kept.prepare(max_rx_datagram_size);
+  state.output_.dropped_packets_ = packets_dropped;
+  kept.in_use_ = true;
+  Cleanup done([&kept]() { kept.in_use_ = false; });
+
+  ENVOY_LOG_MISC(trace, "starting recvmmsg with packets={} max={}", NUM_DATAGRAMS_PER_RECEIVE,
+                 max_rx_datagram_size);
+  Api::IoCallUint64Result result =
+      handle.recvmmsg(state.slices_, local_address.ip()->port(),
+                      udp_packet_processor.saveCmsgConfig(), state.output_);
+  if (!result.ok()) {
+    // Nothing was written to the buffers or to the output.
+    return result;
+  }
+
+  const uint64_t packets_read = result.return_value_;
+  ASSERT(packets_read <= NUM_DATAGRAMS_PER_RECEIVE);
+  ENVOY_LOG_MISC(trace, "recvmmsg read {} packets", packets_read);
+  const MonotonicTime receive_time = time_source.monotonicTime();
+  for (uint64_t i = 0; i < packets_read; ++i) {
+    IoHandle::RecvMsgPerPacketInfo& info = state.output_.msg_[i];
+    // The buffer of a truncated datagram is not handed over. It stays in its entry, and the next
+    // datagram that the kernel writes to it is committed with its own length.
+    if (!info.truncated_and_dropped_) {
+      UdpRecvMmsgBuffers::Entry& entry = state.entries_[i];
+      const uint64_t msg_len = info.msg_len_;
+      ASSERT(msg_len <= state.slices_[i][0].len_);
+      ENVOY_LOG_MISC(debug, "Receive a packet with {} bytes from {}", msg_len,
+                     info.peer_address_->asString());
+
+      entry.reservation_->commit(std::min(max_rx_datagram_size, msg_len));
+      entry.reservation_.reset();
+      // Leaves the entry without a buffer, which makes prepare() give it a new one.
+      Buffer::InstancePtr buffer = std::move(entry.buffer_);
+
+      if (num_packets_read != nullptr) {
+        *num_packets_read += 1;
+      }
+      passPayloadToProcessor(msg_len, std::move(buffer), info.peer_address_, info.local_address_,
+                             udp_packet_processor, receive_time, info.tos_,
+                             std::move(info.saved_cmsg_));
+    }
+    // The next call must not see anything of this packet.
+    std::destroy_at(&info);
+    std::construct_at(&info);
+  }
+  return result;
+}
+
 Api::IoCallUint64Result readFromSocketRecvMmsg(IoHandle& handle,
                                                const Address::Instance& local_address,
                                                UdpPacketProcessor& udp_packet_processor,
@@ -638,6 +772,17 @@ Api::IoCallUint64Result readFromSocketRecvMmsg(IoHandle& handle,
   const auto max_rx_datagram_size = udp_packet_processor.maxDatagramSize();
   if (num_packets_read != nullptr) {
     *num_packets_read = 0;
+  }
+
+  UdpRecvMmsgBuffers* kept = udp_packet_processor.recvMmsgBuffers();
+  if (kept != nullptr && !kept->in_use_) {
+    if (max_rx_datagram_size > 0 && max_rx_datagram_size <= UdpRecvMmsgBuffers::MaxDatagramSize) {
+      return readFromSocketRecvMmsgKeepingBuffers(handle, local_address, udp_packet_processor,
+                                                  time_source, packets_dropped, num_packets_read,
+                                                  *kept, max_rx_datagram_size);
+    }
+    // Buffers of this size are not kept, and the ones of another size are of no use anymore.
+    kept->clear();
   }
 
   // Buffer::ReservationSingleSlice is always passed by value, and can only be constructed
@@ -728,6 +873,14 @@ Api::IoCallUint64Result readFromSocketRecvMsg(IoHandle& handle,
 }
 
 } // namespace
+
+UdpRecvMmsgBuffersPtr Utility::createUdpRecvMmsgBuffers() {
+  return UdpRecvMmsgBuffersPtr(new UdpRecvMmsgBuffers());
+}
+
+uint64_t Utility::udpRecvMmsgBuffersAllocatedForTest(const UdpRecvMmsgBuffers& buffers) {
+  return buffers.buffers_allocated_;
+}
 
 Api::IoCallUint64Result
 Utility::readFromSocket(IoHandle& handle, const Address::Instance& local_address,

@@ -15,6 +15,7 @@
 #include "test/mocks/network/mock_parent_drained_callback_registrar.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/threadsafe_singleton_injector.h"
 #include "test/test_common/utility.h"
 
@@ -939,6 +940,289 @@ TEST_P(UdpListenerImplTest, UdpGroReadLimit) {
 }
 
 #endif
+
+#if defined(__linux__)
+
+// Counts the recvmmsg calls that a UDP listener makes on its socket.
+class CountingOsSysCallsImpl : public Api::OsSysCallsImpl {
+public:
+  Api::SysCallIntResult recvmmsg(os_fd_t sockfd, struct mmsghdr* msgvec, unsigned int vlen,
+                                 int flags, struct timespec* timeout) override {
+    const Api::SysCallIntResult result =
+        Api::OsSysCallsImpl::recvmmsg(sockfd, msgvec, vlen, flags, timeout);
+    calls_++;
+    if (result.return_value_ < 0) {
+      calls_without_datagrams_++;
+    } else {
+      datagrams_ += result.return_value_;
+    }
+    return result;
+  }
+
+  // Whether the listen socket asks for generic receive offload, as the listen sockets of a
+  // server do when the platform supports it. The listener still reads with recvmmsg.
+  bool supportsUdpGro() const override { return gro_socket_option_; }
+
+  bool gro_socket_option_{false};
+
+  uint32_t calls_{0};
+  uint32_t calls_without_datagrams_{0};
+  uint32_t datagrams_{0};
+};
+
+// A UDP listener that reads with recvmmsg from a real socket of the loopback interface. Each test
+// runs with the runtime guard that keeps the receive buffers that a call did not fill off and on.
+class UdpListenerImplRecvMmsgTest : public UdpListenerImplTest {
+public:
+  void setupWithGuard(bool reuse_buffers) {
+    scoped_runtime_.mergeValues({{"envoy.reloadable_features.udp_recvmmsg_reuse_buffers",
+                                  reuse_buffers ? "true" : "false"}});
+    setup();
+    EXPECT_EQ(reuse_buffers, listener_->recvMmsgBuffers() != nullptr);
+    ON_CALL(listener_callbacks_, onDatagramsDropped(_)).WillByDefault(Invoke([this](uint32_t n) {
+      dropped_ += n;
+    }));
+    ON_CALL(listener_callbacks_, onData(_)).WillByDefault(Invoke([this](const UdpRecvData& data) {
+      received_.push_back(data.buffer_->toString());
+      if (received_.size() == exit_after_) {
+        dispatcher_->exit();
+      }
+    }));
+  }
+
+  static std::string guardName(bool reuse_buffers) {
+    return std::string("kept receive buffers ") + (reuse_buffers ? "on" : "off");
+  }
+
+  // Runs the event loop until the listener has handed over this many datagrams in total.
+  void runUntilReceived(size_t count) {
+    if (received_.size() < count) {
+      exit_after_ = count;
+      dispatcher_->run(Event::Dispatcher::RunType::Block);
+    }
+    ASSERT_EQ(count, received_.size());
+    // Let the events that are still pending run.
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  // Gives datagrams that were sent time to arrive, and the listener the chance to read them.
+  void runForAWhile() {
+    for (uint32_t i = 0; i < 50; i++) {
+      dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+      time_system_.realSleepDoNotUseWithoutScrutiny(std::chrono::milliseconds(2));
+    }
+  }
+
+  void oneDatagramPerEvent(bool reuse_buffers);
+  void burst(bool reuse_buffers);
+  void disableAndEnable(bool reuse_buffers);
+  void receiveBufferOverflow(bool reuse_buffers);
+  void segmentedSendWithGroSocketOption(bool reuse_buffers);
+
+  TestScopedRuntime scoped_runtime_;
+  CountingOsSysCallsImpl counting_sys_calls_;
+  TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> counting_os_calls_{&counting_sys_calls_};
+  std::vector<std::string> received_;
+  size_t exit_after_{0};
+  uint32_t dropped_{0};
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, UdpListenerImplRecvMmsgTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+// Datagrams that arrive one at a time, each after the listener has read the one before: every
+// one of them raises its own read event and is read into a receive buffer of its own.
+void UdpListenerImplRecvMmsgTest::oneDatagramPerEvent(bool reuse_buffers) {
+  setupWithGuard(reuse_buffers);
+  constexpr uint32_t datagrams = 20;
+  for (uint32_t i = 0; i < datagrams; i++) {
+    client_.write(std::string(100, 'a' + i), *send_to_addr_);
+    runUntilReceived(i + 1);
+    EXPECT_EQ(std::string(100, 'a' + i), received_[i]);
+  }
+  GTEST_LOG_(INFO) << "one datagram per read event, " << guardName(reuse_buffers) << ": "
+                   << datagrams << " datagrams, recvmmsg calls " << counting_sys_calls_.calls_
+                   << ", of which without a datagram "
+                   << counting_sys_calls_.calls_without_datagrams_;
+  EXPECT_EQ(datagrams, counting_sys_calls_.datagrams_);
+  EXPECT_EQ(2 * datagrams, counting_sys_calls_.calls_);
+  EXPECT_EQ(datagrams, counting_sys_calls_.calls_without_datagrams_);
+  EXPECT_EQ(0, dropped_);
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, OneDatagramPerEventReuseBuffersOff) {
+  oneDatagramPerEvent(false);
+}
+TEST_P(UdpListenerImplRecvMmsgTest, OneDatagramPerEventReuseBuffersOn) {
+  oneDatagramPerEvent(true);
+}
+
+// More datagrams than fit in two batches are queued before the listener reads.
+void UdpListenerImplRecvMmsgTest::burst(bool reuse_buffers) {
+  setupWithGuard(reuse_buffers);
+  constexpr uint32_t datagrams = 2 * NUM_DATAGRAMS_PER_RECEIVE + 8;
+  for (uint32_t round = 0; round < 3; round++) {
+    for (uint32_t i = 0; i < datagrams; i++) {
+      client_.write(std::string(50 + i, 'a' + round), *send_to_addr_);
+    }
+    runUntilReceived((round + 1) * datagrams);
+    for (uint32_t i = 0; i < datagrams; i++) {
+      EXPECT_EQ(std::string(50 + i, 'a' + round), received_[round * datagrams + i]);
+    }
+  }
+  GTEST_LOG_(INFO) << "bursts, " << guardName(reuse_buffers) << ": " << 3 * datagrams
+                   << " datagrams, recvmmsg calls " << counting_sys_calls_.calls_
+                   << ", of which without a datagram "
+                   << counting_sys_calls_.calls_without_datagrams_;
+  EXPECT_EQ(3 * datagrams, counting_sys_calls_.datagrams_);
+  EXPECT_EQ(0, dropped_);
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, BurstReuseBuffersOff) { burst(false); }
+TEST_P(UdpListenerImplRecvMmsgTest, BurstReuseBuffersOn) { burst(true); }
+
+// Datagrams that arrive while the listener is disabled are read when it is enabled again, and
+// datagrams that arrive after that raise read events as before.
+void UdpListenerImplRecvMmsgTest::disableAndEnable(bool reuse_buffers) {
+  setupWithGuard(reuse_buffers);
+  size_t expected = 0;
+  for (uint32_t round = 0; round < 3; round++) {
+    client_.write("before", *send_to_addr_);
+    runUntilReceived(++expected);
+
+    listener_->disable();
+    client_.write("disabled 1", *send_to_addr_);
+    client_.write("disabled 2", *send_to_addr_);
+    runForAWhile();
+    EXPECT_EQ(expected, received_.size());
+
+    listener_->enable();
+    expected += 2;
+    runUntilReceived(expected);
+
+    client_.write("after", *send_to_addr_);
+    runUntilReceived(++expected);
+  }
+  ASSERT_EQ(12, received_.size());
+  for (uint32_t round = 0; round < 3; round++) {
+    EXPECT_EQ("before", received_[round * 4]);
+    EXPECT_EQ("disabled 1", received_[round * 4 + 1]);
+    EXPECT_EQ("disabled 2", received_[round * 4 + 2]);
+    EXPECT_EQ("after", received_[round * 4 + 3]);
+  }
+  EXPECT_EQ(expected, counting_sys_calls_.datagrams_);
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, DisableAndEnableReuseBuffersOff) { disableAndEnable(false); }
+TEST_P(UdpListenerImplRecvMmsgTest, DisableAndEnableReuseBuffersOn) { disableAndEnable(true); }
+
+// The kernel drops datagrams when the receive buffer of the socket is full. Every datagram is
+// either handed over or counted as dropped.
+void UdpListenerImplRecvMmsgTest::receiveBufferOverflow(bool reuse_buffers) {
+  setupWithGuard(reuse_buffers);
+  int receive_buffer_size = 8 * 1024;
+  ASSERT_EQ(0, server_socket_
+                   ->setSocketOption(SOL_SOCKET, SO_RCVBUF, &receive_buffer_size,
+                                     sizeof(receive_buffer_size))
+                   .return_value_);
+  constexpr uint32_t datagrams = 400;
+  for (uint32_t i = 0; i < datagrams; i++) {
+    client_.write(std::string(1000, 'a'), *send_to_addr_);
+  }
+  runForAWhile();
+  const size_t kept = received_.size();
+  EXPECT_GT(kept, 0);
+  EXPECT_LT(kept, datagrams);
+  // The kernel reports its count of dropped datagrams with the next datagram.
+  client_.write("last", *send_to_addr_);
+  runUntilReceived(kept + 1);
+  EXPECT_EQ("last", received_.back());
+  GTEST_LOG_(INFO) << "receive buffer overflow, " << guardName(reuse_buffers) << ": sent "
+                   << datagrams + 1 << ", received " << received_.size() << ", reported as dropped "
+                   << dropped_ << ", recvmmsg calls " << counting_sys_calls_.calls_;
+  EXPECT_EQ(datagrams + 1, received_.size() + dropped_);
+  EXPECT_EQ(dropped_, listener_->packetsDropped());
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, ReceiveBufferOverflowReuseBuffersOff) {
+  receiveBufferOverflow(false);
+}
+TEST_P(UdpListenerImplRecvMmsgTest, ReceiveBufferOverflowReuseBuffersOn) {
+  receiveBufferOverflow(true);
+}
+
+#ifdef UDP_SEGMENT
+// The listen socket has the generic receive offload option set and is read with recvmmsg, which
+// is what a QUIC listener does by default. A sender that uses segmentation offload makes the
+// kernel deliver several segments as one message on the loopback interface. Whatever the kernel
+// delivers, the same bytes are handed over with the guard off and on, and datagrams that arrive
+// later are read.
+void UdpListenerImplRecvMmsgTest::segmentedSendWithGroSocketOption(bool reuse_buffers) {
+  counting_sys_calls_.gro_socket_option_ = Api::OsSysCallsImpl().supportsUdpGro();
+  setupWithGuard(reuse_buffers);
+
+  const int fd = ::socket(send_to_addr_->sockAddr()->sa_family, SOCK_DGRAM, 0);
+  ASSERT_GE(fd, 0);
+  constexpr uint16_t segment_size = 100;
+  constexpr size_t segments = 10;
+  const std::string payload(segment_size * segments, 's');
+  for (uint32_t round = 0; round < 3; round++) {
+    iovec iov{const_cast<char*>(payload.data()), payload.size()};
+    char control[CMSG_SPACE(sizeof(uint16_t))] = {};
+    msghdr message{};
+    message.msg_name = const_cast<sockaddr*>(send_to_addr_->sockAddr());
+    message.msg_namelen = send_to_addr_->sockAddrLen();
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&message);
+    cmsg->cmsg_level = SOL_UDP;
+    cmsg->cmsg_type = UDP_SEGMENT;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+    memcpy(CMSG_DATA(cmsg), &segment_size, sizeof(segment_size));
+    ASSERT_EQ(payload.size(), ::sendmsg(fd, &message, 0));
+    runForAWhile();
+
+    client_.write("after", *send_to_addr_);
+    exit_after_ = received_.size() + 1;
+    dispatcher_->run(Event::Dispatcher::RunType::Block);
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    ASSERT_FALSE(received_.empty());
+    EXPECT_EQ("after", received_.back());
+  }
+  ::close(fd);
+
+  size_t segment_bytes = 0;
+  size_t segment_messages = 0;
+  for (const std::string& data : received_) {
+    if (data != "after") {
+      EXPECT_EQ(std::string(data.size(), 's'), data);
+      segment_bytes += data.size();
+      segment_messages++;
+    }
+  }
+  GTEST_LOG_(INFO) << "segmented sends, receive offload socket option "
+                   << (counting_sys_calls_.gro_socket_option_ ? "set" : "not set") << ", "
+                   << guardName(reuse_buffers) << ": " << 3 * segments
+                   << " segments handed over as " << segment_messages
+                   << " messages, recvmmsg calls " << counting_sys_calls_.calls_
+                   << ", of which without a datagram "
+                   << counting_sys_calls_.calls_without_datagrams_;
+  EXPECT_EQ(3 * payload.size(), segment_bytes);
+  EXPECT_EQ(0, dropped_);
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, SegmentedSendWithGroSocketOptionReuseBuffersOff) {
+  segmentedSendWithGroSocketOption(false);
+}
+TEST_P(UdpListenerImplRecvMmsgTest, SegmentedSendWithGroSocketOptionReuseBuffersOn) {
+  segmentedSendWithGroSocketOption(true);
+}
+#endif // UDP_SEGMENT
+
+#endif // defined(__linux__)
 
 } // namespace
 } // namespace Network
