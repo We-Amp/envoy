@@ -7,9 +7,13 @@
 
 #include "source/common/api/os_sys_calls_impl.h"
 #include "source/common/event/dispatcher_impl.h"
+#include "source/common/event/file_event_impl.h"
+#include "source/common/event/schedulable_cb_impl.h"
+#include "source/common/memory/stats.h"
 #include "source/common/runtime/runtime_features.h"
 #include "source/common/stats/isolated_store_impl.h"
 
+#include "test/common/memory/memory_test_utility.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
@@ -793,6 +797,127 @@ TEST_P(FileEventImplWriteActivationTest, LevelTriggeredIsDeliveredInTheNextItera
   });
 
   EXPECT_THAT(log_, ElementsAre("poll", "after", "poll", "write", "poll"));
+}
+
+// Two file events whose Write callbacks activate each other, as two connections that relay to
+// each other do: each file event gets at most one injected Write event per iteration, so the pair
+// cannot keep the event loop from polling. With the guard, each iteration delivers both once; the
+// activation that comes back to a file event that already had its Write event waits for the next
+// iteration.
+TEST_P(FileEventImplWriteActivationTest, TwoFileEventsThatActivateEachOther) {
+  os_fd_t other_fds[2];
+  ASSERT_EQ(0, os_sys_calls_.socketpair(AF_UNIX, SOCK_STREAM, 0, other_fds).return_value_);
+  int deliveries = 0;
+  FileEventPtr first;
+  FileEventPtr second;
+  auto relay = [&](const std::string& name, FileEventPtr& other) {
+    return [&, name](uint32_t events) {
+      EXPECT_EQ(FileReadyType::Write, events);
+      log_.push_back(name);
+      if (++deliveries < 6) {
+        other->activate(FileReadyType::Write);
+      }
+      return absl::OkStatus();
+    };
+  };
+  // Registered for Read only, on sockets that are not readable, so that only activations deliver.
+  first = dispatcher_->createFileEvent(fds_[0], relay("first", second), FileTriggerType::Edge,
+                                       FileReadyType::Read);
+  second = dispatcher_->createFileEvent(other_fds[0], relay("second", first),
+                                        FileTriggerType::Edge, FileReadyType::Read);
+  dispatcher_->run(Dispatcher::RunType::NonBlock);
+  log_.clear();
+
+  runInLoop([&]() { first->activate(FileReadyType::Write); });
+
+  if (guardEnabled()) {
+    EXPECT_THAT(log_, ElementsAre("poll", "first", "second", "poll", "first", "second", "poll",
+                                  "first", "second", "poll"));
+  } else {
+    EXPECT_THAT(log_, ElementsAre("poll", "poll", "first", "poll", "second", "poll", "first",
+                                  "poll", "second", "poll", "first", "poll", "second", "poll"));
+  }
+  EXPECT_EQ(6, deliveries);
+
+  first.reset();
+  second.reset();
+  os_sys_calls_.close(other_fds[0]);
+  os_sys_calls_.close(other_fds[1]);
+}
+
+// The memory that the guard costs. Every FileEventImpl has three more members (24 bytes on LP64)
+// whether the guard is on or off. With the guard on, the first Write activation that takes the
+// new path also allocates the SchedulableCallbackImpl that delivers it, which the file event keeps
+// until it is destroyed; with the guard off nothing is allocated per activation. A connection has
+// one file event, so these are the costs per connection socket. The figures are measured over many
+// file events, so that the allocator's own variation is spread out, and logged.
+TEST_P(FileEventImplWriteActivationTest, MemoryPerFileEvent) {
+  if (Memory::TestUtil::MemoryTest::mode() == Memory::TestUtil::MemoryTest::Mode::Disabled) {
+    GTEST_SKIP() << "the heap use of this build cannot be measured";
+  }
+  constexpr int64_t kFileEvents = 1000;
+  std::vector<FileEventPtr> file_events;
+  file_events.reserve(kFileEvents);
+  log_.reserve(64);
+  int64_t deliveries = 0;
+  auto allocated = []() { return static_cast<int64_t>(Memory::Stats::totalCurrentlyAllocated()); };
+
+  const int64_t before_create = allocated();
+  for (int64_t i = 0; i < kFileEvents; i++) {
+    // Registered for Read only, on a socket that is not readable, so that only activations
+    // deliver.
+    file_events.push_back(dispatcher_->createFileEvent(
+        fds_[0],
+        [&deliveries](uint32_t) {
+          deliveries++;
+          return absl::OkStatus();
+        },
+        FileTriggerType::Edge, FileReadyType::Read));
+  }
+  const int64_t created = allocated() - before_create;
+  dispatcher_->run(Dispatcher::RunType::NonBlock);
+
+  const int64_t before_write = allocated();
+  runInLoop([&]() {
+    for (FileEventPtr& file_event : file_events) {
+      file_event->activate(FileReadyType::Write);
+    }
+  });
+  ASSERT_EQ(kFileEvents, deliveries);
+  const int64_t written = allocated() - before_write;
+
+  // A second round reuses what the first one allocated.
+  const int64_t before_second_write = allocated();
+  runInLoop([&]() {
+    for (FileEventPtr& file_event : file_events) {
+      file_event->activate(FileReadyType::Write);
+    }
+  });
+  ASSERT_EQ(2 * kFileEvents, deliveries);
+  const int64_t written_again = allocated() - before_second_write;
+
+  ENVOY_LOG_MISC(info,
+                 "guard {}: sizeof(FileEventImpl) {}, sizeof(SchedulableCallbackImpl) {}; heap bytes "
+                 "per file event: created {}, first Write activation {}, second {}",
+                 guardEnabled() ? "on" : "off", sizeof(FileEventImpl),
+                 sizeof(SchedulableCallbackImpl), created / kFileEvents, written / kFileEvents,
+                 written_again / kFileEvents);
+  RecordProperty("heap_bytes_per_file_event_created", static_cast<int>(created / kFileEvents));
+  RecordProperty("heap_bytes_per_file_event_first_write", static_cast<int>(written / kFileEvents));
+
+  // Creating a file event allocates the file event and its next-iteration callback.
+  EXPECT_GE(created, kFileEvents * static_cast<int64_t>(sizeof(FileEventImpl) +
+                                                        sizeof(SchedulableCallbackImpl)));
+  if (guardEnabled()) {
+    // One SchedulableCallbackImpl per file event, rounded up to the allocator's size class.
+    EXPECT_GE(written, kFileEvents * static_cast<int64_t>(sizeof(SchedulableCallbackImpl)));
+    EXPECT_LE(written, kFileEvents * static_cast<int64_t>(sizeof(SchedulableCallbackImpl) + 64));
+  } else {
+    // Nothing per file event: the next-iteration path only grows libevent's shared timer heap.
+    EXPECT_LT(written, kFileEvents * 32);
+  }
+  // Nothing more per file event in later iterations, in either arm.
+  EXPECT_LT(written_again, kFileEvents * 8);
 }
 #endif
 

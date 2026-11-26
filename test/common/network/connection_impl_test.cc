@@ -4776,6 +4776,19 @@ protected:
 
   std::vector<std::string>& log() { return os_sys_calls_.log_; }
 
+  // Small kernel buffers on both ends, so that a write of kBlockingWriteSize fills the socket while
+  // the server does not read, without a large allocation.
+  void limitSocketBuffers() {
+    const int size = 16 * 1024;
+    EXPECT_EQ(0, client_connection_->getSocket()
+                     ->setSocketOption(SOL_SOCKET, SO_SNDBUF, &size, sizeof(size))
+                     .return_value_);
+    EXPECT_EQ(0, server_connection_->getSocket()
+                     ->setSocketOption(SOL_SOCKET, SO_RCVBUF, &size, sizeof(size))
+                     .return_value_);
+  }
+  static constexpr size_t kBlockingWriteSize = 1024 * 1024;
+
   TestScopedRuntime scoped_runtime_;
   WriteRecordingOsSysCalls os_sys_calls_;
   TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> os_calls_{&os_sys_calls_};
@@ -4909,6 +4922,48 @@ TEST_P(WriteInCurrentIterationTest, WritesInConsecutiveIterations) {
   second_writer.reset();
   os_sys_calls_.close(fds[0]);
   os_sys_calls_.close(fds[1]);
+  closeAndWaitForPeer();
+}
+
+// Data written to one connection by the fd events of two other sockets that one poll reports
+// ready goes out in one system call, with and without the guard. This is the case of an HTTP/2
+// downstream connection whose streams are answered by several upstream connections: the write
+// file event that the first answer activates is scheduled after the fd events that the poll
+// already reported, so the second answer joins the first.
+TEST_P(WriteInCurrentIterationTest, WritesFromFdEventsOfOnePollGoOutTogether) {
+  setUpAndConnect();
+
+  os_fd_t first_fds[2];
+  os_fd_t second_fds[2];
+  ASSERT_EQ(0, os_sys_calls_.socketpair(AF_UNIX, SOCK_STREAM, 0, first_fds).return_value_);
+  ASSERT_EQ(0, os_sys_calls_.socketpair(AF_UNIX, SOCK_STREAM, 0, second_fds).return_value_);
+  auto writer = [&](const std::string& data) {
+    return [this, data](uint32_t) {
+      log().push_back("fd event");
+      clientWrite(data);
+      return absl::OkStatus();
+    };
+  };
+  Event::FileEventPtr first_writer = dispatcher_->createFileEvent(
+      first_fds[0], writer("one "), Event::FileTriggerType::Edge, Event::FileReadyType::Read);
+  Event::FileEventPtr second_writer = dispatcher_->createFileEvent(
+      second_fds[0], writer("two"), Event::FileTriggerType::Edge, Event::FileReadyType::Read);
+
+  // Both sockets are readable before the next poll, so that poll reports both.
+  const char wake = 'x';
+  ASSERT_EQ(1, os_sys_calls_.write(first_fds[1], &wake, 1).return_value_);
+  ASSERT_EQ(1, os_sys_calls_.write(second_fds[1], &wake, 1).return_value_);
+  runUntil([&]() { return server_received_.size() == 7; });
+
+  // The order of the two fd events is the poller's; the data is in one system call either way.
+  EXPECT_THAT(log(), ElementsAre("fd event", "fd event", "write 7"));
+  EXPECT_TRUE(server_received_ == "one two" || server_received_ == "twoone ") << server_received_;
+
+  first_writer.reset();
+  second_writer.reset();
+  for (os_fd_t fd : {first_fds[0], first_fds[1], second_fds[0], second_fds[1]}) {
+    os_sys_calls_.close(fd);
+  }
   closeAndWaitForPeer();
 }
 #endif
@@ -5093,6 +5148,7 @@ TEST_P(WriteInCurrentIterationTest, WriteThenDelayedCloseTimeout) {
 // so the flush does not complete and the delayed close timer closes the connection.
 TEST_P(WriteInCurrentIterationTest, FlushWriteCloseTimesOutWhenThePeerDoesNotRead) {
   setUpAndConnect();
+  limitSocketBuffers();
   time_system_.setMonotonicTime(std::chrono::milliseconds(0));
   server_connection_->readDisable(true);
   client_connection_->setDelayedCloseTimeout(std::chrono::milliseconds(50));
@@ -5100,7 +5156,7 @@ TEST_P(WriteInCurrentIterationTest, FlushWriteCloseTimesOutWhenThePeerDoesNotRea
   client_connection_->setConnectionStats(stats.toBufferStats());
   EXPECT_CALL(stats.delayed_close_timeouts_, inc());
 
-  const std::string message(64 * 1024 * 1024, 'd');
+  const std::string message(kBlockingWriteSize, 'd');
   runInLoop([&]() {
     clientWrite(message);
     client_connection_->close(ConnectionCloseType::FlushWrite);
@@ -5185,13 +5241,19 @@ TEST_P(WriteInCurrentIterationTest, WriteFromLowWatermarkCallback) {
 }
 
 // A write to a connection whose socket did not take everything: the connection waits for the
-// socket to become writable, and the write file event of the new write makes one attempt that the
-// socket refuses, with and without the guard.
+// socket to become writable, and the write file event of the new write tries to write until the
+// socket refuses, with and without the guard. What the test is about is when that attempt runs
+// relative to a callback scheduled after the write. How much the socket takes, and when it reports
+// that it is writable again, is up to the kernel: the peer's receive buffer can take more bytes
+// between two runs of the event loop, so an attempt can write some bytes before it is refused, and
+// a poll can report the socket writable, which adds an attempt. Only the order of the attempt that
+// the new write activates and the final refusal are asserted, not the number of system calls.
 TEST_P(WriteInCurrentIterationTest, WriteWhileTheSocketIsBlocked) {
   setUpAndConnect();
+  limitSocketBuffers();
   server_connection_->readDisable(true);
 
-  const std::string message(64 * 1024 * 1024, 'd');
+  const std::string message(kBlockingWriteSize, 'd');
   runInLoop([&]() { clientWrite(message); });
   dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
   // The socket took a part and then refused.
@@ -5205,10 +5267,25 @@ TEST_P(WriteInCurrentIterationTest, WriteWhileTheSocketIsBlocked) {
     after->scheduleCallbackCurrentIteration();
   });
   dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  // The log is one "after" entry and write system calls, the last of which is refused.
+  const std::vector<std::string>& entries = log();
+  ASSERT_EQ(1, std::count(entries.begin(), entries.end(), "after"));
+  for (const std::string& entry : entries) {
+    EXPECT_TRUE(entry == "after" || entry.starts_with("write ")) << entry;
+  }
+  const size_t after_index = std::find(entries.begin(), entries.end(), "after") - entries.begin();
   if (writeInCurrentIteration()) {
-    EXPECT_THAT(log(), ElementsAre("write -1", "after"));
+    // The attempt ran, and was refused, before the callback that was scheduled after the write.
+    ASSERT_GE(after_index, 1U);
+    EXPECT_EQ("write -1", entries[after_index - 1]);
+    if (after_index + 1 < entries.size()) {
+      EXPECT_EQ("write -1", entries.back());
+    }
   } else {
-    EXPECT_THAT(log(), ElementsAre("after", "write -1"));
+    // The attempt ran in the next iteration, after that callback, and was refused.
+    ASSERT_LT(after_index + 1, entries.size());
+    EXPECT_EQ("write -1", entries.back());
   }
 
   server_connection_->readDisable(false);
