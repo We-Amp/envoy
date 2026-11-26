@@ -982,6 +982,7 @@ TEST_P(UdpRecvMmsgTest, MemoryHeldByKeptReceiveBuffers) {
   // The figure is for the whole process, so anything else that allocates in between can only add
   // to it. The smallest of a few measurements, each with new kept buffers, is the one taken.
   uint64_t held = std::numeric_limits<uint64_t>::max();
+  uint64_t largest = 0;
   for (int i = 0; i < 5; i++) {
     processor_.recv_mmsg_buffers_ = Utility::createUdpRecvMmsgBuffers();
     const uint64_t before = Memory::Stats::totalCurrentlyAllocated();
@@ -990,9 +991,12 @@ TEST_P(UdpRecvMmsgTest, MemoryHeldByKeptReceiveBuffers) {
     EXPECT_EQ(NUM_DATAGRAMS_PER_RECEIVE, processor_.keptBuffersAllocated());
     ASSERT_GE(after, before);
     held = std::min(held, after - before);
+    largest = std::max(largest, after - before);
   }
+  // The largest measurement is logged too, so that a one-off jump shows in the log.
   GTEST_LOG_(INFO) << "kept receive buffers for a datagram size of "
-                   << processor_.max_datagram_size_ << ": " << held << " bytes in use (tcmalloc)";
+                   << processor_.max_datagram_size_ << ": " << held
+                   << " bytes in use (tcmalloc; largest of the measurements " << largest << ")";
   EXPECT_GE(held, NUM_DATAGRAMS_PER_RECEIVE * processor_.max_datagram_size_);
   EXPECT_LE(held, bound);
 }
