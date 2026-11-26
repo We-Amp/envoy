@@ -4663,20 +4663,33 @@ TEST_P(ReadBufferLimitTest, SomeLimit_ShortRead_2048) {
 class WriteRecordingOsSysCalls : public Api::OsSysCallsImpl {
 public:
   Api::SysCallSizeResult writev(os_fd_t fd, const iovec* iov, int num_iov) override {
+    if (fd == fd_ && refuse_) {
+      return refuse(fd);
+    }
     const Api::SysCallSizeResult result = Api::OsSysCallsImpl::writev(fd, iov, num_iov);
     record(fd, result);
     return result;
   }
   Api::SysCallSizeResult send(os_fd_t fd, void* buffer, size_t length, int flags) override {
+    if (fd == fd_ && refuse_) {
+      return refuse(fd);
+    }
     const Api::SysCallSizeResult result = Api::OsSysCallsImpl::send(fd, buffer, length, flags);
     record(fd, result);
     return result;
   }
 
   os_fd_t fd_{-1};
+  // While true, every write on fd_ fails as a full socket does, without reaching the kernel.
+  bool refuse_{false};
   std::vector<std::string> log_;
 
 private:
+  Api::SysCallSizeResult refuse(os_fd_t fd) {
+    const Api::SysCallSizeResult refused{-1, SOCKET_ERROR_AGAIN};
+    record(fd, refused);
+    return refused;
+  }
   void record(os_fd_t fd, const Api::SysCallSizeResult& result) {
     if (fd == fd_) {
       log_.push_back(fmt::format("write {}", result.return_value_));
@@ -5240,25 +5253,18 @@ TEST_P(WriteInCurrentIterationTest, WriteFromLowWatermarkCallback) {
   closeAndWaitForPeer();
 }
 
-// A write to a connection whose socket did not take everything: the connection waits for the
-// socket to become writable, and the write file event of the new write tries to write until the
-// socket refuses, with and without the guard. What the test is about is when that attempt runs
-// relative to a callback scheduled after the write. How much the socket takes, and when it reports
-// that it is writable again, is up to the kernel: the peer's receive buffer can take more bytes
-// between two runs of the event loop, so an attempt can write some bytes before it is refused, and
-// a poll can report the socket writable, which adds an attempt. Only the order of the attempt that
-// the new write activates and the final refusal are asserted, not the number of system calls.
+// A write to a connection whose socket refuses writes: the connection waits for the socket to
+// become writable, and the write file event of a new write makes one attempt that is refused, with
+// and without the guard. The refusal is simulated by the system call recorder, so the kernel socket
+// never fills and never reports a new writable edge, and the order is exact: with the guard the
+// attempt runs before a callback scheduled after the write, without it the attempt runs in the next
+// iteration.
 TEST_P(WriteInCurrentIterationTest, WriteWhileTheSocketIsBlocked) {
   setUpAndConnect();
-  limitSocketBuffers();
-  server_connection_->readDisable(true);
-
-  const std::string message(kBlockingWriteSize, 'd');
-  runInLoop([&]() { clientWrite(message); });
+  os_sys_calls_.refuse_ = true;
+  runInLoop([&]() { clientWrite("first "); });
   dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
-  // The socket took a part and then refused.
-  ASSERT_GE(log().size(), 2U);
-  EXPECT_EQ("write -1", log().back());
+  EXPECT_THAT(log(), ElementsAre("write -1"));
 
   log().clear();
   Event::SchedulableCallbackPtr after = afterLogger();
@@ -5267,29 +5273,17 @@ TEST_P(WriteInCurrentIterationTest, WriteWhileTheSocketIsBlocked) {
     after->scheduleCallbackCurrentIteration();
   });
   dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
-
-  // The log is one "after" entry and write system calls, the last of which is refused.
-  const std::vector<std::string>& entries = log();
-  ASSERT_EQ(1, std::count(entries.begin(), entries.end(), "after"));
-  for (const std::string& entry : entries) {
-    EXPECT_TRUE(entry == "after" || entry.starts_with("write ")) << entry;
-  }
-  const size_t after_index = std::find(entries.begin(), entries.end(), "after") - entries.begin();
   if (writeInCurrentIteration()) {
-    // The attempt ran, and was refused, before the callback that was scheduled after the write.
-    ASSERT_GE(after_index, 1U);
-    EXPECT_EQ("write -1", entries[after_index - 1]);
-    if (after_index + 1 < entries.size()) {
-      EXPECT_EQ("write -1", entries.back());
-    }
+    EXPECT_THAT(log(), ElementsAre("write -1", "after"));
   } else {
-    // The attempt ran in the next iteration, after that callback, and was refused.
-    ASSERT_LT(after_index + 1, entries.size());
-    EXPECT_EQ("write -1", entries.back());
+    EXPECT_THAT(log(), ElementsAre("after", "write -1"));
   }
 
-  server_connection_->readDisable(false);
-  runUntil([&]() { return server_received_.size() == message.size() + 4; });
+  // The kernel socket never refused, so it reports no new writable edge: the next write activates
+  // the write file event, which writes everything that is buffered.
+  os_sys_calls_.refuse_ = false;
+  clientWrite("!");
+  runUntil([&]() { return server_received_ == "first more!"; });
   closeAndWaitForPeer();
 }
 
@@ -5352,6 +5346,36 @@ TEST_P(TcpClientConnectionImplTest, BadConnectConnRefusedWithTransportError) {
   dispatcher_->run(Event::Dispatcher::RunType::Block);
   EXPECT_THAT(connection->transportFailureReason(), StartsWith("delayed connect error"));
   EXPECT_THAT(connection->transportFailureReason(), EndsWith("custom error"));
+}
+
+// envoy.reloadable_features.file_event_write_in_current_iteration and the out-of-band close of a
+// client connection whose bind fails. The close is a Write activation made in the constructor, so
+// with the guard it runs later in the current iteration instead of the next one. It still runs
+// only after control returns to the event loop: the owner adds its callbacks after the connection
+// is created and gets exactly one LocalClose, with and without the guard.
+TEST_P(TcpClientConnectionImplTest, BindFailureCloseReachesCallbacksAddedAfterCreation) {
+  for (const bool guard : {false, true}) {
+    SCOPED_TRACE(guard ? "guard on" : "guard off");
+    TestScopedRuntime scoped_runtime;
+    scoped_runtime.mergeValues({{"envoy.reloadable_features.file_event_write_in_current_iteration",
+                                 guard ? "true" : "false"}});
+    // An address family mismatch between the source and the remote address fails the bind.
+    const Address::InstanceConstSharedPtr source_address =
+        GetParam() == Address::IpVersion::v6
+            ? Address::InstanceConstSharedPtr{new Address::Ipv4Instance(
+                  TestUtility::getIpv4Loopback(), 0, nullptr)}
+            : Address::InstanceConstSharedPtr{new Address::Ipv6Instance("::1", 0, nullptr)};
+    MockConnectionCallbacks callbacks;
+    ClientConnectionPtr connection = dispatcher_->createClientConnection(
+        Network::Test::getCanonicalLoopbackAddress(GetParam()), source_address,
+        Network::Test::createRawBufferSocket(), nullptr, nullptr);
+    connection->addConnectionCallbacks(callbacks);
+    EXPECT_CALL(callbacks, onEvent(ConnectionEvent::LocalClose));
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    EXPECT_EQ(Connection::State::Closed, connection->state());
+    EXPECT_THAT(connection->transportFailureReason(), StartsWith("failed to bind to"));
+    testing::Mock::VerifyAndClearExpectations(&callbacks);
+  }
 }
 
 class PipeClientConnectionImplTest : public testing::Test {

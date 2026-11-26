@@ -33,6 +33,10 @@ class TcpProxyIntegrationTest : public BaseTcpProxyIntegrationTest,
                                 public testing::TestWithParam<Network::Address::IpVersion> {
 public:
   TcpProxyIntegrationTest() : BaseTcpProxyIntegrationTest(GetParam()) {}
+
+  // A 16 KiB write in each direction through 1 KiB buffer limits, so that both sides pause and
+  // resume reading.
+  void largeWriteTest();
 };
 
 /**
