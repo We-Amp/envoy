@@ -12,7 +12,6 @@
 #include "source/common/common/utility.h"
 #include "source/common/event/deferred_task.h"
 #include "source/common/event/dispatcher_impl.h"
-#include "source/common/event/real_time_system.h"
 #include "source/common/event/timer_impl.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/stats/isolated_store_impl.h"
@@ -836,15 +835,18 @@ TEST_F(DispatcherMonotonicTimeTest, ApproximateMonotonicTime) {
 // with it.
 class DispatcherEventLoopIterationTest : public testing::Test {
 protected:
-  // Real timers and a monotonic clock that only the test moves, so that a test can change the time
-  // in the middle of an iteration without waiting for the real clock.
-  class SettableMonotonicTimeSystem : public RealTimeSystem {
+  // Simulated time whose monotonic clock the test can move from inside the event loop: moving the
+  // simulated time itself waits for the event loop to finish its callbacks. Only the clock that
+  // the dispatcher reads moves; no timer is armed in these tests.
+  class OffsetMonotonicTimeSystem : public Event::SimulatedTimeSystem {
   public:
-    MonotonicTime monotonicTime() override { return monotonic_time_; }
-    void advance(std::chrono::milliseconds duration) { monotonic_time_ += duration; }
+    MonotonicTime monotonicTime() override {
+      return Event::SimulatedTimeSystem::monotonicTime() + offset_;
+    }
+    void advance(std::chrono::milliseconds duration) { offset_ += duration; }
 
   private:
-    MonotonicTime monotonic_time_{std::chrono::seconds(1)};
+    std::chrono::milliseconds offset_{0};
   };
 
   DispatcherEventLoopIterationTest() : os_sys_calls_(Api::OsSysCallsSingleton::get()) {
@@ -895,9 +897,9 @@ protected:
 
   TestScopedRuntime runtime_;
   Api::OsSysCalls& os_sys_calls_;
-  // Created by the tests that run on simulated or settable time. Must outlive the dispatcher.
+  // Created by the tests that run on simulated time. Must outlive the dispatcher.
   std::unique_ptr<Event::SimulatedTimeSystem> simulated_time_;
-  std::unique_ptr<SettableMonotonicTimeSystem> settable_time_;
+  std::unique_ptr<OffsetMonotonicTimeSystem> offset_time_;
   Api::ApiPtr api_;
   DispatcherPtr dispatcher_;
   os_fd_t fds_[2];
@@ -910,8 +912,8 @@ protected:
 // example by the QUIC clock. It changes the approximate time and must not start a new iteration: a
 // second Write activation in the same iteration still waits for the next one.
 TEST_F(DispatcherEventLoopIterationTest, UpdateApproximateMonotonicTimeIsNotAnIteration) {
-  settable_time_ = std::make_unique<SettableMonotonicTimeSystem>();
-  initialize(Api::createApiForTest(*settable_time_));
+  offset_time_ = std::make_unique<OffsetMonotonicTimeSystem>();
+  initialize(Api::createApiForTest(*offset_time_));
 
   bool first_delivery = true;
   on_write_ = [&]() {
@@ -921,7 +923,7 @@ TEST_F(DispatcherEventLoopIterationTest, UpdateApproximateMonotonicTimeIsNotAnIt
     first_delivery = false;
     const MonotonicTime before = dispatcher_->approximateMonotonicTime();
     // Move the clock in the middle of the iteration.
-    settable_time_->advance(std::chrono::milliseconds(1));
+    offset_time_->advance(std::chrono::milliseconds(1));
     dispatcher_->updateApproximateMonotonicTime();
     dispatcher_->updateApproximateMonotonicTime();
     EXPECT_LT(before, dispatcher_->approximateMonotonicTime());

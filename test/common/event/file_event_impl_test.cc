@@ -823,8 +823,8 @@ TEST_P(FileEventImplWriteActivationTest, TwoFileEventsThatActivateEachOther) {
   // Registered for Read only, on sockets that are not readable, so that only activations deliver.
   first = dispatcher_->createFileEvent(fds_[0], relay("first", second), FileTriggerType::Edge,
                                        FileReadyType::Read);
-  second = dispatcher_->createFileEvent(other_fds[0], relay("second", first),
-                                        FileTriggerType::Edge, FileReadyType::Read);
+  second = dispatcher_->createFileEvent(other_fds[0], relay("second", first), FileTriggerType::Edge,
+                                        FileReadyType::Read);
   dispatcher_->run(Dispatcher::RunType::NonBlock);
   log_.clear();
 
@@ -847,8 +847,9 @@ TEST_P(FileEventImplWriteActivationTest, TwoFileEventsThatActivateEachOther) {
 
 // The memory that the guard costs. Every FileEventImpl has three more members (24 bytes on LP64)
 // whether the guard is on or off. With the guard on, the first Write activation that takes the
-// new path also allocates the SchedulableCallbackImpl that delivers it, which the file event keeps
-// until it is destroyed; with the guard off nothing is allocated per activation. A connection has
+// new path also allocates the SchedulableCallbackImpl that delivers it, with its std::function,
+// which the file event keeps until it is destroyed; with the guard off nothing is allocated per
+// activation. A connection has
 // one file event, so these are the costs per connection socket. The figures are measured over many
 // file events, so that the allocator's own variation is spread out, and logged.
 TEST_P(FileEventImplWriteActivationTest, MemoryPerFileEvent) {
@@ -909,9 +910,12 @@ TEST_P(FileEventImplWriteActivationTest, MemoryPerFileEvent) {
   EXPECT_GE(created, kFileEvents * static_cast<int64_t>(sizeof(FileEventImpl) +
                                                         sizeof(SchedulableCallbackImpl)));
   if (guardEnabled()) {
-    // One SchedulableCallbackImpl per file event, rounded up to the allocator's size class.
+    // One SchedulableCallbackImpl per file event, and the heap block of the std::function in it:
+    // DispatcherImpl::createSchedulableCallback() wraps the callback in a lambda that holds the
+    // dispatcher and a std::function, which is too large for the inline buffer of std::function.
+    // Both are rounded up to the allocator's size classes.
     EXPECT_GE(written, kFileEvents * static_cast<int64_t>(sizeof(SchedulableCallbackImpl)));
-    EXPECT_LE(written, kFileEvents * static_cast<int64_t>(sizeof(SchedulableCallbackImpl) + 64));
+    EXPECT_LE(written, kFileEvents * static_cast<int64_t>(sizeof(SchedulableCallbackImpl) + 128));
   } else {
     // Nothing per file event: the next-iteration path only grows libevent's shared timer heap.
     EXPECT_LT(written, kFileEvents * 32);
