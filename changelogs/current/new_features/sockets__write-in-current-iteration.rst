@@ -9,5 +9,5 @@ and, with TLS, send more records. The change applies to every activation of exac
 ``FileReadyType::Write`` on an edge-triggered file event that has no injected event pending, at most
 once per file event per iteration. Level-triggered file events, as used on Windows, and user space
 sockets keep the previous behavior. The guard is read when a file event is created, so a change of
-its value applies to connections created afterwards. With the guard enabled each connection that
-writes uses one more callback object, about 200 bytes.
+its value applies to connections created afterwards. With the guard enabled, each connection socket
+that writes keeps one more callback, 256 bytes of heap on a 64-bit build with tcmalloc.
