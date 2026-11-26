@@ -897,8 +897,8 @@ TEST_P(FileEventImplWriteActivationTest, MemoryPerFileEvent) {
   const int64_t written_again = allocated() - before_second_write;
 
   ENVOY_LOG_MISC(info,
-                 "guard {}: sizeof(FileEventImpl) {}, sizeof(SchedulableCallbackImpl) {}; heap bytes "
-                 "per file event: created {}, first Write activation {}, second {}",
+                 "guard {}: sizeof(FileEventImpl) {}, sizeof(SchedulableCallbackImpl) {}; heap "
+                 "bytes per file event: created {}, first Write activation {}, second {}",
                  guardEnabled() ? "on" : "off", sizeof(FileEventImpl),
                  sizeof(SchedulableCallbackImpl), created / kFileEvents, written / kFileEvents,
                  written_again / kFileEvents);
