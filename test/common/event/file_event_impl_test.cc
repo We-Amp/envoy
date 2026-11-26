@@ -551,9 +551,8 @@ TEST_P(FileEventImplWriteActivationTest, OncePerIteration) {
   runInLoop([&]() { file_event_->activate(FileReadyType::Write); });
 
   if (guardEnabled()) {
-    EXPECT_THAT(log_,
-                ElementsAre("poll", "write", "poll", "write", "poll", "write", "poll", "write",
-                            "poll"));
+    EXPECT_THAT(log_, ElementsAre("poll", "write", "poll", "write", "poll", "write", "poll",
+                                  "write", "poll"));
   } else {
     EXPECT_THAT(log_, ElementsAre("poll", "poll", "write", "poll", "write", "poll", "write", "poll",
                                   "write", "poll"));

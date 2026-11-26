@@ -4715,16 +4715,14 @@ protected:
           exitIfDone();
           return FilterStatus::StopIteration;
         }));
-    ON_CALL(server_callbacks_, onEvent(_))
-        .WillByDefault(Invoke([this](ConnectionEvent event) {
-          server_events_.push_back(event);
-          exitIfDone();
-        }));
-    ON_CALL(client_callbacks_, onEvent(_))
-        .WillByDefault(Invoke([this](ConnectionEvent event) {
-          client_events_.push_back(event);
-          exitIfDone();
-        }));
+    ON_CALL(server_callbacks_, onEvent(_)).WillByDefault(Invoke([this](ConnectionEvent event) {
+      server_events_.push_back(event);
+      exitIfDone();
+    }));
+    ON_CALL(client_callbacks_, onEvent(_)).WillByDefault(Invoke([this](ConnectionEvent event) {
+      client_events_.push_back(event);
+      exitIfDone();
+    }));
     EXPECT_CALL(server_callbacks_, onEvent(_)).Times(AnyNumber());
     EXPECT_CALL(client_callbacks_, onEvent(_)).Times(AnyNumber());
     dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
