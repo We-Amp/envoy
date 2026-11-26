@@ -85,7 +85,7 @@ DispatcherImpl::DispatcherImpl(const std::string& name, Thread::ThreadFactory& t
   FatalErrorHandler::registerFatalErrorHandler(*this);
   updateApproximateMonotonicTimeInternal();
   base_scheduler_.registerOnCheckCallback(
-      std::bind(&DispatcherImpl::updateApproximateMonotonicTime, this));
+      std::bind(&DispatcherImpl::onEventLoopIterationStart, this));
 }
 
 DispatcherImpl::~DispatcherImpl() {
@@ -353,6 +353,13 @@ void DispatcherImpl::updateApproximateMonotonicTime() { updateApproximateMonoton
 
 void DispatcherImpl::updateApproximateMonotonicTimeInternal() {
   approximate_monotonic_time_ = time_source_.monotonicTime();
+}
+
+void DispatcherImpl::onEventLoopIterationStart() {
+  // The iteration is counted here and not in updateApproximateMonotonicTime(), which is public and
+  // is also called in the middle of an iteration.
+  ++event_loop_iteration_;
+  updateApproximateMonotonicTime();
 }
 
 void DispatcherImpl::runThreadLocalDelete() {

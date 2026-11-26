@@ -104,6 +104,10 @@ public:
   runFatalActionsOnTrackedObject(const FatalAction::FatalActionPtrList& actions) const override;
 
 private:
+  // FileEventImpl reads event_loop_iteration_ to deliver at most one write activation per file
+  // event in the event loop iteration that made it.
+  friend class FileEventImpl;
+
   // Holds a reference to the watchdog registered with this dispatcher and the timer used to ensure
   // that the dog is touched periodically.
   class WatchdogRegistration {
@@ -131,6 +135,9 @@ private:
 
   TimerPtr createTimerInternal(TimerCb cb);
   void updateApproximateMonotonicTimeInternal();
+  // The scheduler's "check" callback: runs once per event loop iteration, after polling for fd
+  // events and before any event of the iteration is handled.
+  void onEventLoopIterationStart();
   void runPostCallbacks();
   void runThreadLocalDelete();
 
@@ -176,6 +183,12 @@ private:
       tracked_object_stack_;
   bool deferred_deleting_{};
   MonotonicTime approximate_monotonic_time_;
+  // Identifies the current event loop iteration. Only onEventLoopIterationStart() changes it, so it
+  // is the same for everything that runs between two polls for fd events, unlike
+  // approximate_monotonic_time_, which updateApproximateMonotonicTime() can change in the middle of
+  // an iteration and which does not change between iterations under simulated time. Starts at 1 so
+  // that 0 can mean "no iteration".
+  uint64_t event_loop_iteration_{1};
   WatchdogRegistrationPtr watchdog_registration_;
   const ScaledRangeTimerManagerPtr scaled_timer_manager_;
 };

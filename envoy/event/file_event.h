@@ -69,6 +69,9 @@ public:
    * Activate the file event explicitly for a set of events. Should be a logical OR of FileReadyType
    * events. This method "injects" the event (and fires callbacks) regardless of whether the event
    * is actually ready on the underlying file.
+   *
+   * The callbacks never run inside activate(). An implementation may run them later in the current
+   * event loop iteration, after the callbacks already scheduled for it, or in the next iteration.
    */
   virtual void activate(uint32_t events) PURE;
 

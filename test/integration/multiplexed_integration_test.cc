@@ -1819,6 +1819,23 @@ TEST_P(MultiplexedIntegrationTest, SimultaneousRequestWithBufferLimits) {
   simultaneousRequest(1024 * 32, 1024 * 16);
 }
 
+// envoy.reloadable_features.file_event_write_in_current_iteration on a multiplexed downstream
+// connection whose streams are answered by separate upstream connections: the answers are flushed
+// in the iteration that made them, and the codec's watermarks and deferred processing must still
+// deliver every stream.
+TEST_P(MultiplexedIntegrationTest, SimultaneousRequestWithWriteInCurrentIteration) {
+  config_helper_.addRuntimeOverride(
+      "envoy.reloadable_features.file_event_write_in_current_iteration", "true");
+  simultaneousRequest(1024, 512);
+}
+
+TEST_P(MultiplexedIntegrationTest, SimultaneousRequestWithBufferLimitsAndWriteInCurrentIteration) {
+  config_helper_.setBufferLimits(1024, 1024); // Set buffer limits upstream and downstream.
+  config_helper_.addRuntimeOverride(
+      "envoy.reloadable_features.file_event_write_in_current_iteration", "true");
+  simultaneousRequest(1024 * 32, 1024 * 16);
+}
+
 // Test downstream connection delayed close processing.
 TEST_P(MultiplexedIntegrationTest, DelayedCloseAfterBadFrame) {
   EXCLUDE_DOWNSTREAM_HTTP3; // Needs HTTP/3 "bad frame" equivalent.

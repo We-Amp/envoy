@@ -265,7 +265,7 @@ TEST_P(TcpProxyIntegrationTest, UpstreamConnectionCreationFailure) {
 }
 #endif
 
-TEST_P(TcpProxyIntegrationTest, TcpProxyLargeWrite) {
+void TcpProxyIntegrationTest::largeWriteTest() {
   config_helper_.setBufferLimits(1024, 1024);
   initialize();
 
@@ -297,6 +297,17 @@ TEST_P(TcpProxyIntegrationTest, TcpProxyLargeWrite) {
       test_server_->counter("tcp.tcpproxy_stats.downstream_flow_control_resumed_reading_total")
           ->value();
   EXPECT_EQ(downstream_pauses, downstream_resumes);
+}
+
+TEST_P(TcpProxyIntegrationTest, TcpProxyLargeWrite) { largeWriteTest(); }
+
+// The same with envoy.reloadable_features.file_event_write_in_current_iteration: a write is
+// flushed in the iteration that made it, which changes when the flow-control watermarks are
+// crossed, and every pause must still be followed by a resume.
+TEST_P(TcpProxyIntegrationTest, TcpProxyLargeWriteWithWriteInCurrentIteration) {
+  config_helper_.addRuntimeOverride(
+      "envoy.reloadable_features.file_event_write_in_current_iteration", "true");
+  largeWriteTest();
 }
 
 // Test that a downstream flush works correctly (all data is flushed)

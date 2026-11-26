@@ -1,7 +1,9 @@
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "source/common/buffer/buffer_impl.h"
+#include "source/common/common/fmt.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/network/connection_impl.h"
 #include "source/common/network/io_socket_handle_impl.h"
@@ -441,6 +443,50 @@ TEST_F(InternalClientConnectionImplTest,
   dispatcher_->run(Event::Dispatcher::RunType::Block);
 
   EXPECT_EQ(StreamInfo::DetectedCloseType::Normal, client_->detectedCloseType());
+}
+
+// envoy.reloadable_features.file_event_write_in_current_iteration applies to the file events of
+// OS sockets only. A user space socket has its own file event, which delivers a write activation in
+// the next event loop iteration whether the guard is on or off.
+TEST_F(InternalClientConnectionImplTest, WriteIsDeliveredInTheNextIterationWithTheGuard) {
+  TestScopedRuntime scoped_runtime;
+  scoped_runtime.mergeValues(
+      {{"envoy.reloadable_features.file_event_write_in_current_iteration", "true"}});
+
+  client_ = std::make_unique<Network::ClientConnectionImpl>(
+      *dispatcher_,
+      std::make_unique<Network::ConnectionSocketImpl>(std::move(io_handle_), local_addr_,
+                                                      remote_addr_),
+      nullptr, std::make_unique<Network::RawBufferSocket>(), nullptr, nullptr);
+  client_->addConnectionCallbacks(connection_callbacks);
+  client_->connect();
+  client_->noDelay(true);
+  EXPECT_CALL(connection_callbacks, onEvent(Network::ConnectionEvent::Connected))
+      .WillOnce(Invoke([&](Network::ConnectionEvent) -> void { dispatcher_->exit(); }));
+  dispatcher_->run(Event::Dispatcher::RunType::Block);
+
+  std::vector<std::string> log;
+  client_->addBytesSentCallback([&](uint64_t bytes) {
+    log.push_back(fmt::format("sent {}", bytes));
+    return true;
+  });
+  Event::SchedulableCallbackPtr after =
+      dispatcher_->createSchedulableCallback([&]() { log.push_back("after"); });
+  Event::SchedulableCallbackPtr first = dispatcher_->createSchedulableCallback([&]() {
+    Buffer::OwnedImpl data("hello");
+    client_->write(data, false);
+    after->scheduleCallbackCurrentIteration();
+  });
+  first->scheduleCallbackCurrentIteration();
+  dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+
+  EXPECT_THAT(log, testing::ElementsAre("after", "sent 5"));
+  Buffer::OwnedImpl received;
+  EXPECT_EQ(5UL, io_handle_peer_->read(received, 1024).return_value_);
+  EXPECT_EQ("hello", received.toString());
+
+  EXPECT_CALL(connection_callbacks, onEvent(Network::ConnectionEvent::LocalClose));
+  client_->close(Network::ConnectionCloseType::NoFlush);
 }
 } // namespace
 } // namespace UserSpace

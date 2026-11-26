@@ -280,6 +280,12 @@ FALSE_RUNTIME_GUARD(envoy_reloadable_features_srds_partial_acceptance);
 // scope logic that propagates scope-level tags onto every stat. Evaluated once at startup.
 // TODO: flip to true after sufficient testing.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_enable_stats_explicit_tags);
+// When true, a write activation of an edge-triggered file event is delivered in the event loop
+// iteration that made it instead of the next one. Read once per file event, at its creation.
+// TODO(oschaaf): flip to true once loaded HTTP/2 and bulk transfer results show that the extra
+// system calls and TLS records are paid for; otherwise replace the guard with a configuration
+// option.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_file_event_write_in_current_iteration);
 // TODO: Flip to true after sufficient testing to enable formatter support for rate limit action
 // descriptor_value fields by default.
 FALSE_RUNTIME_GUARD(
