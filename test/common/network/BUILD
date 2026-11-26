@@ -316,8 +316,23 @@ envoy_cc_test(
         "//test/mocks/server:server_mocks",
         "//test/test_common:environment_lib",
         "//test/test_common:network_utility_lib",
+        "//test/test_common:test_runtime_lib",
         "//test/test_common:threadsafe_singleton_injector_lib",
         "//test/test_common:utility_lib",
+    ],
+)
+
+envoy_cc_test(
+    name = "udp_recvmmsg_test",
+    srcs = ["udp_recvmmsg_test.cc"],
+    rbe_pool = "linux_x64_small",
+    deps = [
+        "//source/common/api:os_sys_calls_lib",
+        "//source/common/memory:stats_lib",
+        "//source/common/network:address_lib",
+        "//source/common/network:default_socket_interface_lib",
+        "//source/common/network:utility_lib",
+        "//test/test_common:threadsafe_singleton_injector_lib",
     ],
 )
 
