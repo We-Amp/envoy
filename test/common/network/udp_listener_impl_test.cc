@@ -1,4 +1,9 @@
+#include <poll.h>
+
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -15,9 +20,14 @@
 #include "test/mocks/network/mock_parent_drained_callback_registrar.h"
 #include "test/test_common/environment.h"
 #include "test/test_common/network_utility.h"
+#include "test/test_common/test_runtime.h"
 #include "test/test_common/threadsafe_singleton_injector.h"
 #include "test/test_common/utility.h"
 
+#include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
+#include "absl/time/time.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
 
@@ -939,6 +949,449 @@ TEST_P(UdpListenerImplTest, UdpGroReadLimit) {
 }
 
 #endif
+
+#if defined(__linux__)
+
+// Counts the recvmmsg calls that a UDP listener makes on its socket.
+class CountingOsSysCallsImpl : public Api::OsSysCallsImpl {
+public:
+  Api::SysCallIntResult recvmmsg(os_fd_t sockfd, struct mmsghdr* msgvec, unsigned int vlen,
+                                 int flags, struct timespec* timeout) override {
+    const Api::SysCallIntResult result =
+        Api::OsSysCallsImpl::recvmmsg(sockfd, msgvec, vlen, flags, timeout);
+    calls_++;
+    if (result.return_value_ < 0) {
+      calls_without_datagrams_++;
+    } else {
+      datagrams_ += result.return_value_;
+    }
+    return result;
+  }
+
+  // Whether the listen socket asks for generic receive offload, as the listen sockets of a
+  // server do when the platform supports it. The listener still reads with recvmmsg.
+  bool supportsUdpGro() const override { return gro_socket_option_; }
+
+  bool gro_socket_option_{false};
+
+  // Atomic, because the listeners of several worker threads can read at the same time.
+  std::atomic<uint32_t> calls_{0};
+  std::atomic<uint32_t> calls_without_datagrams_{0};
+  std::atomic<uint32_t> datagrams_{0};
+};
+
+// A UDP listener that reads with recvmmsg from a real socket of the loopback interface. Each test
+// runs with the runtime guard that keeps the receive buffers that a call did not fill off and on.
+class UdpListenerImplRecvMmsgTest : public UdpListenerImplTest {
+public:
+  void setupWithGuard(bool reuse_buffers) {
+    scoped_runtime_.mergeValues({{"envoy.reloadable_features.udp_recvmmsg_reuse_buffers",
+                                  reuse_buffers ? "true" : "false"}});
+    setup();
+    EXPECT_EQ(reuse_buffers, listener_->recvMmsgBuffers() != nullptr);
+    ON_CALL(listener_callbacks_, onDatagramsDropped(_)).WillByDefault(Invoke([this](uint32_t n) {
+      dropped_ += n;
+    }));
+    ON_CALL(listener_callbacks_, onData(_)).WillByDefault(Invoke([this](const UdpRecvData& data) {
+      received_.push_back(data.buffer_->toString());
+      if (done_ != nullptr && done_()) {
+        dispatcher_->exit();
+      }
+    }));
+  }
+
+  static std::string guardName(bool reuse_buffers) {
+    return std::string("kept receive buffers ") + (reuse_buffers ? "on" : "off");
+  }
+
+  // Runs the event loop until `done` is true after a datagram was handed over.
+  void runUntil(std::function<bool()> done) {
+    if (!done()) {
+      done_ = std::move(done);
+      dispatcher_->run(Event::Dispatcher::RunType::Block);
+      done_ = nullptr;
+    }
+    // Let the events that are still pending run.
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  // Runs the event loop until the listener has handed over this many datagrams in total.
+  void runUntilReceived(size_t count) {
+    runUntil([this, count]() { return received_.size() >= count; });
+    ASSERT_EQ(count, received_.size());
+  }
+
+  // Whether a datagram is queued on the listen socket, waiting for at most `timeout`. Nothing is
+  // read from the socket.
+  bool datagramQueued(std::chrono::milliseconds timeout) {
+    pollfd fd{server_socket_->ioHandle().fdDoNotUse(), POLLIN, 0};
+    return ::poll(&fd, 1, static_cast<int>(timeout.count())) == 1 && (fd.revents & POLLIN) != 0;
+  }
+
+  // Runs the event loop until the listener has read everything that is queued on its socket.
+  void runUntilNothingIsQueued() {
+    while (datagramQueued(std::chrono::milliseconds(0))) {
+      dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    }
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+  }
+
+  void oneDatagramPerEvent(bool reuse_buffers);
+  void burst(bool reuse_buffers);
+  void disableAndEnable(bool reuse_buffers);
+  void receiveBufferOverflow(bool reuse_buffers);
+  void segmentedSendWithGroSocketOption(bool reuse_buffers);
+  void severalWorkersReadOneSocket(bool reuse_buffers);
+
+  // The bytes of the datagrams that were handed over, except those of the ones that say "after".
+  size_t segmentBytes() const {
+    size_t bytes = 0;
+    for (const std::string& data : received_) {
+      if (data != "after") {
+        bytes += data.size();
+      }
+    }
+    return bytes;
+  }
+
+  TestScopedRuntime scoped_runtime_;
+  CountingOsSysCallsImpl counting_sys_calls_;
+  TestThreadsafeSingletonInjector<Api::OsSysCallsImpl> counting_os_calls_{&counting_sys_calls_};
+  std::vector<std::string> received_;
+  std::function<bool()> done_;
+  uint32_t dropped_{0};
+};
+
+INSTANTIATE_TEST_SUITE_P(IpVersions, UdpListenerImplRecvMmsgTest,
+                         testing::ValuesIn(TestEnvironment::getIpVersionsForTest()),
+                         TestUtility::ipTestParamsToString);
+
+// Datagrams that arrive one at a time, each after the listener has read the one before: every
+// one of them raises its own read event and is read into a receive buffer of its own.
+void UdpListenerImplRecvMmsgTest::oneDatagramPerEvent(bool reuse_buffers) {
+  setupWithGuard(reuse_buffers);
+  constexpr uint32_t datagrams = 20;
+  for (uint32_t i = 0; i < datagrams; i++) {
+    client_.write(std::string(100, 'a' + i), *send_to_addr_);
+    runUntilReceived(i + 1);
+    EXPECT_EQ(std::string(100, 'a' + i), received_[i]);
+  }
+  GTEST_LOG_(INFO) << "one datagram per read event, " << guardName(reuse_buffers) << ": "
+                   << datagrams << " datagrams, recvmmsg calls "
+                   << counting_sys_calls_.calls_.load() << ", of which without a datagram "
+                   << counting_sys_calls_.calls_without_datagrams_.load();
+  EXPECT_EQ(datagrams, counting_sys_calls_.datagrams_.load());
+  EXPECT_EQ(2 * datagrams, counting_sys_calls_.calls_.load());
+  EXPECT_EQ(datagrams, counting_sys_calls_.calls_without_datagrams_.load());
+  EXPECT_EQ(0, dropped_);
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, OneDatagramPerEventReuseBuffersOff) {
+  oneDatagramPerEvent(false);
+}
+TEST_P(UdpListenerImplRecvMmsgTest, OneDatagramPerEventReuseBuffersOn) {
+  oneDatagramPerEvent(true);
+}
+
+// More datagrams than fit in two batches are queued before the listener reads.
+void UdpListenerImplRecvMmsgTest::burst(bool reuse_buffers) {
+  setupWithGuard(reuse_buffers);
+  constexpr uint32_t datagrams = 2 * NUM_DATAGRAMS_PER_RECEIVE + 8;
+  for (uint32_t round = 0; round < 3; round++) {
+    for (uint32_t i = 0; i < datagrams; i++) {
+      client_.write(std::string(50 + i, 'a' + round), *send_to_addr_);
+    }
+    runUntilReceived((round + 1) * datagrams);
+    // The datagrams of a burst are not always queued in the order they were sent, so what is
+    // compared is which datagrams were handed over, not their order.
+    std::vector<std::string> sent;
+    sent.reserve(datagrams);
+    for (uint32_t i = 0; i < datagrams; i++) {
+      sent.push_back(std::string(50 + i, 'a' + round));
+    }
+    std::vector<std::string> handed_over(received_.begin() + round * datagrams, received_.end());
+    std::sort(handed_over.begin(), handed_over.end());
+    EXPECT_EQ(sent, handed_over);
+  }
+  GTEST_LOG_(INFO) << "bursts, " << guardName(reuse_buffers) << ": " << 3 * datagrams
+                   << " datagrams, recvmmsg calls " << counting_sys_calls_.calls_.load()
+                   << ", of which without a datagram "
+                   << counting_sys_calls_.calls_without_datagrams_.load();
+  EXPECT_EQ(3 * datagrams, counting_sys_calls_.datagrams_.load());
+  EXPECT_EQ(0, dropped_);
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, BurstReuseBuffersOff) { burst(false); }
+TEST_P(UdpListenerImplRecvMmsgTest, BurstReuseBuffersOn) { burst(true); }
+
+// Datagrams that arrive while the listener is disabled are read when it is enabled again, and
+// datagrams that arrive after that raise read events as before.
+void UdpListenerImplRecvMmsgTest::disableAndEnable(bool reuse_buffers) {
+  setupWithGuard(reuse_buffers);
+  size_t expected = 0;
+  for (uint32_t round = 0; round < 3; round++) {
+    client_.write("before", *send_to_addr_);
+    runUntilReceived(++expected);
+
+    listener_->disable();
+    client_.write("disabled 1", *send_to_addr_);
+    client_.write("disabled 2", *send_to_addr_);
+    // The datagrams are on the socket, and the listener does not read them.
+    ASSERT_TRUE(datagramQueued(TestUtility::DefaultTimeout));
+    dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
+    EXPECT_EQ(expected, received_.size());
+
+    listener_->enable();
+    expected += 2;
+    runUntilReceived(expected);
+
+    client_.write("after", *send_to_addr_);
+    runUntilReceived(++expected);
+  }
+  ASSERT_EQ(12, received_.size());
+  for (uint32_t round = 0; round < 3; round++) {
+    EXPECT_EQ("before", received_[round * 4]);
+    // The two datagrams that were sent one right after the other can be queued in either order.
+    EXPECT_THAT((std::vector<std::string>{received_[round * 4 + 1], received_[round * 4 + 2]}),
+                testing::UnorderedElementsAre("disabled 1", "disabled 2"));
+    EXPECT_EQ("after", received_[round * 4 + 3]);
+  }
+  EXPECT_EQ(expected, counting_sys_calls_.datagrams_.load());
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, DisableAndEnableReuseBuffersOff) { disableAndEnable(false); }
+TEST_P(UdpListenerImplRecvMmsgTest, DisableAndEnableReuseBuffersOn) { disableAndEnable(true); }
+
+// The kernel drops datagrams when the receive buffer of the socket is full. Every datagram is
+// either handed over or counted as dropped.
+void UdpListenerImplRecvMmsgTest::receiveBufferOverflow(bool reuse_buffers) {
+  setupWithGuard(reuse_buffers);
+  int receive_buffer_size = 8 * 1024;
+  ASSERT_EQ(0, server_socket_
+                   ->setSocketOption(SOL_SOCKET, SO_RCVBUF, &receive_buffer_size,
+                                     sizeof(receive_buffer_size))
+                   .return_value_);
+  // The kernel rounds the size up and doubles it. What is sent is a multiple of the size it uses.
+  socklen_t option_size = sizeof(receive_buffer_size);
+  ASSERT_EQ(
+      0, server_socket_->getSocketOption(SOL_SOCKET, SO_RCVBUF, &receive_buffer_size, &option_size)
+             .return_value_);
+  constexpr uint32_t datagram_size = 1000;
+  const uint32_t datagrams =
+      std::max<uint32_t>(400, 8 * static_cast<uint32_t>(receive_buffer_size) / datagram_size);
+  for (uint32_t i = 0; i < datagrams; i++) {
+    client_.write(std::string(datagram_size, 'a'), *send_to_addr_);
+  }
+  ASSERT_TRUE(datagramQueued(TestUtility::DefaultTimeout));
+  runUntilNothingIsQueued();
+  const size_t kept = received_.size();
+  EXPECT_GT(kept, 0);
+  EXPECT_LT(kept, datagrams);
+  // The kernel reports its count of dropped datagrams with the next datagram.
+  client_.write("last", *send_to_addr_);
+  // Datagrams of the burst that were still on their way can be read together with "last".
+  runUntil([this]() { return !received_.empty() && received_.back() == "last"; });
+  EXPECT_EQ("last", received_.back());
+  GTEST_LOG_(INFO) << "receive buffer overflow, " << guardName(reuse_buffers) << ": sent "
+                   << datagrams + 1 << ", received " << received_.size() << ", reported as dropped "
+                   << dropped_ << ", recvmmsg calls " << counting_sys_calls_.calls_.load();
+  EXPECT_EQ(datagrams + 1, received_.size() + dropped_);
+  EXPECT_EQ(dropped_, listener_->packetsDropped());
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, ReceiveBufferOverflowReuseBuffersOff) {
+  receiveBufferOverflow(false);
+}
+TEST_P(UdpListenerImplRecvMmsgTest, ReceiveBufferOverflowReuseBuffersOn) {
+  receiveBufferOverflow(true);
+}
+
+#ifdef UDP_SEGMENT
+// The listen socket has the generic receive offload option set and is read with recvmmsg, which
+// is what a QUIC listener does by default. A sender that uses segmentation offload makes the
+// kernel deliver several segments as one message on the loopback interface. Whatever the kernel
+// delivers, the same bytes are handed over with the guard off and on, and datagrams that arrive
+// later are read.
+void UdpListenerImplRecvMmsgTest::segmentedSendWithGroSocketOption(bool reuse_buffers) {
+  counting_sys_calls_.gro_socket_option_ = Api::OsSysCallsImpl().supportsUdpGro();
+  setupWithGuard(reuse_buffers);
+
+  const int fd = ::socket(send_to_addr_->sockAddr()->sa_family, SOCK_DGRAM, 0);
+  ASSERT_GE(fd, 0);
+  constexpr uint16_t segment_size = 100;
+  constexpr size_t segments = 10;
+  const std::string payload(segment_size * segments, 's');
+  for (uint32_t round = 0; round < 3; round++) {
+    iovec iov{const_cast<char*>(payload.data()), payload.size()};
+    char control[CMSG_SPACE(sizeof(uint16_t))] = {};
+    msghdr message{};
+    message.msg_name = const_cast<sockaddr*>(send_to_addr_->sockAddr());
+    message.msg_namelen = send_to_addr_->sockAddrLen();
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    cmsghdr* cmsg = CMSG_FIRSTHDR(&message);
+    cmsg->cmsg_level = SOL_UDP;
+    cmsg->cmsg_type = UDP_SEGMENT;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+    memcpy(CMSG_DATA(cmsg), &segment_size, sizeof(segment_size));
+    ASSERT_EQ(payload.size(), ::sendmsg(fd, &message, 0));
+    const size_t expected_bytes = (round + 1) * payload.size();
+    runUntil([this, expected_bytes]() { return segmentBytes() >= expected_bytes; });
+    EXPECT_EQ(expected_bytes, segmentBytes());
+
+    client_.write("after", *send_to_addr_);
+    runUntilReceived(received_.size() + 1);
+    EXPECT_EQ("after", received_.back());
+  }
+  ::close(fd);
+
+  size_t segment_bytes = 0;
+  size_t segment_messages = 0;
+  for (const std::string& data : received_) {
+    if (data != "after") {
+      EXPECT_EQ(std::string(data.size(), 's'), data);
+      segment_bytes += data.size();
+      segment_messages++;
+    }
+  }
+  GTEST_LOG_(INFO) << "segmented sends, receive offload socket option "
+                   << (counting_sys_calls_.gro_socket_option_ ? "set" : "not set") << ", "
+                   << guardName(reuse_buffers) << ": " << 3 * segments
+                   << " segments handed over as " << segment_messages
+                   << " messages, recvmmsg calls " << counting_sys_calls_.calls_.load()
+                   << ", of which without a datagram "
+                   << counting_sys_calls_.calls_without_datagrams_.load();
+  EXPECT_EQ(3 * payload.size(), segment_bytes);
+  EXPECT_EQ(0, dropped_);
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, SegmentedSendWithGroSocketOptionReuseBuffersOff) {
+  segmentedSendWithGroSocketOption(false);
+}
+TEST_P(UdpListenerImplRecvMmsgTest, SegmentedSendWithGroSocketOptionReuseBuffersOn) {
+  segmentedSendWithGroSocketOption(true);
+}
+#endif // UDP_SEGMENT
+
+// Several worker threads read one socket, each with a listener of its own on a duplicate of the
+// socket, which is what the workers do for a listener without reuse_port. Each listener keeps its
+// own receive buffers. Every datagram is handed over once, by one of the listeners, with its
+// content.
+void UdpListenerImplRecvMmsgTest::severalWorkersReadOneSocket(bool reuse_buffers) {
+  setupWithGuard(reuse_buffers);
+  // The listener of the test thread does not read.
+  listener_.reset();
+
+  constexpr uint32_t workers = 4;
+  constexpr uint32_t rounds = 20;
+  constexpr uint32_t datagrams_per_round = 2 * NUM_DATAGRAMS_PER_RECEIVE + 3;
+
+  struct Progress {
+    static bool reached(Progress* progress) { return progress->handed_over_ >= progress->target_; }
+    uint32_t handed_over_{0};
+    uint32_t target_{0};
+    uint32_t dropped_{0};
+  };
+  absl::Mutex mutex;
+  Progress progress;
+
+  struct Worker {
+    Event::DispatcherPtr dispatcher_;
+    SocketSharedPtr socket_;
+    NiceMock<MockUdpListenerCallbacks> callbacks_;
+    Thread::ThreadPtr thread_;
+    absl::Notification listening_;
+    // Written by the thread of the worker, read after it was joined.
+    std::vector<std::string> received_;
+    const void* kept_buffers_{nullptr};
+  };
+  std::vector<std::unique_ptr<Worker>> pool;
+  for (uint32_t i = 0; i < workers; i++) {
+    auto worker = std::make_unique<Worker>();
+    Worker& w = *worker;
+    w.dispatcher_ = api_->allocateDispatcher(absl::StrCat("worker_", i));
+    w.socket_ = i == 0 ? server_socket_ : SocketSharedPtr(server_socket_->duplicate());
+    ON_CALL(w.callbacks_, numPacketsExpectedPerEventLoop())
+        .WillByDefault(Return(MAX_NUM_PACKETS_PER_EVENT_LOOP));
+    ON_CALL(w.callbacks_, udpSaveCmsgConfig()).WillByDefault(ReturnRef(udp_save_cmsg_config_));
+    ON_CALL(w.callbacks_, onData(_))
+        .WillByDefault(Invoke([&w, &mutex, &progress](const UdpRecvData& data) {
+          w.received_.push_back(data.buffer_->toString());
+          absl::MutexLock lock(&mutex);
+          progress.handed_over_++;
+        }));
+    ON_CALL(w.callbacks_, onDatagramsDropped(_))
+        .WillByDefault(Invoke([&mutex, &progress](uint32_t dropped) {
+          absl::MutexLock lock(&mutex);
+          progress.dropped_ += dropped;
+        }));
+    w.thread_ = api_->threadFactory().createThread([&w]() {
+      envoy::config::core::v3::UdpSocketConfig config;
+      auto listener = std::make_unique<UdpListenerImpl>(*w.dispatcher_, w.socket_, w.callbacks_,
+                                                        w.dispatcher_->timeSource(), config);
+      w.kept_buffers_ = listener->recvMmsgBuffers();
+      w.listening_.Notify();
+      w.dispatcher_->run(Event::Dispatcher::RunType::RunUntilExit);
+      listener.reset();
+      w.dispatcher_->shutdown();
+    });
+    pool.push_back(std::move(worker));
+  }
+  for (const auto& worker : pool) {
+    worker->listening_.WaitForNotification();
+  }
+
+  std::vector<std::string> sent;
+  bool all_handed_over = true;
+  for (uint32_t round = 0; round < rounds && all_handed_over; round++) {
+    for (uint32_t i = 0; i < datagrams_per_round; i++) {
+      sent.push_back(absl::StrCat(round, ".", i, ".", std::string(i, 'a' + round)));
+      client_.write(sent.back(), *send_to_addr_);
+    }
+    absl::MutexLock lock(&mutex);
+    progress.target_ = static_cast<uint32_t>(sent.size());
+    all_handed_over = mutex.AwaitWithTimeout(absl::Condition(&Progress::reached, &progress),
+                                             absl::FromChrono(TestUtility::DefaultTimeout));
+  }
+  for (const auto& worker : pool) {
+    worker->dispatcher_->post([d = worker->dispatcher_.get()]() { d->exit(); });
+    worker->thread_->join();
+  }
+  EXPECT_TRUE(all_handed_over);
+
+  std::vector<std::string> handed_over;
+  std::string split;
+  for (const auto& worker : pool) {
+    handed_over.insert(handed_over.end(), worker->received_.begin(), worker->received_.end());
+    absl::StrAppend(&split, split.empty() ? "" : ", ", worker->received_.size());
+    EXPECT_EQ(reuse_buffers, worker->kept_buffers_ != nullptr);
+    for (const auto& other : pool) {
+      if (other != worker && reuse_buffers) {
+        EXPECT_NE(worker->kept_buffers_, other->kept_buffers_);
+      }
+    }
+  }
+  GTEST_LOG_(INFO) << "several workers, " << guardName(reuse_buffers) << ": " << sent.size()
+                   << " datagrams, handed over by the workers " << split << ", recvmmsg calls "
+                   << counting_sys_calls_.calls_.load();
+  std::sort(sent.begin(), sent.end());
+  std::sort(handed_over.begin(), handed_over.end());
+  EXPECT_EQ(sent, handed_over);
+  EXPECT_EQ(sent.size(), counting_sys_calls_.datagrams_.load());
+  absl::MutexLock lock(&mutex);
+  EXPECT_EQ(0, progress.dropped_);
+}
+
+TEST_P(UdpListenerImplRecvMmsgTest, SeveralWorkersReadOneSocketReuseBuffersOff) {
+  severalWorkersReadOneSocket(false);
+}
+TEST_P(UdpListenerImplRecvMmsgTest, SeveralWorkersReadOneSocketReuseBuffersOn) {
+  severalWorkersReadOneSocket(true);
+}
+
+#endif // defined(__linux__)
 
 } // namespace
 } // namespace Network

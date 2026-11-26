@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <list>
+#include <memory>
 #include <string>
 
 #include "envoy/common/platform.h"
@@ -21,6 +22,18 @@
 
 namespace Envoy {
 namespace Network {
+
+/**
+ * The receive buffers that readPacketsFromSocket() keeps between recvmmsg calls, see
+ * Utility::createUdpRecvMmsgBuffers(). The type is private to utility.cc.
+ */
+struct UdpRecvMmsgBuffers;
+
+struct UdpRecvMmsgBuffersDeleter {
+  void operator()(UdpRecvMmsgBuffers* buffers) const;
+};
+
+using UdpRecvMmsgBuffersPtr = std::unique_ptr<UdpRecvMmsgBuffers, UdpRecvMmsgBuffersDeleter>;
 
 /**
  * A callback interface used by readFromSocket() to pass packets read from
@@ -61,6 +74,15 @@ public:
   virtual size_t numPacketsExpectedPerEventLoop() const PURE;
 
   virtual const IoHandle::UdpSaveCmsgConfig& saveCmsgConfig() const PURE;
+
+  /**
+   * @return the receive buffers that reads with recvmmsg keep for this processor between calls,
+   * or nullptr, which is the default, if every call allocates and frees its own. The buffers are
+   * created with Utility::createUdpRecvMmsgBuffers() and are owned by the processor. They hold
+   * memory for NUM_DATAGRAMS_PER_RECEIVE datagrams of maxDatagramSize() while the socket is idle,
+   * so a processor of which there are many should not have them.
+   */
+  virtual UdpRecvMmsgBuffers* recvMmsgBuffers() { return nullptr; }
 };
 
 static const uint64_t DEFAULT_UDP_MAX_DATAGRAM_SIZE = 1500;
@@ -334,6 +356,20 @@ public:
                  UdpPacketProcessor& udp_packet_processor, TimeSource& time_source,
                  UdpRecvMsgMethod recv_msg_method, uint32_t* packets_dropped,
                  uint32_t* num_packets_read);
+
+  /**
+   * Creates the object in which reads with recvmmsg keep their receive buffers between calls.
+   * A recvmmsg call is given NUM_DATAGRAMS_PER_RECEIVE buffers and usually fills few of them. The
+   * buffers that were filled are handed to the UdpPacketProcessor and are replaced before the
+   * next call. The other ones are used again.
+   * @return the object, to be returned by UdpPacketProcessor::recvMmsgBuffers() of one processor.
+   */
+  static UdpRecvMmsgBuffersPtr createUdpRecvMmsgBuffers();
+
+  /**
+   * @return the number of receive buffers that were allocated for `buffers` so far.
+   */
+  static uint64_t udpRecvMmsgBuffersAllocatedForTest(const UdpRecvMmsgBuffers& buffers);
 
   /**
    * Read some packets from a given UDP socket and pass the packet to a given

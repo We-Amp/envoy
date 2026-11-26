@@ -56,6 +56,7 @@ public:
   const IoHandle::UdpSaveCmsgConfig& saveCmsgConfig() const override {
     return cb_.udpSaveCmsgConfig();
   }
+  UdpRecvMmsgBuffers* recvMmsgBuffers() override { return recv_mmsg_buffers_.get(); }
 
 protected:
   void handleWriteCallback();
@@ -74,6 +75,8 @@ private:
   // Taking a weak_ptr to this lets us detect if the listener has been destroyed.
   std::shared_ptr<bool> destruction_checker_ = std::make_shared<bool>(true);
   uint32_t events_when_unpaused_ = Event::FileReadyType::Read | Event::FileReadyType::Write;
+  // The receive buffers that reads with recvmmsg keep between calls. Null if they are not kept.
+  const UdpRecvMmsgBuffersPtr recv_mmsg_buffers_;
 };
 
 class UdpListenerWorkerRouterImpl : public UdpListenerWorkerRouter {
