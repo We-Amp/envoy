@@ -43,7 +43,6 @@ RUNTIME_GUARD(envoy_reloadable_features_codec_client_enable_idle_timer_only_when
 RUNTIME_GUARD(envoy_reloadable_features_composite_cluster_skip_clusters_without_hosts);
 RUNTIME_GUARD(envoy_reloadable_features_conn_pool_fix_reentrancy);
 RUNTIME_GUARD(envoy_reloadable_features_conn_pool_grid_early_return_on_teardown);
-RUNTIME_GUARD(envoy_reloadable_features_connection_write_in_current_iteration);
 RUNTIME_GUARD(envoy_reloadable_features_connectivity_grid_prevent_double_h2_scheduled);
 RUNTIME_GUARD(envoy_reloadable_features_decouple_explicit_drain_pools_and_dns_refresh);
 RUNTIME_GUARD(envoy_reloadable_features_dfp_cluster_resolves_hosts);
@@ -220,6 +219,11 @@ FALSE_RUNTIME_GUARD(envoy_reloadable_features_test_feature_false);
 // scope logic that propagates scope-level tags onto every stat. Evaluated once at startup.
 // TODO: flip to true after sufficient testing.
 FALSE_RUNTIME_GUARD(envoy_reloadable_features_enable_stats_explicit_tags);
+// When true, a write activation of an edge-triggered file event is delivered in the event loop
+// iteration that made it instead of the next one. Read once per file event, at its creation.
+// TODO: flip to true once loaded HTTP/2 and bulk transfer results show that the extra system calls
+// and TLS records on connections written in consecutive iterations are paid for.
+FALSE_RUNTIME_GUARD(envoy_reloadable_features_connection_write_in_current_iteration);
 // TODO: Flip to true after sufficient testing to enable formatter support for rate limit action
 // descriptor_value fields by default.
 FALSE_RUNTIME_GUARD(
