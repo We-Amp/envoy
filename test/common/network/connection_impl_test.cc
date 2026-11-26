@@ -5075,7 +5075,6 @@ TEST_P(WriteInCurrentIterationTest, ConnectionDestroyedBeforeDelivery) {
 // flushed, the delayed close timer does not fire, and the peer's close ends the connection.
 TEST_P(WriteInCurrentIterationTest, WriteThenFlushWriteAndDelayClose) {
   setUpAndConnect();
-  time_system_.setMonotonicTime(std::chrono::milliseconds(0));
   client_connection_->setDelayedCloseTimeout(std::chrono::milliseconds(100));
   NiceMockConnectionStats stats;
   client_connection_->setConnectionStats(stats.toBufferStats());
@@ -5100,7 +5099,6 @@ TEST_P(WriteInCurrentIterationTest, WriteThenFlushWriteAndDelayClose) {
 // data is flushed and the delayed close timer closes the connection.
 TEST_P(WriteInCurrentIterationTest, WriteThenDelayedCloseTimeout) {
   setUpAndConnect();
-  time_system_.setMonotonicTime(std::chrono::milliseconds(0));
   client_connection_->setDelayedCloseTimeout(std::chrono::milliseconds(50));
   NiceMockConnectionStats stats;
   client_connection_->setConnectionStats(stats.toBufferStats());
@@ -5114,7 +5112,7 @@ TEST_P(WriteInCurrentIterationTest, WriteThenDelayedCloseTimeout) {
   EXPECT_THAT(log(), ElementsAre("write 5"));
   EXPECT_EQ(Connection::State::Closing, client_connection_->state());
 
-  time_system_.setMonotonicTime(std::chrono::milliseconds(100));
+  time_system_.advanceTimeAsyncImpl(std::chrono::milliseconds(100));
   runUntil([&]() { return sawEvent(server_events_, ConnectionEvent::RemoteClose); });
   EXPECT_TRUE(sawEvent(client_events_, ConnectionEvent::LocalClose));
   EXPECT_EQ(Connection::State::Closed, client_connection_->state());
@@ -5125,7 +5123,6 @@ TEST_P(WriteInCurrentIterationTest, WriteThenDelayedCloseTimeout) {
 TEST_P(WriteInCurrentIterationTest, FlushWriteCloseTimesOutWhenThePeerDoesNotRead) {
   setUpAndConnect();
   limitSocketBuffers();
-  time_system_.setMonotonicTime(std::chrono::milliseconds(0));
   server_connection_->readDisable(true);
   client_connection_->setDelayedCloseTimeout(std::chrono::milliseconds(50));
   NiceMockConnectionStats stats;
@@ -5141,7 +5138,7 @@ TEST_P(WriteInCurrentIterationTest, FlushWriteCloseTimesOutWhenThePeerDoesNotRea
   EXPECT_FALSE(log().empty());
   EXPECT_EQ(Connection::State::Closing, client_connection_->state());
 
-  time_system_.setMonotonicTime(std::chrono::milliseconds(100));
+  time_system_.advanceTimeAsyncImpl(std::chrono::milliseconds(100));
   runUntil([&]() { return sawEvent(client_events_, ConnectionEvent::LocalClose); });
   EXPECT_EQ(Connection::State::Closed, client_connection_->state());
   server_connection_->close(ConnectionCloseType::NoFlush);
