@@ -19,6 +19,7 @@
 #include "source/common/event/dispatcher_impl.h"
 #include "source/common/network/address_impl.h"
 #include "source/common/network/io_socket_error_impl.h"
+#include "source/common/runtime/runtime_features.h"
 
 #include "absl/container/fixed_array.h"
 #include "event2/listener.h"
@@ -35,7 +36,11 @@ UdpListenerImpl::UdpListenerImpl(Event::Dispatcher& dispatcher, SocketSharedPtr 
                                  const envoy::config::core::v3::UdpSocketConfig& config)
     : BaseListenerImpl(dispatcher, std::move(socket)), cb_(cb), time_source_(time_source),
       // Default prefer_gro to false for downstream server traffic.
-      config_(config, false) {
+      config_(config, false),
+      recv_mmsg_buffers_(
+          Runtime::runtimeFeatureEnabled("envoy.reloadable_features.udp_recvmmsg_reuse_buffers")
+              ? Utility::createUdpRecvMmsgBuffers()
+              : nullptr) {
   parent_drained_callback_registrar_ = socket_->parentDrainedCallbackRegistrar();
   socket_->ioHandle().initializeFileEvent(
       dispatcher,
