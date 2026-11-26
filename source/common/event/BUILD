@@ -47,6 +47,7 @@ envoy_cc_library(
         "//source/common/filesystem:watcher_lib",
         "//source/common/network:address_lib",
         "//source/common/network:default_client_connection_factory",
+        "//source/common/runtime:runtime_features_lib",
         "@envoy_api//envoy/config/overload/v3:pkg_cc_proto",
     ],
 )

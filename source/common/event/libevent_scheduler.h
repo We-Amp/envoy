@@ -51,12 +51,24 @@ namespace Event {
 // implemented as libevent timers with a deadline of 0. Both of these actions are moved to the work
 // list while checking for expired timers during step 5.
 //
+// There is one exception. With the runtime guard
+// envoy.reloadable_features.file_event_write_in_current_iteration enabled, a call to
+// Event::FileEvent::activate with exactly FileReadyType::Write on an edge-triggered file event is a
+// "same-iteration" work item: it is added directly to the work list, like
+// Event::SchedulableCallback::scheduleCallbackCurrentIteration(), so that the event loop does not
+// have to poll for fd events with a zero timeout only to deliver it. This is done at most once per
+// file event per event loop iteration, and only if the file event has no injected event pending;
+// otherwise the activation is a timer with a deadline of 0 as described above. Activations that
+// include FileReadyType::Read or FileReadyType::Closed, and activations of level-triggered and
+// emulated-edge file events, are always timers with a deadline of 0.
+//
 // Events execute in the following order, derived from the order in which items were added to the
 // work list:
 // 0. Events added via event_active prior to the start of the event loop (in tests)
 // 1. Fd events
 // 2. Timers, FileEvent::activate and SchedulableCallback::scheduleCallbackNextIteration
-// 3. "Same-iteration" work items described above, including Event::Dispatcher::post callbacks
+// 3. "Same-iteration" work items described above, including Event::Dispatcher::post callbacks and
+//    the FileEvent::activate exception described above
 class LibeventScheduler : public Scheduler, public CallbackScheduler {
 public:
   using OnPrepareCallback = std::function<void()>;
