@@ -462,7 +462,7 @@ TEST_F(InternalClientConnectionImplTest, WriteIsDeliveredInTheNextIterationWithT
   client_->connect();
   client_->noDelay(true);
   EXPECT_CALL(connection_callbacks, onEvent(Network::ConnectionEvent::Connected))
-      .WillOnce(Invoke([&](Network::ConnectionEvent) -> void { dispatcher_->exit(); }));
+      .WillOnce([&](Network::ConnectionEvent) -> void { dispatcher_->exit(); });
   dispatcher_->run(Event::Dispatcher::RunType::Block);
 
   std::vector<std::string> log;

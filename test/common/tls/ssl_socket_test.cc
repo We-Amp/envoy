@@ -8867,25 +8867,25 @@ protected:
     std::string received;
     std::string expected = "early ";
     EXPECT_CALL(listener_callbacks_, onAccept_(_))
-        .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+        .WillOnce([&](Network::ConnectionSocketPtr& socket) -> void {
           server_connection_ = dispatcher_->createServerConnection(
               std::move(socket), server_ssl_socket_factory_->createDownstreamTransportSocket(),
               stream_info_);
           server_connection_->addConnectionCallbacks(server_callbacks_);
           server_connection_->addReadFilter(read_filter_);
-        }));
+        });
     EXPECT_CALL(listener_callbacks_, recordConnectionsAcceptedOnSocketEvent(_));
     EXPECT_CALL(client_callbacks_, onEvent(Network::ConnectionEvent::Connected));
     EXPECT_CALL(*read_filter_, onNewConnection());
     EXPECT_CALL(*read_filter_, onData(_, _))
-        .WillRepeatedly(Invoke([&](Buffer::Instance& data, bool) -> Network::FilterStatus {
+        .WillRepeatedly([&](Buffer::Instance& data, bool) -> Network::FilterStatus {
           received.append(data.toString());
           data.drain(data.length());
           if (received == expected) {
             dispatcher_->exit();
           }
           return Network::FilterStatus::StopIteration;
-        }));
+        });
 
     std::vector<std::string> log;
     client_connection_->addBytesSentCallback([&](uint64_t bytes) {
@@ -8950,18 +8950,18 @@ protected:
     std::string client_received;
     auto client_read_filter = std::make_shared<NiceMock<Network::MockReadFilter>>();
     ON_CALL(*client_read_filter, onData(_, _))
-        .WillByDefault(Invoke([&](Buffer::Instance& data, bool) -> Network::FilterStatus {
+        .WillByDefault([&](Buffer::Instance& data, bool) -> Network::FilterStatus {
           client_received.append(data.toString());
           data.drain(data.length());
           if (client_received == "server-early") {
             dispatcher_->exit();
           }
           return Network::FilterStatus::StopIteration;
-        }));
+        });
     client_connection_->addReadFilter(client_read_filter);
 
     EXPECT_CALL(listener_callbacks_, onAccept_(_))
-        .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+        .WillOnce([&](Network::ConnectionSocketPtr& socket) -> void {
           server_connection_ = dispatcher_->createServerConnection(
               std::move(socket), server_ssl_socket_factory_->createDownstreamTransportSocket(),
               stream_info_);
@@ -8974,7 +8974,7 @@ protected:
           // The TLS handshake is not done: the write file event runs doHandshake().
           Buffer::OwnedImpl server_early("server-early");
           server_connection_->write(server_early, false);
-        }));
+        });
     EXPECT_CALL(listener_callbacks_, recordConnectionsAcceptedOnSocketEvent(_));
     EXPECT_CALL(client_callbacks_, onEvent(Network::ConnectionEvent::Connected));
 
@@ -9003,30 +9003,30 @@ protected:
     const std::string message(1024 * 1024, 'd');
     std::string expected = message + "more";
     EXPECT_CALL(listener_callbacks_, onAccept_(_))
-        .WillOnce(Invoke([&](Network::ConnectionSocketPtr& socket) -> void {
+        .WillOnce([&](Network::ConnectionSocketPtr& socket) -> void {
           server_connection_ = dispatcher_->createServerConnection(
               std::move(socket), server_ssl_socket_factory_->createDownstreamTransportSocket(),
               stream_info_);
           server_connection_->addConnectionCallbacks(server_callbacks_);
           server_connection_->addReadFilter(read_filter_);
-        }));
+        });
     EXPECT_CALL(listener_callbacks_, recordConnectionsAcceptedOnSocketEvent(_));
     EXPECT_CALL(client_callbacks_, onEvent(Network::ConnectionEvent::Connected))
-        .WillOnce(Invoke([&](Network::ConnectionEvent) -> void { dispatcher_->exit(); }));
+        .WillOnce([&](Network::ConnectionEvent) -> void { dispatcher_->exit(); });
     dispatcher_->run(Event::Dispatcher::RunType::Block);
     // The server may still be finishing its side of the handshake.
     dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
 
     EXPECT_CALL(*read_filter_, onNewConnection());
     EXPECT_CALL(*read_filter_, onData(_, _))
-        .WillRepeatedly(Invoke([&](Buffer::Instance& data, bool) -> Network::FilterStatus {
+        .WillRepeatedly([&](Buffer::Instance& data, bool) -> Network::FilterStatus {
           received.append(data.toString());
           data.drain(data.length());
           if (received.size() >= expected.size()) {
             dispatcher_->exit();
           }
           return Network::FilterStatus::StopIteration;
-        }));
+        });
 
     // Small kernel buffers and a server that does not read, so that SSL_write() is refused.
     const int size = 16 * 1024;

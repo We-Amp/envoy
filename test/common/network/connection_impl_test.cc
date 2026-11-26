@@ -4685,20 +4685,20 @@ protected:
         Network::Test::getCanonicalLoopbackAddress(std::get<0>(GetParam())));
     connect();
     ON_CALL(*read_filter_, onData(_, _))
-        .WillByDefault(Invoke([this](Buffer::Instance& data, bool) -> FilterStatus {
+        .WillByDefault([this](Buffer::Instance& data, bool) -> FilterStatus {
           server_received_.append(data.toString());
           data.drain(data.length());
           exitIfDone();
           return FilterStatus::StopIteration;
-        }));
-    ON_CALL(server_callbacks_, onEvent(_)).WillByDefault(Invoke([this](ConnectionEvent event) {
+        });
+    ON_CALL(server_callbacks_, onEvent(_)).WillByDefault([this](ConnectionEvent event) {
       server_events_.push_back(event);
       exitIfDone();
-    }));
-    ON_CALL(client_callbacks_, onEvent(_)).WillByDefault(Invoke([this](ConnectionEvent event) {
+    });
+    ON_CALL(client_callbacks_, onEvent(_)).WillByDefault([this](ConnectionEvent event) {
       client_events_.push_back(event);
       exitIfDone();
-    }));
+    });
     EXPECT_CALL(server_callbacks_, onEvent(_)).Times(AnyNumber());
     EXPECT_CALL(client_callbacks_, onEvent(_)).Times(AnyNumber());
     dispatcher_->run(Event::Dispatcher::RunType::NonBlock);
@@ -5174,10 +5174,10 @@ TEST_P(WriteInCurrentIterationTest, LargeWriteWithWatermarks) {
   std::vector<std::string> watermarks;
   EXPECT_CALL(client_callbacks_, onAboveWriteBufferHighWatermark())
       .Times(AnyNumber())
-      .WillRepeatedly(InvokeWithoutArgs([&]() { watermarks.push_back("high"); }));
+      .WillRepeatedly([&]() { watermarks.push_back("high"); });
   EXPECT_CALL(client_callbacks_, onBelowWriteBufferLowWatermark())
       .Times(AnyNumber())
-      .WillRepeatedly(InvokeWithoutArgs([&]() { watermarks.push_back("low"); }));
+      .WillRepeatedly([&]() { watermarks.push_back("low"); });
 
   const std::string message(16 * 1024 * 1024, 'd');
   runInLoop([&]() {
@@ -5201,12 +5201,12 @@ TEST_P(WriteInCurrentIterationTest, WriteFromLowWatermarkCallback) {
   EXPECT_CALL(client_callbacks_, onAboveWriteBufferHighWatermark()).Times(AnyNumber());
   EXPECT_CALL(client_callbacks_, onBelowWriteBufferLowWatermark())
       .Times(AnyNumber())
-      .WillRepeatedly(InvokeWithoutArgs([&]() {
+      .WillRepeatedly([&]() {
         if (!written_from_callback) {
           written_from_callback = true;
           clientWrite("tail");
         }
-      }));
+      });
 
   const std::string message(4 * 1024 * 1024, 'd');
   runInLoop([&]() { clientWrite(message); });
