@@ -21,7 +21,7 @@ FileEventImpl::FileEventImpl(DispatcherImpl& dispatcher, os_fd_t fd, FileReadyCb
       write_in_current_iteration_(
           trigger == FileTriggerType::Edge &&
           Runtime::runtimeFeatureEnabled(
-              "envoy.reloadable_features.connection_write_in_current_iteration")) {
+              "envoy.reloadable_features.file_event_write_in_current_iteration")) {
   // Treat the lack of a valid fd (which in practice should only happen if we run out of FDs) as
   // an OOM condition and just crash.
   RELEASE_ASSERT(SOCKET_VALID(fd), "");

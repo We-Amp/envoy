@@ -4684,7 +4684,7 @@ private:
   }
 };
 
-// envoy.reloadable_features.connection_write_in_current_iteration on a real event loop and real TCP
+// envoy.reloadable_features.file_event_write_in_current_iteration on a real event loop and real TCP
 // sockets, with the guard on and off. The peer must receive the same bytes either way; what
 // differs is when the write system call is made relative to other callbacks of the event loop, and
 // that data written in two consecutive iterations is written in two system calls.
@@ -4693,7 +4693,7 @@ class WriteInCurrentIterationTest
       public testing::TestWithParam<std::tuple<Address::IpVersion, bool>> {
 protected:
   WriteInCurrentIterationTest() {
-    scoped_runtime_.mergeValues({{"envoy.reloadable_features.connection_write_in_current_iteration",
+    scoped_runtime_.mergeValues({{"envoy.reloadable_features.file_event_write_in_current_iteration",
                                   std::get<1>(GetParam()) ? "true" : "false"}});
   }
 

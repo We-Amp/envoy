@@ -70,12 +70,8 @@ public:
    * events. This method "injects" the event (and fires callbacks) regardless of whether the event
    * is actually ready on the underlying file.
    *
-   * The callbacks never run inside activate(). They normally run in the next event loop
-   * iteration. With the runtime guard
-   * envoy.reloadable_features.connection_write_in_current_iteration enabled when the file event
-   * was created, an activation of exactly FileReadyType::Write on an edge-triggered file event
-   * that has no injected event pending runs its callback later in the current iteration instead,
-   * after the work that is already scheduled for it, at most once per file event per iteration.
+   * The callbacks never run inside activate(). An implementation may run them later in the current
+   * event loop iteration, after the callbacks already scheduled for it, or in the next iteration.
    */
   virtual void activate(uint32_t events) PURE;
 

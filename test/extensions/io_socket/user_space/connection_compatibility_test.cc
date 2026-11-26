@@ -281,13 +281,13 @@ TEST_F(InternalClientConnectionImplTest,
   EXPECT_EQ(StreamInfo::DetectedCloseType::Normal, client_->detectedCloseType());
 }
 
-// envoy.reloadable_features.connection_write_in_current_iteration applies to the file events of
+// envoy.reloadable_features.file_event_write_in_current_iteration applies to the file events of
 // OS sockets only. A user space socket has its own file event, which delivers a write activation in
 // the next event loop iteration whether the guard is on or off.
 TEST_F(InternalClientConnectionImplTest, WriteIsDeliveredInTheNextIterationWithTheGuard) {
   TestScopedRuntime scoped_runtime;
   scoped_runtime.mergeValues(
-      {{"envoy.reloadable_features.connection_write_in_current_iteration", "true"}});
+      {{"envoy.reloadable_features.file_event_write_in_current_iteration", "true"}});
 
   client_ = std::make_unique<Network::ClientConnectionImpl>(
       *dispatcher_,

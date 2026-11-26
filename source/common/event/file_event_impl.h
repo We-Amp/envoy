@@ -47,7 +47,7 @@ private:
 
   // True if activate(FileReadyType::Write) may deliver the event in the current event loop
   // iteration: the file event is edge-triggered and the runtime guard
-  // envoy.reloadable_features.connection_write_in_current_iteration was enabled when the file
+  // envoy.reloadable_features.file_event_write_in_current_iteration was enabled when the file
   // event was created.
   const bool write_in_current_iteration_;
   // True while current_iteration_write_cb_ is scheduled and has not run.

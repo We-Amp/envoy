@@ -8392,12 +8392,12 @@ protected:
     disconnect();
   }
 
-  // envoy.reloadable_features.connection_write_in_current_iteration with a TLS transport socket:
+  // envoy.reloadable_features.file_event_write_in_current_iteration with a TLS transport socket:
   // data written while the handshake is in progress, then writes made by two callbacks of one
   // event loop iteration.
   void writeInCurrentIterationTest(bool guard) {
     TestScopedRuntime scoped_runtime;
-    scoped_runtime.mergeValues({{"envoy.reloadable_features.connection_write_in_current_iteration",
+    scoped_runtime.mergeValues({{"envoy.reloadable_features.file_event_write_in_current_iteration",
                                  guard ? "true" : "false"}});
     const bool write_in_current_iteration =
         guard && Event::PlatformDefaultTriggerType == Event::FileTriggerType::Edge;

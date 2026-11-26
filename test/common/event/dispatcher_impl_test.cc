@@ -829,7 +829,7 @@ TEST_F(DispatcherMonotonicTimeTest, ApproximateMonotonicTime) {
 
 #ifndef WIN32 // Libevent on Windows doesn't support edge trigger.
 // The dispatcher counts its event loop iterations for
-// envoy.reloadable_features.connection_write_in_current_iteration: a file event delivers at most
+// envoy.reloadable_features.file_event_write_in_current_iteration: a file event delivers at most
 // one injected Write event per iteration, and delivers the first one in the iteration that
 // injected it. The counter is private, so these tests watch what an edge-triggered file event does
 // with it.
@@ -851,7 +851,7 @@ protected:
 
   DispatcherEventLoopIterationTest() : os_sys_calls_(Api::OsSysCallsSingleton::get()) {
     runtime_.mergeValues(
-        {{"envoy.reloadable_features.connection_write_in_current_iteration", "true"}});
+        {{"envoy.reloadable_features.file_event_write_in_current_iteration", "true"}});
   }
 
   ~DispatcherEventLoopIterationTest() override {

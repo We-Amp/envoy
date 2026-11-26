@@ -33,7 +33,7 @@ using ::testing::MockFunction;
 bool writeActivationInCurrentIteration(FileTriggerType trigger) {
   return trigger == FileTriggerType::Edge &&
          Runtime::runtimeFeatureEnabled(
-             "envoy.reloadable_features.connection_write_in_current_iteration");
+             "envoy.reloadable_features.file_event_write_in_current_iteration");
 }
 
 class FileEventImplTest : public testing::Test {
@@ -400,13 +400,13 @@ TEST_F(FileEventImplTest, SetEnabled) {
 }
 
 #ifndef WIN32 // Libevent on Windows doesn't support edge trigger.
-// envoy.reloadable_features.connection_write_in_current_iteration, with the guard on and off: when
+// envoy.reloadable_features.file_event_write_in_current_iteration, with the guard on and off: when
 // an injected Write event is delivered relative to the polls for fd events and to other callbacks
 // of the event loop.
 class FileEventImplWriteActivationTest : public testing::TestWithParam<bool> {
 public:
   FileEventImplWriteActivationTest() : os_sys_calls_(Api::OsSysCallsSingleton::get()) {
-    scoped_runtime_.mergeValues({{"envoy.reloadable_features.connection_write_in_current_iteration",
+    scoped_runtime_.mergeValues({{"envoy.reloadable_features.file_event_write_in_current_iteration",
                                   guardEnabled() ? "true" : "false"}});
     api_ = Api::createApiForTest();
     dispatcher_ = api_->allocateDispatcher("test_thread");

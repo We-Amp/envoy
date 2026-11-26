@@ -52,7 +52,7 @@ namespace Event {
 // list while checking for expired timers during step 5.
 //
 // There is one exception. With the runtime guard
-// envoy.reloadable_features.connection_write_in_current_iteration enabled, a call to
+// envoy.reloadable_features.file_event_write_in_current_iteration enabled, a call to
 // Event::FileEvent::activate with exactly FileReadyType::Write on an edge-triggered file event is a
 // "same-iteration" work item: it is added directly to the work list, like
 // Event::SchedulableCallback::scheduleCallbackCurrentIteration(), so that the event loop does not
@@ -68,7 +68,7 @@ namespace Event {
 // 1. Fd events
 // 2. Timers, FileEvent::activate and SchedulableCallback::scheduleCallbackNextIteration
 // 3. "Same-iteration" work items described above, including Event::Dispatcher::post callbacks and
-// the FileEvent::activate exception described above
+//    the FileEvent::activate exception described above
 class LibeventScheduler : public Scheduler, public CallbackScheduler {
 public:
   using OnPrepareCallback = std::function<void()>;
